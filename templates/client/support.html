@@ -1,586 +1,86 @@
 {% extends "layout.html" %}
 
-{% block title %}Support · Feedback System{% endblock %}
+{% block title %}License Configuration · Feedback Admin{% endblock %}
 
 {% block content %}
-<style>
-  /* Tickets slide-in drawer */
-  .tickets-drawer-backdrop {
-    position: fixed; inset: 0;
-    background: rgba(15, 23, 42, 0.45);
-    backdrop-filter: blur(2px);
-    opacity: 0; visibility: hidden;
-    transition: opacity .25s ease, visibility 0s linear .25s;
-    z-index: 1090;
-  }
-  .tickets-drawer-backdrop.open {
-    opacity: 1; visibility: visible;
-    transition: opacity .25s ease, visibility 0s linear 0s;
-  }
-  .tickets-drawer {
-    position: fixed; top: 0; right: 0; bottom: 0;
-    width: min(560px, 100%);
-    background: #fff;
-    box-shadow: -10px 0 40px rgba(15, 23, 42, .25);
-    transform: translateX(100%);
-    transition: transform .3s cubic-bezier(.4,.0,.2,1);
-    display: flex; flex-direction: column;
-    z-index: 1100;
-  }
-  .tickets-drawer.open { transform: translateX(0); }
-  .tickets-drawer-header {
-    padding: 18px 22px;
-    border-bottom: 1px solid var(--neutral-200);
-    display: flex; align-items: center; gap: 12px;
-    background: linear-gradient(135deg, #FF6B35 0%, #B03A14 100%);
-    color: #fff;
-  }
-  .tickets-drawer-header .drawer-icon {
-    width: 38px; height: 38px; border-radius: 10px;
-    background: rgba(255,255,255,.15);
-    display: flex; align-items: center; justify-content: center;
-    font-size: 1.1rem;
-  }
-  .tickets-drawer-body {
-    flex: 1; overflow-y: auto;
-    padding: 20px 22px;
-    display: flex;
-    flex-direction: column;
-  }
-  .messages-container {
-    flex: 1;
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    padding-bottom: 16px;
-  }
-  .message-bubble {
-    max-width: 85%;
-    padding: 12px 16px;
-    border-radius: 16px;
-    position: relative;
-    line-height: 1.5;
-  }
-  .message-bubble.client {
-    align-self: flex-end;
-    background: linear-gradient(135deg, #FF6B35 0%, #E85A2A 100%);
-    color: #fff;
-    border-bottom-right-radius: 4px;
-  }
-  .message-bubble.admin {
-    align-self: flex-start;
-    background: var(--neutral-100);
-    border: 1px solid var(--neutral-200);
-    border-bottom-left-radius: 4px;
-  }
-  .message-sender {
-    font-size: 0.75rem;
-    font-weight: 600;
-    margin-bottom: 4px;
-    opacity: 0.9;
-  }
-  .message-time {
-    font-size: 0.7rem;
-    margin-top: 6px;
-    opacity: 0.7;
-  }
-  .message-input-area {
-    padding-top: 16px;
-    border-top: 1px solid var(--neutral-200);
-  }
-  .message-input-wrapper {
-    display: flex;
-    gap: 12px;
-    align-items: end;
-  }
-  .message-input-wrapper textarea {
-    flex: 1;
-    min-height: 44px;
-    max-height: 120px;
-    resize: none;
-  }
-  .tickets-drawer-close {
-    margin-left: auto;
-    background: rgba(255,255,255,.15);
-    border: none; color: #fff;
-    width: 32px; height: 32px; border-radius: 8px;
-    display: flex; align-items: center; justify-content: center;
-    transition: background .15s ease;
-    cursor: pointer;
-  }
-  .tickets-drawer-close:hover { background: rgba(255,255,255,.25); }
-
-  .ticket-card {
-    border: 1px solid var(--neutral-200);
-    border-radius: 12px;
-    padding: 14px 16px;
-    margin-bottom: 12px;
-    background: #fff;
-    transition: box-shadow .15s ease, transform .15s ease;
-  }
-  .ticket-card:hover { box-shadow: 0 6px 18px rgba(15,23,42,.06); transform: translateY(-1px); }
-  .ticket-reply {
-    margin-top: 10px;
-    padding: 10px 12px;
-    border-radius: 8px;
-    background: rgba(255,107,53,.06);
-    border-left: 3px solid var(--accent-500);
-    font-size: .82rem;
-    line-height: 1.5;
-  }
-</style>
-
-<div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+<div class="d-flex justify-content-between align-items-center mb-4">
   <div>
-    <h2 class="page-title mb-1">Support</h2>
-    <p class="page-subtitle mb-0">View your license status, request renewals, or submit a support ticket</p>
+    <h2 class="page-title mb-1">License Configuration</h2>
+    <p class="page-subtitle mb-0">Configure your license from the licensing portal</p>
   </div>
-  <button type="button" class="btn btn-outline-primary" id="open-tickets-drawer">
-    <i class="bi bi-clock-history me-2"></i>My Tickets
-    <span class="badge bg-primary ms-2 d-none" id="tickets-count-badge">0</span>
-  </button>
 </div>
 
 <div class="row g-4">
-  <!-- License Status Card -->
   <div class="col-12 col-lg-6">
     <div class="card border-0 shadow-lg mb-4">
       <div class="card-body p-4">
         <div class="d-flex align-items-center gap-2 mb-3 pb-3" style="border-bottom:1px solid var(--neutral-200);">
-          <div style="background:linear-gradient(135deg, rgba(74,144,226,.15) 0%, rgba(74,144,226,.25) 100%); width:40px; height:40px; border-radius:10px; display:flex; align-items:center; justify-content:center;">
-            <i class="bi bi-shield-check" style="color:var(--accent-500) !important;opacity:1; font-size:1.1rem;"></i>
+          <div class="survey-section-icon" style="background:linear-gradient(135deg, rgba(249, 115, 22, 0.15) 0%, rgba(249, 115, 22, 0.25) 100%);">
+            <i class="bi bi-key-fill" style="color:var(--primary-600) !important;opacity:1;"></i>
           </div>
           <div>
-            <h6 class="mb-0 fw-bold" style="font-size:1rem;">License Status</h6>
-            <small class="text-muted" style="font-size:.75rem;">Your current license information</small>
+            <h6 class="mb-0 fw-bold" style="font-size:1rem;">License Configuration</h6>
+            <small class="text-muted" style="font-size:.75rem;">Enter your license details from the licensing portal</small>
           </div>
         </div>
 
-        <div id="license-status-area">
-          {% if license_key %}
-          <!-- Loading state -->
-          <div class="text-center py-3" id="license-loading">
-            <div class="spinner-border spinner-border-sm text-muted" role="status"></div>
-            <p class="small text-muted mt-2 mb-0">Checking license...</p>
+        <form method="POST" action="{{ url_for('admin_save_license_config') }}" class="vstack gap-3">
+          <div>
+            <label class="form-label fw-semibold" for="license_key">License Key</label>
+            <input class="form-control" id="license_key" name="license_key" required placeholder="Enter license key from portal" value="{{ config.license_key if config else '' }}" />
           </div>
-          {% else %}
-          <div class="p-3 rounded mb-3" style="background:linear-gradient(135deg, rgba(234,179,8,.08), rgba(234,179,8,.03)); border:1px solid rgba(234,179,8,.25);">
-            <div class="d-flex align-items-center gap-3">
-              <div class="rounded-circle p-2" style="background:rgba(234,179,8,.15);">
-                <i class="bi bi-exclamation-circle-fill" style="color:var(--yellow-600);"></i>
-              </div>
-              <div>
-                <h6 class="fw-bold mb-0" style="font-size:.9rem; color:var(--yellow-700);">License Not Configured</h6>
-                <small class="text-muted">Enter your license key below to activate your account</small>
-              </div>
-            </div>
+          <div>
+            <label class="form-label fw-semibold" for="api_key">API Key</label>
+            <input class="form-control" id="api_key" name="api_key" required placeholder="Enter API key from portal" value="{{ config.api_key if config else '' }}" />
           </div>
-          <form method="POST" action="{{ url_for('client_save_license_config') }}" class="vstack gap-2">
-            <input class="form-control form-control-sm" name="license_key" required placeholder="Enter license key from administrator">
-            <button class="btn btn-primary btn-sm" type="submit">
-              <i class="bi bi-check-lg me-1" style="color:#fff !important; opacity:1;"></i>Save License Key
-            </button>
-          </form>
-          {% endif %}
-        </div>
+          <div>
+            <label class="form-label fw-semibold" for="licensing_portal_url">Licensing Portal URL</label>
+            <input class="form-control" id="licensing_portal_url" name="licensing_portal_url" placeholder="https://feedbacklicensing-production-c938.up.railway.app/" value="{{ config.licensing_portal_url if config else 'https://feedbacklicensing-production-c938.up.railway.app/' }}" />
+          </div>
+          <button class="btn btn-primary" type="submit">
+            <i class="bi bi-check-lg me-2"></i>Save Configuration
+          </button>
+        </form>
 
-        {% if license_key %}
-        <div class="mt-3 pt-3" style="border-top:1px solid var(--neutral-200);">
-          <small class="text-muted d-block mb-1" style="font-size:.7rem; text-transform:uppercase; letter-spacing:.05em; font-weight:600;">Your License Key</small>
-          <div class="d-flex gap-2 align-items-center">
-            <code class="flex-grow-1 p-2 rounded" style="font-size:.78rem; word-break:break-all; background:var(--neutral-100); border:1px solid var(--neutral-200);">{{ license_key }}</code>
-            <button class="btn btn-sm btn-outline-secondary" type="button" onclick="copyLicenseKey('{{ license_key }}')" title="Copy">
-              <i class="bi bi-clipboard"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-secondary" type="button" onclick="toggleEditLicense()" title="Change">
-              <i class="bi bi-pencil"></i>
-            </button>
-          </div>
-          <form id="edit_license_form" method="POST" action="{{ url_for('client_save_license_config') }}" class="d-none mt-2 vstack gap-2">
-            <input class="form-control form-control-sm" name="license_key" placeholder="Enter new license key" required>
-            <div class="d-flex gap-2">
-              <button class="btn btn-primary btn-sm" type="submit">
-                <i class="bi bi-check-lg me-1" style="color:#fff !important; opacity:1;"></i>Save
-              </button>
-              <button class="btn btn-outline-secondary btn-sm" type="button" onclick="toggleEditLicense()">Cancel</button>
+        {% if config %}
+        <div class="mt-4 p-4 rounded" style="background: linear-gradient(135deg, rgba(34, 197, 94, 0.1), rgba(34, 197, 94, 0.05)); border: 1px solid rgba(34, 197, 94, 0.3);">
+          <div class="d-flex align-items-center gap-3">
+            <div class="rounded-circle bg-success bg-opacity-20 p-3">
+              <i class="bi bi-check-circle-fill text-success fs-4"></i>
             </div>
-          </form>
+            <div class="flex-grow-1">
+              <h6 class="fw-bold mb-1 text-success">License Configured</h6>
+              <p class="small text-muted mb-0">
+                Your license is configured.
+                {% if license_status and license_status.get('valid') and license_status.get('expiry_date') %}
+                <span class="fw-semibold">Expires: {{ license_status.expiry_date }}</span>
+                {% elif license_status and license_status.get('valid') %}
+                <span class="fw-semibold text-warning">Expiry date not set (Perpetual license)</span>
+                {% elif license_error %}
+                <span class="fw-semibold text-danger">{{ license_error }}</span>
+                {% else %}
+                <span class="fw-semibold text-warning">Unable to fetch expiry date from portal</span>
+                {% endif %}
+                Visit the <a href="{{ config.licensing_portal_url }}" target="_blank" class="text-decoration-none text-success fw-semibold">Licensing Portal</a> to check your license status and details.
+              </p>
+            </div>
+          </div>
+        </div>
+        {% else %}
+        <div class="mt-4 p-4 rounded" style="background: linear-gradient(135deg, rgba(234, 179, 8, 0.1), rgba(234, 179, 8, 0.05)); border: 1px solid rgba(234, 179, 8, 0.3);">
+          <div class="d-flex align-items-center gap-3">
+            <div class="rounded-circle bg-warning bg-opacity-20 p-3">
+              <i class="bi bi-exclamation-circle-fill text-warning fs-4"></i>
+            </div>
+            <div class="flex-grow-1">
+              <h6 class="fw-bold mb-1 text-warning">License Not Configured</h6>
+              <p class="small text-muted mb-0">Please configure your license details above to activate your system.</p>
+            </div>
+          </div>
         </div>
         {% endif %}
       </div>
     </div>
   </div>
-
-  <!-- Submit Ticket Card -->
-  <div class="col-12 col-lg-6">
-    <div class="card border-0 shadow-lg mb-4">
-      <div class="card-body p-4">
-        <div class="d-flex align-items-center gap-2 mb-3 pb-3" style="border-bottom:1px solid var(--neutral-200);">
-          <div style="background:linear-gradient(135deg, rgba(234,179,8,.15) 0%, rgba(234,179,8,.25) 100%); width:40px; height:40px; border-radius:10px; display:flex; align-items:center; justify-content:center;">
-            <i class="bi bi-envelope-plus" style="color:var(--yellow-600) !important;opacity:1; font-size:1.1rem;"></i>
-          </div>
-          <div>
-            <h6 class="mb-0 fw-bold" style="font-size:1rem;">Submit a Ticket</h6>
-            <small class="text-muted" style="font-size:.75rem;">Get help from the development team</small>
-          </div>
-        </div>
-
-        <form method="POST" action="{{ url_for('client_submit_ticket') }}">
-          <input type="hidden" name="license_key" value="{{ license_key }}">
-          <div class="mb-3">
-            <label class="form-label small fw-semibold">Your Email</label>
-            <input type="email" class="form-control" name="contact_email" value="{{ user.email or '' }}" required placeholder="your@email.com">
-          </div>
-          <div class="mb-3">
-            <label class="form-label small fw-semibold">Type</label>
-            <select class="form-select" name="ticket_type">
-              <option value="general">General Inquiry</option>
-              <option value="renewal">Renewal</option>
-              <option value="bug">Bug Report</option>
-              <option value="feature">Feature Request</option>
-            </select>
-          </div>
-          <div class="mb-3">
-            <label class="form-label small fw-semibold">Subject</label>
-            <input type="text" class="form-control" name="subject" required placeholder="Brief description of your issue">
-          </div>
-          <div class="mb-3">
-            <label class="form-label small fw-semibold">Message</label>
-            <textarea class="form-control" name="message" rows="4" required placeholder="Describe your issue or request in detail..."></textarea>
-          </div>
-          <button type="submit" class="btn btn-primary w-100">
-            <i class="bi bi-send me-2" style="color:#fff !important; opacity:1;"></i>Submit Ticket
-          </button>
-        </form>
-      </div>
-    </div>
-  </div>
 </div>
-
-<!-- Tickets slide-in drawer -->
-<div class="tickets-drawer-backdrop" id="tickets-backdrop"></div>
-<aside class="tickets-drawer" id="tickets-drawer" aria-hidden="true" aria-labelledby="tickets-drawer-title">
-  <div class="tickets-drawer-header">
-    <div class="drawer-icon"><i class="bi bi-chat-dots"></i></div>
-    <div class="flex-grow-1">
-      <h6 class="mb-0 fw-bold" id="tickets-drawer-title">Support Chat</h6>
-      <small style="opacity:.85; font-size:.78rem;">Message our support team</small>
-    </div>
-    <button type="button" class="tickets-drawer-close" id="close-tickets-drawer" aria-label="Close">
-      <i class="bi bi-x-lg"></i>
-    </button>
-  </div>
-  <div class="tickets-drawer-body" id="tickets-area">
-    {% if license_key %}
-    <div class="messages-container" id="messages-container">
-      <div class="text-center py-3" id="messages-loading">
-        <div class="spinner-border spinner-border-sm text-muted" role="status"></div>
-        <p class="small text-muted mt-2 mb-0">Loading messages...</p>
-      </div>
-    </div>
-    <div class="message-input-area">
-      <form class="message-input-wrapper" id="message-form">
-        <textarea class="form-control" id="message-input" placeholder="Type your message..." rows="1"></textarea>
-        <button type="submit" class="btn btn-primary" id="send-btn">
-          <i class="bi bi-send"></i>
-        </button>
-      </form>
-    </div>
-    {% else %}
-    <div class="text-center py-4">
-      <i class="bi bi-inbox text-muted" style="font-size:2.5rem; opacity:.3;"></i>
-      <p class="text-muted mt-2 mb-0">Configure your license to start chatting.</p>
-    </div>
-    {% endif %}
-  </div>
-</aside>
-{% endblock %}
-
-{% block scripts %}
-<script>
-function copyLicenseKey(key) {
-  navigator.clipboard.writeText(key).then(() => {
-    if (window.showNotification) showNotification('License key copied to clipboard', 'success');
-    else alert('License key copied to clipboard');
-  }).catch(err => console.error('Copy failed:', err));
-}
-function toggleEditLicense() {
-  const f = document.getElementById('edit_license_form');
-  if (f) f.classList.toggle('d-none');
-}
-
-// Tickets drawer open/close
-(function() {
-  const drawer = document.getElementById('tickets-drawer');
-  const backdrop = document.getElementById('tickets-backdrop');
-  const openBtn = document.getElementById('open-tickets-drawer');
-  const closeBtn = document.getElementById('close-tickets-drawer');
-  if (!drawer || !backdrop) return;
-
-  function openDrawer() {
-    drawer.classList.add('open');
-    backdrop.classList.add('open');
-    drawer.setAttribute('aria-hidden', 'false');
-    document.body.style.overflow = 'hidden';
-  }
-  function closeDrawer() {
-    drawer.classList.remove('open');
-    backdrop.classList.remove('open');
-    drawer.setAttribute('aria-hidden', 'true');
-    document.body.style.overflow = '';
-  }
-  if (openBtn) openBtn.addEventListener('click', openDrawer);
-  if (closeBtn) closeBtn.addEventListener('click', closeDrawer);
-  backdrop.addEventListener('click', closeDrawer);
-  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
-})();
-</script>
-{% if license_key %}
-<script>
-(function() {
-  const licenseKey = "{{ license_key }}";
-  const userEmail = "{{ user.email or '' }}";
-  let conversationId = null;
-
-  fetch('/api/support/status')
-    .then(r => r.json())
-    .then(data => {
-      renderLicenseStatus(data);
-      loadMessages();
-    })
-    .catch(() => {
-      document.getElementById('license-status-area').innerHTML = `
-        <div class="p-3 rounded" style="background:rgba(239,68,68,.06); border:1px solid rgba(239,68,68,.2);">
-          <div class="d-flex align-items-center gap-2">
-            <i class="bi bi-exclamation-triangle text-danger"></i>
-            <span class="small text-danger fw-semibold">Unable to reach licensing portal</span>
-          </div>
-        </div>`;
-    });
-
-  function renderLicenseStatus(data) {
-    const area = document.getElementById('license-status-area');
-    const ls = data.license_status;
-
-    if (ls && ls.valid) {
-      const expiry = ls.expiry_date ? `Expires: <strong>${ls.expiry_date}</strong>` : 'Perpetual license';
-      const company = ls.company_name ? `<div class="col-6"><div class="p-2 rounded" style="background:var(--neutral-100);border:1px solid var(--neutral-200);"><small class="text-muted d-block" style="font-size:.7rem;text-transform:uppercase;letter-spacing:.04em;">Company</small><span class="fw-semibold" style="font-size:.85rem;">${ls.company_name}</span></div></div>` : '';
-      const maxStores = ls.max_stores > 0 ? ls.max_stores : 'Unlimited';
-
-      area.innerHTML = `
-        <div class="p-3 rounded mb-3" style="background:linear-gradient(135deg,rgba(34,197,94,.08),rgba(34,197,94,.03));border:1px solid rgba(34,197,94,.25);">
-          <div class="d-flex align-items-center gap-3">
-            <div class="rounded-circle p-2" style="background:rgba(34,197,94,.15);"><i class="bi bi-check-circle-fill text-success"></i></div>
-            <div><h6 class="fw-bold mb-0 text-success" style="font-size:.9rem;">License Active</h6><small class="text-muted">${expiry}</small></div>
-          </div>
-        </div>
-        <div class="row g-2 mb-3">
-          ${company}
-          <div class="col-6"><div class="p-2 rounded" style="background:var(--neutral-100);border:1px solid var(--neutral-200);"><small class="text-muted d-block" style="font-size:.7rem;text-transform:uppercase;letter-spacing:.04em;">Max Stores</small><span class="fw-semibold" style="font-size:.85rem;">${maxStores}</span></div></div>
-        </div>
-        <div class="pt-3" style="border-top:1px solid var(--neutral-200);">
-          <form method="POST" action="/client/support/renew" class="d-flex gap-2 align-items-end flex-wrap">
-            <input type="hidden" name="license_key" value="${licenseKey}">
-            <div class="flex-grow-1" style="min-width:180px;">
-              <label class="form-label small fw-semibold mb-1">Contact email for renewal</label>
-              <input type="email" class="form-control form-control-sm" name="contact_email" value="${userEmail}" required placeholder="your@email.com">
-            </div>
-            <button type="submit" class="btn btn-sm" style="background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;border:none;white-space:nowrap;">
-              <i class="bi bi-arrow-clockwise me-1" style="color:#fff !important;opacity:1;"></i>Request Renewal
-            </button>
-          </form>
-        </div>`;
-    } else {
-      const errMsg = data.license_error || 'License validation failed';
-      area.innerHTML = `
-        <div class="p-3 rounded mb-3" style="background:linear-gradient(135deg,rgba(239,68,68,.08),rgba(239,68,68,.03));border:1px solid rgba(239,68,68,.25);">
-          <div class="d-flex align-items-center gap-3">
-            <div class="rounded-circle p-2" style="background:rgba(239,68,68,.15);"><i class="bi bi-x-circle-fill text-danger"></i></div>
-            <div><h6 class="fw-bold mb-0 text-danger" style="font-size:.9rem;">${errMsg}</h6><small class="text-muted">Please renew your license or contact support</small></div>
-          </div>
-        </div>
-        <div class="pt-3" style="border-top:1px solid var(--neutral-200);">
-          <form method="POST" action="/client/support/renew" class="d-flex gap-2 align-items-end flex-wrap">
-            <input type="hidden" name="license_key" value="${licenseKey}">
-            <div class="flex-grow-1" style="min-width:180px;">
-              <label class="form-label small fw-semibold mb-1">Contact email for renewal</label>
-              <input type="email" class="form-control form-control-sm" name="contact_email" value="${userEmail}" required placeholder="your@email.com">
-            </div>
-            <button type="submit" class="btn btn-sm" style="background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;border:none;white-space:nowrap;">
-              <i class="bi bi-arrow-clockwise me-1" style="color:#fff !important;opacity:1;"></i>Request Renewal
-            </button>
-          </form>
-        </div>`;
-    }
-  }
-
-  let lastMessageCount = 0;
-
-  function buildBubbleHTML(msg) {
-    const timeStr = new Date(msg.created_at).toLocaleString('en-US', {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
-    const isClient = msg.sender_type === 'client';
-    return `
-        <div class="message-bubble ${isClient ? 'client' : 'admin'}">
-          <div class="message-sender">${isClient ? 'You' : 'Support Team'}</div>
-          <div>${String(msg.message || '').replace(/</g,'&lt;').replace(/\n/g, '<br>')}</div>
-          <div class="message-time">${timeStr}</div>
-        </div>`;
-  }
-
-  function appendMessage(msg) {
-    const container = document.getElementById('messages-container');
-    if (!container) return;
-    // Clear empty-state placeholder if present
-    if (!container.querySelector('.message-bubble')) {
-      container.innerHTML = '';
-    }
-    container.insertAdjacentHTML('beforeend', buildBubbleHTML(msg));
-    container.scrollTop = container.scrollHeight;
-    lastMessageCount += 1;
-  }
-
-  function loadMessages(showLoading = false) {
-    const container = document.getElementById('messages-container');
-    if (showLoading || !container.querySelector('.message-bubble')) {
-      container.innerHTML = '<div class="text-center py-3"><div class="spinner-border spinner-border-sm text-muted"></div><p class="small text-muted mt-2 mb-0">Loading messages...</p></div>';
-    }
-
-    fetch('/api/client/messages')
-      .then(r => r.json())
-      .then(data => {
-        conversationId = data.conversation_id;
-        renderMessages(data.messages || []);
-      })
-      .catch(err => {
-        console.error(err);
-        if (!container.querySelector('.message-bubble')) {
-          container.innerHTML = '<div class="text-center py-4"><i class="bi bi-exclamation-triangle text-muted"></i><p class="text-muted mt-2 mb-0">Failed to load messages.</p></div>';
-        }
-      });
-  }
-
-  function renderMessages(messages) {
-    const container = document.getElementById('messages-container');
-    if (!messages.length) {
-      container.innerHTML = '<div class="text-center py-5"><i class="bi bi-chat-dots text-muted" style="font-size:3rem;opacity:.3;"></i><p class="text-muted mt-3 mb-0">No messages yet.</p><p class="text-muted small mb-0">Start a conversation with our support team!</p></div>';
-      lastMessageCount = 0;
-      return;
-    }
-
-    const bubbles = messages.map(msg => {
-      const timeStr = new Date(msg.created_at).toLocaleString('en-US', {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
-      const isClient = msg.sender_type === 'client';
-      return `
-        <div class="message-bubble ${isClient ? 'client' : 'admin'}">
-          <div class="message-sender">${isClient ? 'You' : 'Support Team'}</div>
-          <div>${msg.message.replace(/\n/g, '<br>')}</div>
-          <div class="message-time">${timeStr}</div>
-        </div>`;
-    }).join('');
-
-    // Skip re-render if message count is unchanged (avoids flicker from polling)
-    if (messages.length === lastMessageCount && container.querySelector('.message-bubble')) {
-      return;
-    }
-    const wasAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 50;
-    container.innerHTML = bubbles;
-    if (messages.length !== lastMessageCount || wasAtBottom) {
-      container.scrollTop = container.scrollHeight;
-    }
-    lastMessageCount = messages.length;
-  }
-
-  function sendMessage(event) {
-    event.preventDefault();
-    const input = document.getElementById('message-input');
-    const message = input.value.trim();
-    if (!message) return;
-
-    const btn = document.getElementById('send-btn');
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
-
-    fetch('/api/client/messages/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message })
-    })
-    .then(async r => {
-      const data = await r.json().catch(() => ({}));
-      if (r.ok && data.success) {
-        input.value = '';
-        input.style.height = 'auto';
-        appendMessage({
-          sender_type: 'client',
-          message: message,
-          created_at: new Date().toISOString()
-        });
-      } else {
-        const errMsg = data.error || `Failed to send (HTTP ${r.status})`;
-        console.error('Send failed:', errMsg, data);
-        alert(errMsg);
-      }
-    })
-    .catch(err => {
-      alert('Failed to send message: ' + err.message);
-      console.error(err);
-    })
-    .finally(() => {
-      btn.disabled = false;
-      btn.innerHTML = '<i class="bi bi-send"></i>';
-    });
-  }
-
-  // Wire up message form submit
-  const messageForm = document.getElementById('message-form');
-  if (messageForm) {
-    messageForm.addEventListener('submit', sendMessage);
-  }
-
-  // Auto-resize textarea
-  const textarea = document.getElementById('message-input');
-  if (textarea) {
-    textarea.addEventListener('input', function() {
-      this.style.height = 'auto';
-      this.style.height = Math.min(this.scrollHeight, 120) + 'px';
-    });
-    // Send on Enter (Shift+Enter for newline)
-    textarea.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        if (messageForm) messageForm.requestSubmit();
-      }
-    });
-  }
-
-  // Load messages when drawer opens
-  const drawer = document.getElementById('tickets-drawer');
-  let pollingInterval = null;
-  if (drawer) {
-    const observer = new MutationObserver((mutations) => {
-      mutations.forEach((mutation) => {
-        const isOpen = mutation.target.classList.contains('open');
-        if (isOpen) {
-          if (!document.getElementById('messages-container').querySelector('.message-bubble')) {
-            loadMessages();
-          }
-          // Start polling for new messages every 5 seconds while drawer is open
-          if (!pollingInterval) {
-            pollingInterval = setInterval(loadMessages, 5000);
-          }
-        } else {
-          // Stop polling when drawer is closed
-          if (pollingInterval) {
-            clearInterval(pollingInterval);
-            pollingInterval = null;
-          }
-        }
-      });
-    });
-    observer.observe(drawer, { attributes: true, attributeFilter: ['class'] });
-  }
-})();
-</script>
-{% endif %}
 {% endblock %}
