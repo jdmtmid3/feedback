@@ -324,9 +324,18 @@ def create_app() -> Flask:
                 logger.info(f"Attempting schema initialization... ({retries} retries left)")
                 conn = get_db_connection()
                 cursor = conn.cursor()
-                
+
+                # Disable FK checks during schema initialization to avoid
+                # ordering issues when tables reference each other.
+                cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+
                 # --- CREATE TABLES IF NOT EXIST ---
-                
+                # Tables are created in dependency order so that any table
+                # with a FOREIGN KEY reference is created after the table
+                # it points to already exists:
+                #   stores -> questionnaires -> questions -> question_options
+                #   -> responses -> answers -> staff -> staff_commendations
+
                 # 1. Stores Table
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS stores (
@@ -350,40 +359,7 @@ def create_app() -> Flask:
                     )
                 """)
 
-                # 2. Staff Table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS staff (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        store_id INT NOT NULL,
-                        first_name VARCHAR(100) NOT NULL,
-                        last_name VARCHAR(100) NOT NULL,
-                        email VARCHAR(255),
-                        phone VARCHAR(20),
-                        position VARCHAR(100),
-                        role ENUM('staff', 'manager', 'supervisor') DEFAULT 'staff',
-                        hire_date DATE,
-                        status ENUM('active', 'inactive') DEFAULT 'active',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
-                    )
-                """)
-
-                # 3. Staff Commendations Table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS staff_commendations (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        response_id INT NOT NULL,
-                        staff_id INT NOT NULL,
-                        rating INT DEFAULT 5,
-                        commendation_type ENUM('excellent_service', 'friendly_attitude', 'professional', 'helpful', 'knowledgeable') DEFAULT 'excellent_service',
-                        comment TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (response_id) REFERENCES responses(id) ON DELETE CASCADE,
-                        FOREIGN KEY (staff_id) REFERENCES staff(id) ON DELETE CASCADE
-                    )
-                """)
-
-                # 4. Questionnaires Table
+                # 2. Questionnaires Table
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS questionnaires (
                         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -446,6 +422,39 @@ def create_app() -> Flask:
                         question_id INT NOT NULL,
                         answer_text TEXT,
                         rating_value DECIMAL(3,1)
+                    )
+                """)
+
+                # 7. Staff Table
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS staff (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        store_id INT NOT NULL,
+                        first_name VARCHAR(100) NOT NULL,
+                        last_name VARCHAR(100) NOT NULL,
+                        email VARCHAR(255),
+                        phone VARCHAR(20),
+                        position VARCHAR(100),
+                        role ENUM('staff', 'manager', 'supervisor') DEFAULT 'staff',
+                        hire_date DATE,
+                        status ENUM('active', 'inactive') DEFAULT 'active',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+                    )
+                """)
+
+                # 8. Staff Commendations Table
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS staff_commendations (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        response_id INT NOT NULL,
+                        staff_id INT NOT NULL,
+                        rating INT DEFAULT 5,
+                        commendation_type ENUM('excellent_service', 'friendly_attitude', 'professional', 'helpful', 'knowledgeable') DEFAULT 'excellent_service',
+                        comment TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (response_id) REFERENCES responses(id) ON DELETE CASCADE,
+                        FOREIGN KEY (staff_id) REFERENCES staff(id) ON DELETE CASCADE
                     )
                 """)
 
@@ -863,7 +872,10 @@ def create_app() -> Flask:
                     logger.info("Adding 'rating' column to staff_commendations table...")
                     cursor.execute("ALTER TABLE staff_commendations ADD COLUMN rating INT DEFAULT 5 AFTER staff_id")
                     conn.commit()
-                
+
+                # Re-enable FK checks now that all tables/migrations are in place
+                cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+
                 conn.commit()
                 conn.close()
                 logger.info("Master schema check/update completed.")
