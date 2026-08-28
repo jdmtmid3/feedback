@@ -1,0 +1,813 @@
+{% extends "layout.html" %}
+<!-- 
+================================================================================
+FILE: manage_stores/store_details.html
+URL ROUTE: /admin/stores/<store_id>/details
+PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
+         for a specific store in a unified interface.
+================================================================================
+-->
+
+{% block title %}{{ store.store_name }} · Store Details{% endblock %}
+
+{% block content %}
+  <!-- Breadcrumb Navigation -->
+  <nav aria-label="breadcrumb" class="mb-4">
+    <ol class="breadcrumb">
+      <li class="breadcrumb-item"><a href="{{ url_for('admin_dashboard') }}" class="text-decoration-none">Dashboard</a></li>
+      <li class="breadcrumb-item"><a href="{{ url_for('stores_management') }}" class="text-decoration-none">Stores</a></li>
+      <li class="breadcrumb-item active" aria-current="page">{{ store.store_name }}</li>
+    </ol>
+  </nav>
+
+  <!-- Store Header -->
+  <div class="card mb-4 border-0 shadow-lg">
+    <div class="card-body p-4">
+      <!-- Smart Breadcrumb Navigation -->
+      <nav aria-label="breadcrumb" class="mb-3">
+        <ol class="breadcrumb mb-0">
+          <li class="breadcrumb-item">
+            <a href="{{ url_for('admin_dashboard') }}" class="text-decoration-none text-muted">
+              <i class="bi bi-speedometer2 me-1"></i>Dashboard
+            </a>
+          </li>
+          <li class="breadcrumb-item">
+            <a href="{{ url_for('stores_management') }}" class="text-decoration-none text-muted">
+              <i class="bi bi-shop me-1"></i>Stores
+            </a>
+          </li>
+          <li class="breadcrumb-item active text-dark fw-medium" aria-current="page">
+            {{ store.store_name }}
+          </li>
+        </ol>
+      </nav>
+
+      <!-- Page Header -->
+      <div class="d-flex justify-content-between align-items-start mb-4">
+        <div>
+          <div class="d-flex align-items-center gap-3 mb-2">
+            <h2 class="page-title mb-0">{{ store.store_name }}</h2>
+            <span class="badge bg-{{ 'success' if store.status == 'active' else 'secondary' if store.status == 'inactive' else 'warning' }} text-dark">
+              {{ store.status|title }}
+            </span>
+          </div>
+          <p class="page-subtitle">
+            {% if store.address %}
+              <i class="bi bi-geo-alt me-2"></i>
+              {{ store.address }}
+              {% if store.city %}, {{ store.city }}{% endif %}
+              {% if store.province %}, {{ store.province }}{% endif %}
+            {% endif %}
+            {% if store.contact_number %}
+              <span class="ms-3"><i class="bi bi-telephone me-2"></i>{{ store.contact_number }}</span>
+            {% endif %}
+          </p>
+        </div>
+        <div class="d-flex gap-2">
+          <button type="button" class="btn btn-outline-info" data-bs-toggle="modal" data-bs-target="#qrCodeModal">
+            <i class="bi bi-qr-code me-2"></i>
+            QR Code
+          </button>
+          <button type="button" class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#editStoreModal">
+            <i class="bi bi-pencil me-2"></i>
+            Edit Store
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Quick Stats Cards -->
+  <div class="row g-3 mb-4">
+    <div class="col-md-3">
+      <div class="card border-0 shadow-sm h-100">
+        <div class="card-body p-3">
+          <div class="d-flex align-items-center">
+            <div class="rounded-circle bg-primary bg-opacity-10 p-3 me-3">
+              <i class="bi bi-chat-left-text text-primary fs-5"></i>
+            </div>
+            <div>
+              <h3 class="h5 mb-0 fw-bold">{{ total_feedback }}</h3>
+              <p class="text-muted mb-0 small">Total Feedback</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-3">
+      <div class="card border-0 shadow-sm h-100">
+        <div class="card-body p-3">
+          <div class="d-flex align-items-center">
+            <div class="rounded-circle bg-success bg-opacity-10 p-3 me-3">
+              <i class="bi bi-star text-success fs-5"></i>
+            </div>
+            <div>
+              <h3 class="h5 mb-0 fw-bold">{{ avg_rating|round(1) if avg_rating else '0.0' }}/5</h3>
+              <p class="text-muted mb-0 small">Average Rating</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-3">
+      <div class="card border-0 shadow-sm h-100">
+        <div class="card-body p-3">
+          <div class="d-flex align-items-center">
+            <div class="rounded-circle bg-info bg-opacity-10 p-3 me-3">
+              <i class="bi bi-people text-info fs-5"></i>
+            </div>
+            <div>
+              <h3 class="h5 mb-0 fw-bold">{{ total_staff }}</h3>
+              <p class="text-muted mb-0 small">Staff Members</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-3">
+      <div class="card border-0 shadow-sm h-100">
+        <div class="card-body p-3">
+          <div class="d-flex align-items-center">
+            <div class="rounded-circle bg-warning bg-opacity-10 p-3 me-3">
+              <i class="bi bi-award text-warning fs-5"></i>
+            </div>
+            <div>
+              <h3 class="h5 mb-0 fw-bold">{{ total_commendations }}</h3>
+              <p class="text-muted mb-0 small">Commendations</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab Navigation -->
+  <div class="card border-0 shadow-lg">
+    <div class="card-header bg-white border-bottom-0">
+      <ul class="nav nav-tabs card-header-tabs" role="tablist">
+        <li class="nav-item">
+          <button class="nav-link active" id="feedback-tab" data-bs-toggle="tab" data-bs-target="#feedback" type="button" role="tab">
+            <i class="bi bi-chat-left-text me-2"></i>
+            Feedback
+          </button>
+        </li>
+        <li class="nav-item">
+          <button class="nav-link" id="analytics-tab" data-bs-toggle="tab" data-bs-target="#analytics" type="button" role="tab">
+            <i class="bi bi-bar-chart me-2"></i>
+            Analytics
+          </button>
+        </li>
+        <li class="nav-item">
+          <button class="nav-link" id="staff-tab" data-bs-toggle="tab" data-bs-target="#staff" type="button" role="tab">
+            <i class="bi bi-people me-2"></i>
+            Staff
+          </button>
+        </li>
+      </ul>
+    </div>
+    <div class="card-body p-0">
+      <div class="tab-content" id="storeTabContent">
+        <!-- Feedback Tab -->
+        <div class="tab-pane fade show active" id="feedback" role="tabpanel">
+          <div class="p-4">
+            <div class="d-flex justify-content-between align-items-center mb-4">
+              <h4 class="mb-0 fw-bold">Recent Feedback</h4>
+              <div class="d-flex gap-2">
+                <select class="form-select form-select-sm" style="width: auto;">
+                  <option value="all">All Status</option>
+                  <option value="unresolved">Unresolved</option>
+                  <option value="resolved">Resolved</option>
+                </select>
+                <a href="{{ request.url_root }}s/{{ store.id }}" target="_blank" class="btn btn-sm py-1 px-2" style="font-size: 0.75rem; background: rgba(255, 107, 53, 0.1); color: #FF6B35; border: 1px solid rgba(255, 107, 53, 0.3);">
+                  <i class="bi bi-arrow-right me-1"></i>
+                  View All Feedback
+                </a>
+              </div>
+            </div>
+            
+            {% if recent_feedback|length == 0 %}
+              <div class="text-center py-5">
+                <i class="bi bi-inbox text-muted fs-1"></i>
+                <p class="text-muted mt-3">No feedback received yet</p>
+              </div>
+            {% else %}
+              <div class="list-group list-group-flush">
+                {% for feedback in recent_feedback %}
+                <div class="list-group-item">
+                  <div class="d-flex align-items-start justify-content-between">
+                    <div>
+                      <h6 class="mb-1 fw-semibold">{{ feedback.user_email or 'Anonymous' }}</h6>
+                      {% if feedback.receipt_number %}
+                        <small class="text-muted">
+                          <i class="bi bi-receipt me-1"></i>
+                          {{ feedback.receipt_number }}
+                        </small>
+                      {% endif %}
+                      <p class="mb-1">{{ feedback.submitted_at.strftime('%b %d, %Y at %I:%M %p') }}</p>
+                      {% if feedback.avg_rating %}
+                        <div class="text-warning mb-2">
+                          {% for i in range(1, 6) %}
+                            {% if i <= feedback.avg_rating|round %}
+                              <i class="bi bi-star-fill"></i>
+                            {% else %}
+                              <i class="bi bi-star"></i>
+                            {% endif %}
+                          {% endfor %}
+                          {{ feedback.avg_rating|round(1) }}/5
+                        </div>
+                      {% endif %}
+                    </div>
+                    <span class="badge bg-{{ 'success' if feedback.status == 'resolved' else 'warning' }} text-dark">
+                      {{ feedback.status|title }}
+                    </span>
+                  </div>
+                </div>
+                {% endfor %}
+              </div>
+            {% endif %}
+          </div>
+        </div>
+
+        <!-- Analytics Tab -->
+        <div class="tab-pane fade" id="analytics" role="tabpanel">
+          <div class="p-4">
+            <h4 class="mb-4 fw-bold">Store Analytics</h4>
+            
+            <div class="row g-4">
+              <div class="col-md-6">
+                <div class="card border-0 shadow-sm">
+                  <div class="card-body p-3">
+                    <h6 class="card-title mb-3">5-Star Rating Analytics</h6>
+                    <div class="row text-center mb-3">
+                      <div class="col-4">
+                        <h4 class="text-warning">{{ "%.1f"|format(rating_quality_score) }}</h4>
+                        <small class="text-muted">Quality Score</small>
+                      </div>
+                      <div class="col-4">
+                        <h4 class="text-success">{{ "%.1f"|format(five_star_percentage) }}%</h4>
+                        <small class="text-muted">5-Star Rate</small>
+                      </div>
+                      <div class="col-4">
+                        <h4 class="text-info">{{ "%.1f"|format(four_plus_star_percentage) }}%</h4>
+                        <small class="text-muted">4+ Star Rate</small>
+                      </div>
+                    </div>
+                    <canvas id="ratingChart" width="200" height="120"></canvas>
+                  </div>
+                </div>
+              </div>
+              <div class="col-md-6">
+                <div class="card border-0 shadow-sm">
+                  <div class="card-body p-3">
+                    <h6 class="card-title mb-3">Feedback Trend</h6>
+                    <canvas id="trendChart" width="200" height="120"></canvas>
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            <div class="row g-4 mt-2">
+              <div class="col-md-6">
+                <div class="card border-0 shadow-sm">
+                  <div class="card-body p-3">
+                    <h6 class="card-title mb-3">Performance Metrics</h6>
+                    <div class="row text-center">
+                      <div class="col-6">
+                        <h4 class="text-primary">{{ resolution_rate }}%</h4>
+                        <small class="text-muted">Resolution Rate</small>
+                      </div>
+                      <div class="col-6">
+                        <h4 class="text-success">{{ response_time }}h</h4>
+                        <small class="text-muted">Avg Response Time</small>
+                      </div>
+                      <div class="col-6">
+                        <h4 class="text-info">{{ commendation_rate }}%</h4>
+                        <small class="text-muted">Commendation Rate</small>
+                      </div>
+                      <div class="col-6">
+                        <h4 class="text-warning">{{ repeat_rate }}%</h4>
+                        <small class="text-muted">Repeat Customers</small>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              
+              <div class="col-md-6">
+                <div class="card border-0 shadow-sm">
+                  <div class="card-body p-3">
+                    <h6 class="card-title mb-3">Staff Performance</h6>
+                    <div class="row text-center">
+                      <div class="col-4">
+                        <h4 class="text-success">{{ staff_performance|selectattr('performance_score', 'equalto', 'excellent')|list|length }}</h4>
+                        <small class="text-muted">Excellent</small>
+                      </div>
+                      <div class="col-4">
+                        <h4 class="text-warning">{{ staff_performance|selectattr('performance_score', 'equalto', 'average')|list|length }}</h4>
+                        <small class="text-muted">Average</small>
+                      </div>
+                      <div class="col-4">
+                        <h4 class="text-danger">{{ staff_performance|selectattr('performance_score', 'equalto', 'needs_attention')|list|length }}</h4>
+                        <small class="text-muted">Needs Attention</small>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            <!-- Staff Analytics Section -->
+            <div class="row g-4 mt-2">
+              <div class="col-md-6">
+                <div class="card border-0 shadow-sm">
+                  <div class="card-body p-3">
+                    <h6 class="card-title mb-3">
+                      <i class="bi bi-trophy text-warning me-2"></i>
+                      Staff Commendations Analytics
+                    </h6>
+                    {% if top_staff %}
+                      <!-- Top Performer -->
+                      {% if top_staff[0] %}
+                      <div class="d-flex align-items-center justify-content-center rounded-circle" style="width: 48px; height: 48px; min-width: 48px; background: linear-gradient(135deg, #FF6B35, #E85A2A); color: white; font-size: 1.2rem; font-weight: 700;">
+                        <div>
+                          <div class="fw-bold text-success">
+                            <i class="bi bi-award-fill me-2"></i>
+                            {{ top_staff[0].staff_name }}
+                          </div>
+                          <small class="text-muted">{{ top_staff[0].staff_position }}</small>
+                        </div>
+                        <div class="text-end">
+                          <span class="badge bg-success fs-6">{{ "%.1f"|format(top_staff[0].avg_rating) }} ★</span>
+                          <small class="text-muted d-block">avg rating</small>
+                        </div>
+                      </div>
+                      {% endif %}
+                      
+                      <!-- Other Top Performers -->
+                      {% for staff in top_staff[1:4] %}
+                      <div class="d-flex align-items-center justify-content-between mb-2 p-2 bg-light rounded">
+                        <div>
+                          <div class="fw-semibold">{{ staff.staff_name }}</div>
+                          <small class="text-muted">{{ staff.staff_position }}</small>
+                        </div>
+                        <div class="text-end">
+                          <span class="badge bg-success">{{ "%.1f"|format(staff.avg_rating) }} ★</span>
+                          <small class="text-muted d-block">avg rating</small>
+                        </div>
+                      </div>
+                      {% endfor %}
+                    {% else %}
+                      <p class="text-muted text-center py-2">No staff commendations yet</p>
+                    {% endif %}
+                    {% endif %}
+                  </div>
+                </div>
+              </div>
+              
+              <div class="col-md-6">
+                <div class="card border-0 shadow-sm">
+                  <div class="card-body p-3">
+                    <h6 class="card-title mb-3">
+                      <i class="bi bi-exclamation-triangle text-danger me-2"></i>
+                      Staff Needing Attention
+                    </h6>
+                    {% set needs_attention = staff_performance|selectattr('performance_score', 'equalto', 'needs_attention')|list %}
+                    {% if needs_attention %}
+                      {% for staff in needs_attention %}
+                      <div class="d-flex align-items-center justify-content-between mb-2 p-2 bg-light rounded">
+                        <div>
+                          <div class="fw-semibold">{{ staff.staff_name }}</div>
+                          <small class="text-muted">{{ staff.staff_position }}</small>
+                        </div>
+                        <div class="text-end">
+                          <span class="badge bg-secondary">{{ "%.1f"|format(staff.avg_rating|default(0)) }} ★</span>
+                          <small class="text-muted d-block">avg rating</small>
+                        </div>
+                      </div>
+                      {% endfor %}
+                    {% else %}
+                      <p class="text-muted text-center py-2">All staff performing well!</p>
+                    {% endif %}
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            <!-- Staff Commendations Chart -->
+            {% if top_staff %}
+            <div class="row g-4 mt-2">
+              <div class="col-md-12">
+                <div class="card border-0 shadow-sm">
+                  <div class="card-body p-3">
+                    <h6 class="card-title mb-3">Staff Commendations Breakdown</h6>
+                    <canvas id="staffCommendationsChart" width="300" height="150"></canvas>
+                  </div>
+                </div>
+              </div>
+            </div>
+            {% endif %}
+          </div>
+        </div>
+
+        <!-- Staff Tab -->
+        <div class="tab-pane fade" id="staff" role="tabpanel">
+          <div class="p-4">
+            <div class="d-flex justify-content-between align-items-center mb-4">
+              <h4 class="mb-0 fw-bold">Staff Members</h4>
+              <a href="{{ url_for('staff_management', store_id=store.id) }}" class="btn btn-primary btn-sm">
+                <i class="bi bi-gear me-1"></i>
+                Manage Staff
+              </a>
+            </div>
+            
+            {% if staff_members|length == 0 %}
+              <div class="text-center py-5">
+                <i class="bi bi-people text-muted fs-1"></i>
+                <p class="text-muted mt-3">No staff members added yet</p>
+                <a href="{{ url_for('staff_management', store_id=store.id) }}" class="btn btn-primary mt-3">
+                  <i class="bi bi-plus-lg me-2"></i>
+                  Add Staff Member
+                </a>
+              </div>
+            {% else %}
+              <div class="row g-3">
+                {% for member in staff_members %}
+                <div class="col-md-6 col-lg-4">
+                  <div class="card border-0 shadow-sm h-100">
+                    <div class="card-body p-3">
+                      <div class="d-flex align-items-start justify-content-between mb-3">
+                        <div class="rounded-circle bg-light p-2">
+                          <i class="bi bi-person text-muted fs-4"></i>
+                        </div>
+                        <span class="badge bg-{{ 'primary' if member.role == 'manager' else 'info' if member.role == 'supervisor' else 'secondary' }} text-white">
+                          {{ member.role|title }}
+                        </span>
+                      </div>
+                      <h5 class="card-title mb-1">{{ member.first_name }} {{ member.last_name }}</h5>
+                      {% if member.position %}
+                        <p class="text-muted small mb-2">{{ member.position }}</p>
+                      {% endif %}
+                      {% if member.email %}
+                        <p class="text-muted small mb-2">
+                          <i class="bi bi-envelope me-1"></i>
+                          {{ member.email }}
+                        </p>
+                      {% endif %}
+                      {% if member.phone %}
+                        <p class="text-muted small mb-0">
+                          <i class="bi bi-telephone me-1"></i>
+                          {{ member.phone }}
+                        </p>
+                      {% endif %}
+                    </div>
+                  </div>
+                </div>
+                {% endfor %}
+              </div>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- QR Code Modal -->
+  <div class="modal fade" id="qrCodeModal" tabindex="-1" aria-labelledby="qrCodeModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="qrCodeModalLabel">
+            <i class="bi bi-qr-code me-2"></i>
+            {{ store.store_name }} - Survey QR Code
+          </h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body text-center">
+          <div class="mb-4">
+            <div class="bg-white p-4 rounded-3 shadow-sm d-inline-block">
+              <img src="{{ qr_data_uri }}" alt="QR Code" style="width: 200px; height: 200px;" />
+            </div>
+          </div>
+          
+          <div class="mb-4">
+            <h6 class="fw-semibold mb-2">Survey Link</h6>
+            <div class="input-group">
+              <input type="text" id="surveyLink" class="form-control" value="{{ public_url }}" readonly />
+              <button class="btn btn-outline-primary" type="button" onclick="copySurveyLink()">
+                <i class="bi bi-clipboard"></i>
+                Copy
+              </button>
+            </div>
+            <p class="text-muted small mt-2">
+              Share this link or QR code with customers to collect feedback
+            </p>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+          <button type="button" class="btn btn-primary" onclick="downloadQRCode()">
+            <i class="bi bi-download me-2"></i>
+            Download QR Code
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Edit Store Modal (reuse from stores.html) -->
+  <div class="modal fade" id="editStoreModal" tabindex="-1" aria-labelledby="editStoreModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header" style="background: linear-gradient(135deg, #FF6B35 0%, #212529 100%); color: white; border-radius:14px 14px 0 0;">
+          <h5 class="modal-title" id="editStoreModalLabel">Edit Store</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <form method="POST" id="editStoreForm">
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label for="edit_store_name" class="form-label fw-medium">Store Name *</label>
+                <input type="text" id="edit_store_name" name="store_name" class="form-control" value="{{ store.store_name }}" required />
+              </div>
+              <div class="col-md-6">
+                <label for="edit_store_type" class="form-label fw-medium">Store Type</label>
+                <select id="edit_store_type" name="store_type" class="form-select">
+                  <option value="">Select type...</option>
+                  <option value="retail" {{ 'selected' if store.store_type == 'retail' }}>Retail</option>
+                  <option value="restaurant" {{ 'selected' if store.store_type == 'restaurant' }}>Restaurant</option>
+                  <option value="service" {{ 'selected' if store.store_type == 'service' }}>Service Center</option>
+                  <option value="office" {{ 'selected' if store.store_type == 'office' }}>Corporate Office</option>
+                  <option value="warehouse" {{ 'selected' if store.store_type == 'warehouse' }}>Warehouse</option>
+                  <option value="other" {{ 'selected' if store.store_type == 'other' }}>Other</option>
+                </select>
+              </div>
+              
+              <div class="col-12">
+                <label for="edit_address" class="form-label fw-medium">Address</label>
+                <input type="text" id="edit_address" name="address" class="form-control" value="{{ store.address or '' }}" />
+              </div>
+              
+              <div class="col-md-4">
+                <label for="edit_city" class="form-label fw-medium">City</label>
+                <input type="text" id="edit_city" name="city" class="form-control" value="{{ store.city or '' }}" />
+              </div>
+              <div class="col-md-4">
+                <label for="edit_province" class="form-label fw-medium">Province/State</label>
+                <input type="text" id="edit_province" name="province" class="form-control" value="{{ store.province or '' }}" />
+              </div>
+              <div class="col-md-4">
+                <label for="edit_postal_code" class="form-label fw-medium">Postal Code</label>
+                <input type="text" id="edit_postal_code" name="postal_code" class="form-control" value="{{ store.postal_code or '' }}" />
+              </div>
+              
+              <div class="col-md-4">
+                <label for="edit_contact_number" class="form-label fw-medium">Contact Number</label>
+                <input type="tel" id="edit_contact_number" name="contact_number" class="form-control" value="{{ store.contact_number or '' }}" />
+              </div>
+              <div class="col-md-4">
+                <label for="edit_email" class="form-label fw-medium">Email</label>
+                <input type="email" id="edit_email" name="email" class="form-control" value="{{ store.email or '' }}" />
+              </div>
+              <div class="col-md-4">
+                <label for="edit_status" class="form-label fw-medium">Status</label>
+                <select id="edit_status" name="status" class="form-select">
+                  <option value="active" {{ 'selected' if store.status == 'active' }}>Active</option>
+                  <option value="inactive" {{ 'selected' if store.status == 'inactive' }}>Inactive</option>
+                  <option value="maintenance" {{ 'selected' if store.status == 'maintenance' }}>Maintenance</option>
+                </select>
+              </div>
+            </div>
+          </form>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" form="editStoreForm" class="btn btn-primary">Save Changes</button>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    // Set edit form action
+    document.getElementById('editStoreForm').action = `/admin/stores/{{ store.id }}/edit`;
+    
+    // QR Code functions
+    window.copySurveyLink = function() {
+        const surveyLink = document.getElementById('surveyLink');
+        surveyLink.select();
+        document.execCommand('copy');
+        
+        // Show feedback
+        const button = event.target;
+        const originalText = button.innerHTML;
+        button.innerHTML = '<i class="bi bi-check me-2"></i>Copied!';
+        button.classList.remove('btn-outline-primary');
+        button.classList.add('btn-success');
+        
+        setTimeout(() => {
+            button.innerHTML = originalText;
+            button.classList.remove('btn-success');
+            button.classList.add('btn-outline-primary');
+        }, 2000);
+    };
+    
+    window.downloadQRCode = function() {
+        const qrImage = document.querySelector('#qrCodeModal img');
+        if (!qrImage) return;
+        
+        // Create download link
+        const link = document.createElement('a');
+        link.href = qrImage.src;
+        link.download = 'QR_' + '{{ store.store_name }}'.replace(/[^a-z0-9]/gi, '_') + '_Survey.png';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    };
+    
+    // Analytics Charts
+    const ctx1 = document.getElementById('ratingChart');
+    if (ctx1) {
+        new Chart(ctx1, {
+            type: 'bar',
+            data: {
+                labels: ['1 Star', '2 Stars', '3 Stars', '4 Stars', '5 Stars'],
+                datasets: [{
+                    label: 'Number of Ratings',
+                    data: {{ rating_distribution|tojson }},
+                    backgroundColor: [
+                        '#FF6B35',  // 1 star - orange
+                        '#FF6B35',  // 2 stars - orange
+                        '#E85A2A',  // 3 stars - darker orange
+                        '#E85A2A',  // 4 stars - darker orange
+                        '#CC4A1F'   // 5 stars - darkest orange
+                    ],
+                    borderColor: [
+                        '#FF6B35',
+                        '#FF6B35', 
+                        '#E85A2A',
+                        '#E85A2A',
+                        '#CC4A1F'
+                    ],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        ticks: {
+                            stepSize: 1
+                        }
+                    }
+                },
+                plugins: {
+                    legend: {
+                        display: false
+                    },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                const total = {{ total_ratings }};
+                                const value = context.parsed.y;
+                                const percentage = ((value / total) * 100).toFixed(1);
+                                return `${context.parsed.y} ratings (${percentage}%)`;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    
+    const ctx2 = document.getElementById('trendChart');
+    if (ctx2) {
+        new Chart(ctx2, {
+            type: 'line',
+            data: {
+                labels: {{ feedback_trend_labels|tojson }},
+                datasets: [{
+                    label: 'Feedback Count',
+                    data: {{ feedback_trend_data|tojson }},
+                    borderColor: '#FF6B35',
+                    backgroundColor: '#FF6B35',
+                    tension: 0.4
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        ticks: {
+                            stepSize: 1
+                        }
+                    }
+                }
+            }
+        });
+    }
+    
+    // Staff Commendations Chart
+    const ctx3 = document.getElementById('staffCommendationsChart');
+    if (ctx3) {
+        const staffData = {{ top_staff|tojson }};
+        const staffNames = staffData.map(s => s.staff_name);
+        const commendationCounts = staffData.map(s => s.total_commendations);
+        
+        new Chart(ctx3, {
+            type: 'bar',
+            data: {
+                labels: staffNames,
+                datasets: [{
+                    label: 'Total Commendations',
+                    data: commendationCounts,
+                    backgroundColor: [
+                        '#4A90E2',
+                        '#4A90E2',
+                        '#357ABD',
+                        '#357ABD',
+                        '#357ABD',
+                        '#357ABD'
+                    ],
+                    borderColor: [
+                        '#4A90E2',
+                        '#4A90E2',
+                        '#357ABD',
+                        '#357ABD',
+                        '#357ABD',
+                        '#357ABD'
+                    ],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        ticks: {
+                            stepSize: 1
+                        }
+                    }
+                },
+                plugins: {
+                    legend: {
+                        display: false
+                    }
+                }
+            }
+        });
+    }
+});
+</script>
+
+<style>
+.nav-tabs .nav-link {
+    color: #6c757d;
+    border-bottom: 2px solid transparent;
+}
+
+.nav-tabs .nav-link.active {
+    color: #0d6efd;
+    border-bottom-color: #0d6efd;
+    background: none;
+}
+
+.nav-tabs .nav-link:hover {
+    color: #0d6efd;
+    border-bottom-color: rgba(13, 110, 253, 0.3);
+}
+
+.card-header-tabs {
+    border-bottom: none;
+}
+
+.list-group-item {
+    border-left: 3px solid transparent;
+    transition: all 0.2s ease;
+}
+
+.list-group-item:hover {
+    border-left-color: #0d6efd;
+    background-color: #f8f9fa;
+}
+
+.commendation-card {
+    transition: all 0.2s ease;
+}
+
+.commendation-card:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+</style>
+{% endblock %}

@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Support Tickets · Tugon Licensing</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary-50: rgba(62,225,163,.16);
+            --primary-400: #60f2bd;
+            --primary-500: #3ee1a3;
+            --primary-600: #32f08c;
+            --primary-700: #26a57b;
+            --slate-50: #17181a;
+            --slate-100: #121314;
+            --slate-200: #111214;
+            --slate-300: #202123;
+            --slate-400: #2a2c2e;
+            --slate-500: #4a4c4e;
+            --slate-600: #6a6c6e;
+            --slate-700: #8a8c8e;
+            --slate-800: #a8aaa9;
+            --slate-900: #f5f9fe;
+            --success-50: rgba(38,165,123,.16);
+            --success-500: #26a57b;
+            --success-600: #1ab07f;
+            --warning-50: rgba(0,184,248,.16);
+            --warning-500: #00b8f8;
+            --warning-600: #04cbe5;
+            --danger-50: rgba(239,68,68,.16);
+            --danger-500: #ef4444;
+            --danger-600: #dc2626;
+        }
+        * { box-sizing: border-box; }
+        body {
+            background: #0a0b0d;
+            color: var(--slate-900);
+            font-family: 'Inter',-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+            min-height: 100vh;
+            font-size: .875rem;
+            line-height: 1.5;
+            margin: 0;
+        }
+        .top-nav {
+            background: var(--slate-100);
+            border-bottom: 1px solid var(--slate-300);
+            padding: 0 2rem;
+            height: 64px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        .nav-brand {
+            display: flex; align-items: center; gap: .75rem;
+            font-weight: 700; font-size: 1.125rem;
+            color: var(--slate-900); text-decoration: none;
+        }
+        .nav-brand-icon {
+            width: 36px; height: 36px;
+            background: linear-gradient(90deg,var(--primary-500) 0%,var(--primary-600) 36%,var(--primary-400) 72%,rgba(160,253,231,.4) 100%);
+            border-radius: 10px;
+            display: flex; align-items: center; justify-content: center;
+            color: var(--slate-50); font-size: 1rem;
+        }
+        .nav-links { display: flex; align-items: center; gap: .5rem; }
+        .nav-links a {
+            color: var(--slate-700); text-decoration: none; font-size: .85rem;
+            font-weight: 500; padding: .5rem .75rem; border-radius: 8px; transition: all .15s;
+        }
+        .nav-links a:hover, .nav-links a.active { background: var(--slate-300); color: var(--slate-900); }
+        .main-container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+        .page-header { margin-bottom: 2rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+        .page-header h1 { font-size: 1.75rem; font-weight: 700; margin: 0; letter-spacing: -.02em; }
+        .page-header p { color: var(--slate-700); margin: .25rem 0 0; font-size: .95rem; }
+        .stats-row { display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }
+        .stat-pill {
+            display: flex; align-items: center; gap: .5rem;
+            padding: .5rem 1rem; border-radius: 9999px; font-size: .8rem; font-weight: 600;
+            border: 1px solid var(--slate-300); background: var(--slate-100);
+        }
+        .stat-pill .count { font-size: 1.1rem; }
+        .card {
+            background: var(--slate-100);
+            border: 1px solid var(--slate-300);
+            border-radius: 12px;
+            box-shadow: 0 1px 2px rgba(0,0,0,.3);
+        }
+        .alert {
+            padding: .875rem 1rem; border-radius: 8px; font-size: .875rem;
+            margin-bottom: 1.5rem; display: flex; align-items: center; gap: .625rem;
+        }
+        .alert-success { background: var(--success-50); color: var(--success-600); border: 1px solid rgba(34,197,94,.2); }
+        .alert-danger { background: var(--danger-50); color: var(--danger-600); border: 1px solid rgba(239,68,68,.2); }
+        .alert-close { margin-left: auto; background: none; border: none; cursor: pointer; color: currentColor; opacity: .6; font-size: 1.25rem; line-height: 1; padding: 0; }
+        .alert-close:hover { opacity: 1; }
+        .status-badge {
+            display: inline-flex; align-items: center; gap: .375rem;
+            padding: .25rem .625rem; border-radius: 9999px; font-size: .75rem; font-weight: 600;
+        }
+        .status-badge::before { content: ''; width: 6px; height: 6px; border-radius: 50%; }
+        .status-badge.open { background: var(--success-50); color: var(--success-600); }
+        .status-badge.open::before { background: var(--success-500); }
+        .status-badge.in_progress { background: var(--warning-50); color: var(--warning-600); }
+        .status-badge.in_progress::before { background: var(--warning-500); }
+        .status-badge.resolved { background: var(--primary-50); color: var(--primary-700); }
+        .status-badge.resolved::before { background: var(--primary-500); }
+        .status-badge.closed { background: rgba(100,100,100,.15); color: var(--slate-600); }
+        .status-badge.closed::before { background: var(--slate-500); }
+        .type-badge {
+            display: inline-flex; padding: .2rem .5rem; border-radius: 6px;
+            font-size: .7rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+        }
+        .type-badge.renewal { background: var(--warning-50); color: var(--warning-600); }
+        .type-badge.bug { background: var(--danger-50); color: var(--danger-600); }
+        .type-badge.feature { background: var(--primary-50); color: var(--primary-700); }
+        .type-badge.general { background: var(--slate-300); color: var(--slate-700); }
+        .ticket-row {
+            padding: 1.25rem 1.5rem;
+            border-bottom: 1px solid var(--slate-300);
+            transition: background .1s;
+            cursor: pointer;
+        }
+        .ticket-row:hover { background: var(--slate-200); }
+        .ticket-row:last-child { border-bottom: none; }
+        .ticket-top { display: flex; align-items: center; gap: .75rem; margin-bottom: .5rem; flex-wrap: wrap; }
+        .ticket-subject { font-weight: 600; color: var(--slate-900); font-size: .9rem; flex: 1; min-width: 200px; }
+        .ticket-company { font-size: .8rem; color: var(--slate-600); }
+        .ticket-email { font-size: .8rem; color: var(--slate-600); }
+        .ticket-date { font-size: .75rem; color: var(--slate-500); }
+        .ticket-message { font-size: .85rem; color: var(--slate-700); margin: .25rem 0; }
+        .ticket-reply-box {
+            margin-top: .75rem; padding: .75rem;
+            background: rgba(62,225,163,.06); border-radius: 8px;
+            border-left: 3px solid var(--primary-500); font-size: .85rem; color: var(--primary-400);
+        }
+        .ticket-actions {
+            display: none; margin-top: 1rem; padding-top: 1rem;
+            border-top: 1px solid var(--slate-300);
+        }
+        .ticket-row.expanded .ticket-actions { display: block; }
+        .btn {
+            display: inline-flex; align-items: center; justify-content: center; gap: .5rem;
+            font-weight: 500; font-size: .875rem; padding: .625rem 1rem;
+            border-radius: 8px; border: 1px solid transparent;
+            cursor: pointer; transition: all .15s; font-family: inherit; text-decoration: none;
+        }
+        .btn-primary { background: var(--primary-600); color: #fff; border-color: var(--primary-600); }
+        .btn-primary:hover { background: var(--primary-700); border-color: var(--primary-700); }
+        .btn-secondary { background: var(--slate-200); color: var(--slate-900); border-color: var(--slate-400); }
+        .btn-secondary:hover { background: var(--slate-300); }
+        .btn-sm { padding: .375rem .625rem; font-size: .8rem; }
+        .form-control, .form-select {
+            width: 100%; border: 1px solid var(--slate-400); border-radius: 8px;
+            padding: .625rem .875rem; font-size: .875rem; font-family: inherit;
+            background: var(--slate-200); color: var(--slate-900); transition: all .15s;
+        }
+        .form-control:focus, .form-select:focus { outline: none; border-color: var(--primary-600); box-shadow: 0 0 0 3px rgba(50,240,140,.2); }
+        textarea.form-control { min-height: 80px; resize: vertical; }
+        .empty-state {
+            text-align: center; padding: 4rem 2rem;
+        }
+        .empty-state i { font-size: 2.5rem; color: var(--slate-500); }
+        .empty-state h3 { font-size: 1rem; font-weight: 600; margin: 1rem 0 .25rem; }
+        .empty-state p { color: var(--slate-600); margin: 0; }
+        .reply-form { display: flex; gap: .75rem; flex-wrap: wrap; }
+        .reply-form textarea { flex: 1; min-width: 250px; }
+        .reply-form .actions { display: flex; gap: .5rem; align-items: end; }
+        @media (max-width: 768px) {
+            .main-container { padding: 1rem; }
+            .top-nav { padding: 0 1rem; }
+            .reply-form { flex-direction: column; }
+            .reply-form .actions { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <nav class="top-nav">
+        <a href="/" class="nav-brand">
+            <div class="nav-brand-icon"><i class="bi bi-key-fill"></i></div>
+            <span>Tugon Licensing</span>
+        </a>
+        <div class="nav-links">
+            <a href="/">Dashboard</a>
+            <a href="/messages" class="active">Messages</a>
+        </div>
+    </nav>
+
+    <main class="main-container">
+        <div class="page-header">
+            <div>
+                <h1>Support Tickets</h1>
+                <p>Manage and respond to client support requests</p>
+            </div>
+        </div>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ 'danger' if category == 'danger' else 'success' }}">
+                        <i class="bi bi-{{ 'exclamation-triangle-fill' if category == 'danger' else 'check-circle-fill' }}"></i>
+                        {{ message }}
+                        <button type="button" class="alert-close" onclick="this.parentElement.remove()">&times;</button>
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <!-- Stats -->
+        <div class="stats-row">
+            <div class="stat-pill">
+                <span class="count">{{ tickets|length }}</span> Total
+            </div>
+            <div class="stat-pill" style="color: var(--success-600);">
+                <span class="count">{{ tickets|selectattr('status','equalto','open')|list|length }}</span> Open
+            </div>
+            <div class="stat-pill" style="color: var(--warning-600);">
+                <span class="count">{{ tickets|selectattr('status','equalto','in_progress')|list|length }}</span> In Progress
+            </div>
+            <div class="stat-pill" style="color: var(--primary-700);">
+                <span class="count">{{ tickets|selectattr('status','equalto','resolved')|list|length }}</span> Resolved
+            </div>
+        </div>
+
+        <div class="card">
+            {% if tickets %}
+                {% for ticket in tickets %}
+                <div class="ticket-row" onclick="toggleTicket(this, event)">
+                    <div class="ticket-top">
+                        <span class="status-badge {{ ticket.status }}">{{ ticket.status|replace('_',' ')|title }}</span>
+                        <span class="type-badge {{ ticket.ticket_type }}">{{ ticket.ticket_type }}</span>
+                        <span class="ticket-subject">{{ ticket.subject }}</span>
+                        <span class="ticket-date">{{ ticket.created_at.strftime('%b %d, %Y %I:%M %p') if ticket.created_at else '' }}</span>
+                    </div>
+                    <div style="display: flex; gap: 1.5rem; flex-wrap: wrap;">
+                        <span class="ticket-company"><i class="bi bi-building"></i> {{ ticket.company_name }}</span>
+                        <span class="ticket-email"><i class="bi bi-envelope"></i> {{ ticket.contact_email }}</span>
+                        {% if ticket.license_key %}
+                        <span class="ticket-email"><i class="bi bi-key"></i> {{ ticket.license_key[:16] }}...</span>
+                        {% endif %}
+                    </div>
+                    <div class="ticket-message">{{ ticket.message }}</div>
+
+                    {% if ticket.admin_reply %}
+                    <div class="ticket-reply-box">
+                        <strong style="font-size: .7rem; text-transform: uppercase; letter-spacing: .03em;">Your Reply</strong>
+                        {% if ticket.replied_at %}<span class="ticket-date" style="margin-left: .5rem;">{{ ticket.replied_at.strftime('%b %d, %Y') if ticket.replied_at else '' }}</span>{% endif %}
+                        <br>{{ ticket.admin_reply }}
+                    </div>
+                    {% endif %}
+
+                    <div class="ticket-actions" onclick="event.stopPropagation()">
+                        <form method="POST" action="{{ url_for('admin_reply_ticket', ticket_id=ticket.id) }}">
+                            <div class="reply-form">
+                                <textarea class="form-control" name="admin_reply" placeholder="Write your reply..." required>{{ ticket.admin_reply or '' }}</textarea>
+                                <div class="actions">
+                                    <select class="form-select" name="status" style="width: auto; min-width: 140px;">
+                                        <option value="in_progress" {{ 'selected' if ticket.status == 'in_progress' }}>In Progress</option>
+                                        <option value="resolved" {{ 'selected' if ticket.status == 'resolved' }}>Resolved</option>
+                                        <option value="closed" {{ 'selected' if ticket.status == 'closed' }}>Closed</option>
+                                    </select>
+                                    <button type="submit" class="btn btn-primary btn-sm">
+                                        <i class="bi bi-reply"></i> Send
+                                    </button>
+                                </div>
+                            </div>
+                        </form>
+                        {% if ticket.status != 'closed' %}
+                        <form method="POST" action="{{ url_for('admin_update_ticket_status', ticket_id=ticket.id) }}" style="margin-top: .75rem;">
+                            <input type="hidden" name="status" value="closed">
+                            <button type="submit" class="btn btn-secondary btn-sm" onclick="return confirm('Close this ticket?')">
+                                <i class="bi bi-x-circle"></i> Close Ticket
+                            </button>
+                        </form>
+                        {% endif %}
+                    </div>
+                </div>
+                {% endfor %}
+            {% else %}
+                <div class="empty-state">
+                    <i class="bi bi-inbox"></i>
+                    <h3>No tickets yet</h3>
+                    <p>Support tickets from clients will appear here</p>
+                </div>
+            {% endif %}
+        </div>
+    </main>
+
+    <script>
+    function toggleTicket(row, event) {
+        if (event.target.closest('.ticket-actions')) return;
+        row.classList.toggle('expanded');
+    }
+    </script>
+</body>
+</html>

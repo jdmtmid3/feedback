@@ -1,0 +1,166 @@
+{% extends "layout.html" %}
+
+{% block title %}History · Feedback Admin{% endblock %}
+
+{% block content %}
+  <style>
+    .history-item {
+      transition: all 0.2s ease;
+      border-left: 4px solid transparent;
+    }
+    .history-item:hover {
+      transform: translateX(4px);
+      border-left-color: var(--primary-400);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+    }
+    .entity-badge {
+      font-size: 0.75rem;
+      padding: 0.35rem 0.75rem;
+      border-radius: 8px;
+      font-weight: 500;
+    }
+    .action-badge {
+      font-size: 0.7rem;
+      padding: 0.25rem 0.6rem;
+      border-radius: 6px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .date-badge {
+      background: linear-gradient(135deg, var(--neutral-100) 0%, var(--neutral-200) 100%);
+      border-radius: 8px;
+      padding: 0.5rem 0.75rem;
+    }
+    .details-box {
+      background: var(--neutral-50);
+      border-radius: 8px;
+      padding: 0.5rem 0.75rem;
+      font-size: 0.85rem;
+    }
+  </style>
+
+  <div class="d-flex justify-content-between align-items-center mb-4">
+    <div>
+      <h2 class="page-title mb-1">History</h2>
+      <p class="page-subtitle mb-0">
+        Track all system operations and changes
+      </p>
+    </div>
+    <div class="d-flex gap-2">
+      <form method="POST" action="{{ url_for('clear_history') }}" onsubmit="return confirm('Are you sure you want to clear all history? This cannot be undone.');">
+        <button class="btn btn-outline-danger">
+          <i class="bi bi-trash me-2"></i>Clear History
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <div class="card border-0 shadow-sm">
+    <div class="card-body p-4">
+      {% if logs|length == 0 %}
+        <div class="text-center py-5">
+          <div class="rounded-circle bg-light mx-auto mb-3 d-flex align-items-center justify-content-center" style="width: 108px; height: 108px;">
+            <i class="bi bi-clock-history text-muted fs-1"></i>
+          </div>
+          <h4 class="text-muted mb-2">No History Yet</h4>
+          <p class="text-muted fs-5 mb-0">History of system operations will appear here.</p>
+        </div>
+      {% else %}
+        <div class="table-responsive">
+          <table class="table table-hover" style="border-collapse: separate; border-spacing: 0 8px;">
+            <thead>
+              <tr>
+                <th style="border: none; padding-bottom: 0;">Date & Time</th>
+                <th style="border: none; padding-bottom: 0;">Entity</th>
+                <th style="border: none; padding-bottom: 0;">Action</th>
+                <th style="border: none; padding-bottom: 0;">Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for log in logs %}
+              <tr class="history-item" style="background: white; box-shadow: 0 2px 8px rgba(0,0,0,0.04);">
+                <td>
+                  <div class="date-badge mb-1">
+                    <div class="fw-bold text-dark">{{ log.created_at.strftime('%b %d, %Y') }}</div>
+                    <small class="text-muted">{{ log.created_at.strftime('%I:%M %p') }}</small>
+                  </div>
+                </td>
+                <td>
+                  {% if log.entity_type == 'store' %}
+                    <span class="entity-badge bg-primary bg-opacity-10 text-primary">
+                      <i class="bi bi-shop me-1"></i>Store
+                    </span>
+                  {% elif log.entity_type == 'staff' %}
+                    <span class="entity-badge bg-info bg-opacity-10 text-info">
+                      <i class="bi bi-person me-1"></i>Staff
+                    </span>
+                  {% elif log.entity_type == 'questionnaire' %}
+                    <span class="entity-badge bg-warning bg-opacity-10 text-warning">
+                      <i class="bi bi-question-square me-1"></i>Questionnaire
+                    </span>
+                  {% elif log.entity_type == 'question' %}
+                    <span class="entity-badge bg-success bg-opacity-10 text-success">
+                      <i class="bi bi-chat-left-text me-1"></i>Question
+                    </span>
+                  {% else %}
+                    <span class="entity-badge bg-secondary bg-opacity-10 text-secondary">
+                      <i class="bi bi-box me-1"></i>{{ log.entity_type|title }}
+                    </span>
+                  {% endif %}
+                </td>
+                <td>
+                  {% if log.action == 'created' %}
+                    <span class="action-badge bg-success text-white">
+                      <i class="bi bi-plus-circle me-1"></i>Added
+                    </span>
+                  {% elif log.action == 'updated' %}
+                    <span class="action-badge bg-info text-white">
+                      <i class="bi bi-pencil me-1"></i>Edited
+                    </span>
+                  {% elif log.action == 'deleted' %}
+                    <span class="action-badge bg-danger text-white">
+                      <i class="bi bi-trash me-1"></i>Deleted
+                    </span>
+                  {% elif log.action == 'published' %}
+                    <span class="action-badge bg-primary text-white">
+                      <i class="bi bi-send me-1"></i>Published
+                    </span>
+                  {% elif log.action == 'toggled' %}
+                    <span class="action-badge bg-warning text-white">
+                      <i class="bi bi-toggle-on me-1"></i>Toggled
+                    </span>
+                  {% else %}
+                    <span class="action-badge bg-secondary text-white">
+                      <i class="bi bi-arrow-repeat me-1"></i>{{ log.action|title }}
+                    </span>
+                  {% endif %}
+                </td>
+                <td>
+                  <div class="details-box">
+                    <small class="text-muted">
+                      {% if log.new_values %}
+                        {{ log.new_values }}
+                      {% elif log.old_values %}
+                        {{ log.old_values }}
+                      {% else %}
+                        <em>ID: {{ log.entity_id }}</em>
+                      {% endif %}
+                    </small>
+                  </div>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="mt-4 text-center">
+          <small class="text-muted">
+            <i class="bi bi-info-circle me-1"></i>
+            Showing last 100 entries. Logs older than 90 days are automatically pruned.
+          </small>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+{% endblock %}

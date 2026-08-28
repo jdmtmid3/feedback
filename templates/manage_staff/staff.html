@@ -1,0 +1,612 @@
+{% extends "layout.html" %}
+<!-- 
+================================================================================
+FILE: manage_staff/staff.html
+URL ROUTE: /admin/stores/<store_id>/staff
+PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/deleting 
+         staff members for the store.
+================================================================================
+-->
+
+{% block title %}Staff Management · {{ store.store_name }} · Feedback Admin{% endblock %}
+
+{% block content %}
+  <div class="d-flex justify-content-between align-items-start mb-4">
+    <div>
+      <h2 class="page-title">Staff Management</h2>
+      <p class="page-subtitle">
+        Manage staff members for <strong>{{ store.store_name }}</strong>
+      </p>
+    </div>
+    <div class="d-flex gap-2">
+      <a href="{{ url_for('stores_management') }}" class="btn btn-outline-primary d-flex align-items-center">
+        <i class="bi bi-arrow-left me-2"></i>
+        Back to Stores
+      </a>
+      <a href="{{ url_for('store_feedback', store_id=store.id) }}" class="btn btn-outline-success d-flex align-items-center">
+        <i class="bi bi-chat-left-text me-2"></i>
+        View Feedback
+      </a>
+    </div>
+  </div>
+
+  <!-- Store Info Card -->
+  <div class="card mb-4 border-0 shadow-lg">
+    <div class="card-body p-3">
+      <div class="d-flex align-items-center">
+        <div class="rounded-circle bg-primary bg-opacity-10 p-3 me-3">
+          <i class="bi bi-shop text-primary fs-4"></i>
+        </div>
+        <div>
+          <h4 class="mb-1 fw-bold">{{ store.store_name }}</h4>
+          {% if store.address %}
+            <p class="text-muted mb-0">
+              <i class="bi bi-geo-alt me-2"></i>
+              {{ store.address }}
+              {% if store.city %}, {{ store.city }}{% endif %}
+              {% if store.province %}, {{ store.province }}{% endif %}
+            </p>
+          {% endif %}
+        </div>
+        <div class="ms-auto">
+          <span class="badge bg-{{ 'success' if store.status == 'active' else 'secondary' if store.status == 'inactive' else 'warning' }} text-dark">
+            {{ store.status|title }}
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- QR Code Section -->
+  <div class="card mb-4 border-0 shadow-lg">
+    <div class="card-body p-4">
+      <div class="row align-items-center">
+        <div class="col-md-8">
+          <div class="d-flex align-items-center mb-3">
+            <div class="rounded-circle bg-info bg-opacity-10 p-3 me-3">
+              <i class="bi bi-qr-code text-info fs-4"></i>
+            </div>
+            <div>
+              <h4 class="mb-1 fw-bold">Store Survey QR Code</h4>
+              <p class="text-muted mb-0">Share this QR code with customers to collect feedback</p>
+            </div>
+          </div>
+          <div class="mb-3">
+            <div class="input-group">
+              <input type="text" id="staffSurveyLink" class="form-control" value="{{ public_url }}" readonly />
+              <button class="btn btn-outline-primary" type="button" onclick="copyStaffSurveyLink()">
+                <i class="bi bi-clipboard"></i>
+                Copy
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-4 text-center">
+          <div class="bg-white p-3 rounded-3 shadow-sm d-inline-block">
+            <img src="{{ qr_data_uri }}" alt="QR Code" style="width: 150px; height: 150px;" />
+          </div>
+          <button type="button" class="btn btn-sm btn-outline-info mt-3" onclick="downloadStaffQRCode()">
+            <i class="bi bi-download me-2"></i>
+            Download
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Staff Management Card -->
+  <div class="card mb-3 border-0 shadow-lg">
+    <div class="card-body p-3">
+      <div class="d-flex align-items-center justify-content-between">
+        <div class="d-flex align-items-center">
+          <div class="rounded-circle bg-primary bg-opacity-10 p-3 me-3">
+            <i class="bi bi-people text-primary fs-4"></i>
+          </div>
+          <div>
+            <h4 class="mb-0 fw-bold">Staff Members</h4>
+            <p class="text-muted mb-0">Add and manage staff for this store</p>
+          </div>
+        </div>
+        <button type="button" class="btn btn-primary d-flex align-items-center" data-bs-toggle="modal" data-bs-target="#addStaffModal">
+          <i class="bi bi-plus-lg me-2"></i>
+          Add Staff Member
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add Staff Modal -->
+  <div class="modal fade" id="addStaffModal" tabindex="-1" aria-labelledby="addStaffModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="addStaffModalLabel">Add Staff Member</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <form method="POST" action="{{ url_for('add_staff', store_id=store.id) }}" id="addStaffForm">
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label for="first_name" class="form-label fw-medium">First Name *</label>
+                <input
+                  type="text"
+                  id="first_name"
+                  name="first_name"
+                  class="form-control"
+                  placeholder="e.g. John"
+                  required
+                />
+              </div>
+              <div class="col-md-6">
+                <label for="last_name" class="form-label fw-medium">Last Name *</label>
+                <input
+                  type="text"
+                  id="last_name"
+                  name="last_name"
+                  class="form-control"
+                  placeholder="e.g. Smith"
+                  required
+                />
+              </div>
+              
+              <div class="col-md-6">
+                <label for="email" class="form-label fw-medium">Email</label>
+                <input
+                  type="email"
+                  id="email"
+                  name="email"
+                  class="form-control"
+                  placeholder="e.g. john.smith@example.com"
+                />
+              </div>
+              <div class="col-md-6">
+                <label for="phone" class="form-label fw-medium">Phone Number</label>
+                <input
+                  type="tel"
+                  id="phone"
+                  name="phone"
+                  class="form-control"
+                  placeholder="e.g. (555) 123-4567"
+                />
+              </div>
+              
+              <div class="col-md-6">
+                <label for="position" class="form-label fw-medium">Position</label>
+                <input
+                  type="text"
+                  id="position"
+                  name="position"
+                  class="form-control"
+                  placeholder="e.g. Sales Associate"
+                />
+              </div>
+              <div class="col-md-6">
+                <label for="role" class="form-label fw-medium">Role</label>
+                <select id="role" name="role" class="form-select">
+                  <option value="staff">Staff</option>
+                  <option value="manager">Manager</option>
+                  <option value="supervisor">Supervisor</option>
+                </select>
+              </div>
+              
+              <div class="col-12">
+                <label for="hire_date" class="form-label fw-medium">Hire Date</label>
+                <input
+                  type="date"
+                  id="hire_date"
+                  name="hire_date"
+                  class="form-control"
+                />
+              </div>
+            </div>
+          </form>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" form="addStaffForm" class="btn btn-primary d-flex align-items-center">
+            <i class="bi bi-plus-lg me-2"></i>
+            Add Staff Member
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Edit Staff Modal -->
+  <div class="modal fade" id="editStaffModal" tabindex="-1" aria-labelledby="editStaffModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="editStaffModalLabel">Edit Staff Member</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <form method="POST" id="editStaffForm">
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label for="edit_first_name" class="form-label fw-medium">First Name *</label>
+                <input
+                  type="text"
+                  id="edit_first_name"
+                  name="first_name"
+                  class="form-control"
+                  required
+                />
+              </div>
+              <div class="col-md-6">
+                <label for="edit_last_name" class="form-label fw-medium">Last Name *</label>
+                <input
+                  type="text"
+                  id="edit_last_name"
+                  name="last_name"
+                  class="form-control"
+                  required
+                />
+              </div>
+              
+              <div class="col-md-6">
+                <label for="edit_email" class="form-label fw-medium">Email</label>
+                <input
+                  type="email"
+                  id="edit_email"
+                  name="email"
+                  class="form-control"
+                />
+              </div>
+              <div class="col-md-6">
+                <label for="edit_phone" class="form-label fw-medium">Phone Number</label>
+                <input
+                  type="tel"
+                  id="edit_phone"
+                  name="phone"
+                  class="form-control"
+                />
+              </div>
+              
+              <div class="col-md-6">
+                <label for="edit_position" class="form-label fw-medium">Position</label>
+                <input
+                  type="text"
+                  id="edit_position"
+                  name="position"
+                  class="form-control"
+                />
+              </div>
+              <div class="col-md-6">
+                <label for="edit_role" class="form-label fw-medium">Role</label>
+                <select id="edit_role" name="role" class="form-select">
+                  <option value="staff">Staff</option>
+                  <option value="manager">Manager</option>
+                  <option value="supervisor">Supervisor</option>
+                </select>
+              </div>
+              
+              <div class="col-md-6">
+                <label for="edit_status" class="form-label fw-medium">Status</label>
+                <select id="edit_status" name="status" class="form-select">
+                  <option value="active">Active</option>
+                  <option value="inactive">Inactive</option>
+                </select>
+              </div>
+              
+              <div class="col-md-6">
+                <label for="edit_hire_date" class="form-label fw-medium">Hire Date</label>
+                <input
+                  type="date"
+                  id="edit_hire_date"
+                  name="hire_date"
+                  class="form-control"
+                />
+              </div>
+            </div>
+          </form>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" form="editStaffForm" class="btn btn-primary">Save Changes</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Staff List -->
+  {% if staff|length == 0 %}
+    <div class="alert alert-warning d-flex align-items-center" role="alert">
+      <i class="bi bi-exclamation-triangle me-2"></i>
+      <div>
+        <strong>No staff members found.</strong> Add your first staff member to get started.
+      </div>
+    </div>
+  {% else %}
+    <div class="row g-3">
+      {% for member in staff %}
+        <div class="col-md-6 col-lg-4">
+          <div class="card staff-card h-100">
+            <div class="card-body p-3">
+              <div class="d-flex align-items-start justify-content-between mb-3">
+                <div class="rounded-circle bg-light p-2">
+                  <i class="bi bi-person text-muted fs-4"></i>
+                </div>
+                <div class="d-flex gap-1">
+                  <button class="btn btn-sm btn-outline-primary" onclick="editStaff({{ member.id }}); event.stopPropagation();" title="Edit Staff">
+                    <i class="bi bi-pencil"></i>
+                  </button>
+                  <form method="POST" action="{{ url_for('delete_staff', store_id=store.id, staff_id=member.id) }}" class="d-inline" onsubmit="return confirm('Are you sure you want to delete this staff member? This action cannot be undone.');">
+                    <button type="submit" class="btn btn-sm btn-outline-danger" title="Delete Staff">
+                      <i class="bi bi-trash"></i>
+                    </button>
+                  </form>
+                </div>
+              </div>
+              <h4 class="card-title mb-2 fw-bold">
+                {{ member.first_name }} {{ member.last_name }}
+              </h4>
+              {% if member.position %}
+                <p class="card-subtitle text-muted mb-2">
+                  <i class="bi bi-briefcase me-2"></i>
+                  {{ member.position }}
+                </p>
+              {% endif %}
+              {% if member.email %}
+                <p class="card-subtitle text-muted mb-2">
+                  <i class="bi bi-envelope me-2"></i>
+                  {{ member.email }}
+                </p>
+              {% endif %}
+              {% if member.phone %}
+                <p class="card-subtitle text-muted mb-2">
+                  <i class="bi bi-telephone me-2"></i>
+                  {{ member.phone }}
+                </p>
+              {% endif %}
+              {% if member.hire_date %}
+                <p class="card-subtitle text-muted mb-3">
+                  <i class="bi bi-calendar me-2"></i>
+                  Hired: {{ member.hire_date }}
+                </p>
+              {% endif %}
+              <div class="d-flex align-items-center justify-content-between">
+                <span class="badge bg-{{ 'primary' if member.role == 'manager' else 'info' if member.role == 'supervisor' else 'secondary' }} text-white">
+                  {{ member.role|title }}
+                </span>
+                <span class="badge bg-{{ 'success' if member.status == 'active' else 'secondary' }} text-white">
+                  {{ member.status|title }}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+{% endblock %}
+
+{% block head %}
+<style>
+/* Enhanced card styling with black and white theme */
+.card {
+    transition: all 0.3s ease;
+    background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
+    border: 1px solid #dee2e6;
+}
+
+.card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15);
+}
+
+.staff-card {
+    transition: all 0.3s ease;
+    border-left: 4px solid transparent;
+    background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
+    border: 1px solid #dee2e6;
+}
+
+.staff-card:hover {
+    border-left-color: #000000;
+    transform: translateY(-4px);
+    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15);
+}
+
+/* Enhanced form controls with white background */
+.form-control {
+    border-radius: 0.5rem;
+    border: 1px solid #dee2e6;
+    transition: all 0.3s ease;
+    font-size: 0.9rem;
+    background-color: white;
+    color: #212529;
+}
+
+.form-control:focus {
+    border-color: #000000;
+    box-shadow: 0 0 0 0.2rem rgba(0, 0, 0, 0.1);
+    transform: translateY(-1px);
+    background-color: white;
+}
+
+.form-select {
+    border-radius: 0.5rem;
+    border: 1px solid #dee2e6;
+    transition: all 0.3s ease;
+    font-size: 0.9rem;
+    background-color: white;
+    color: #212529;
+}
+
+.form-select:focus {
+    border-color: #000000;
+    box-shadow: 0 0 0 0.2rem rgba(0, 0, 0, 0.1);
+    transform: translateY(-1px);
+    background-color: white;
+}
+
+/* Enhanced buttons with black and white theme */
+.btn {
+    border-radius: 0.5rem;
+    font-weight: 600;
+    transition: all 0.3s ease;
+    font-size: 0.9rem;
+}
+
+.btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15);
+}
+
+.btn-primary {
+    background: #000000;
+    color: white;
+    border: 1px solid #000000;
+}
+
+.btn-success {
+    background: #28a745;
+    color: white;
+    border: 1px solid #28a745;
+}
+
+.btn-outline-primary {
+    border: 1px solid #000000;
+    color: #000000;
+}
+
+.btn-outline-primary:hover {
+    background: #000000;
+    border-color: #000000;
+    color: white;
+    transform: translateY(-1px);
+}
+
+.btn-outline-success {
+    border: 1px solid #28a745;
+    color: #28a745;
+}
+
+.btn-outline-success:hover {
+    background: #28a745;
+    border-color: #28a745;
+    color: white;
+    transform: translateY(-1px);
+}
+
+/* Enhanced badges to match dashboard */
+.badge {
+    font-weight: 600;
+    border-radius: 0.5rem;
+    font-size: 0.75rem;
+}
+
+/* Enhanced icons */
+.rounded-circle {
+    transition: all 0.3s ease;
+}
+
+.card:hover .rounded-circle {
+    transform: scale(1.05);
+}
+
+/* Enhanced modal styling */
+.modal-content {
+    border: none;
+    border-radius: 0.75rem;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+}
+
+.modal-header {
+    border-bottom: 1px solid #e9ecef;
+    background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+    border-radius: 0.75rem 0.75rem 0 0;
+    padding: 1.5rem;
+}
+
+.modal-title {
+    font-weight: 700;
+    font-size: 1.1rem;
+}
+
+.modal-body {
+    padding: 1.5rem;
+}
+
+.modal-footer {
+    border-top: 1px solid #e9ecef;
+    background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+    padding: 1rem 1.5rem;
+    border-radius: 0 0 0.75rem 0.75rem;
+}
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Staff data (pre-loaded from server)
+const staffData = {{ staff | tojson | safe }};
+
+function editStaff(staffId) {
+    console.log('Editing staff:', staffId);
+    
+    const staff = staffData.find(s => s.id == staffId);
+    if (!staff) {
+        console.error('Staff not found:', staffId);
+        return;
+    }
+    
+    // Populate the edit form with staff data
+    document.getElementById('edit_first_name').value = staff.first_name || '';
+    document.getElementById('edit_last_name').value = staff.last_name || '';
+    document.getElementById('edit_email').value = staff.email || '';
+    document.getElementById('edit_phone').value = staff.phone || '';
+    document.getElementById('edit_position').value = staff.position || '';
+    document.getElementById('edit_role').value = staff.role || 'staff';
+    document.getElementById('edit_status').value = staff.status || 'active';
+    document.getElementById('edit_hire_date').value = staff.hire_date || '';
+    
+    // Set form action
+    document.getElementById('editStaffForm').action = `/admin/stores/{{ store.id }}/staff/${staffId}/edit`;
+    
+    // Show the modal
+    const modal = new bootstrap.Modal(document.getElementById('editStaffModal'));
+    modal.show();
+}
+
+// QR Code functions
+function copyStaffSurveyLink() {
+    const surveyLink = document.getElementById('staffSurveyLink');
+    surveyLink.select();
+    document.execCommand('copy');
+    
+    // Show feedback
+    const button = event.target;
+    const originalText = button.innerHTML;
+    button.innerHTML = '<i class="bi bi-check"></i> Copied!';
+    button.classList.remove('btn-outline-primary');
+    button.classList.add('btn-success');
+    
+    setTimeout(() => {
+        button.innerHTML = originalText;
+        button.classList.remove('btn-success');
+        button.classList.add('btn-outline-primary');
+    }, 2000);
+}
+
+function downloadStaffQRCode() {
+    const qrImage = document.querySelector('.bg-white img');
+    if (!qrImage) return;
+    
+    // Create download link
+    const link = document.createElement('a');
+    link.href = qrImage.src;
+    link.download = 'QR_{{ store.store_name.replace(/[^a-z0-9]/gi, '_') }}_Staff.png';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+// Debug: Check if Bootstrap is loaded
+document.addEventListener('DOMContentLoaded', function() {
+    console.log('Bootstrap loaded:', typeof bootstrap);
+    console.log('Staff data:', staffData);
+});
+</script>
+{% endblock %}

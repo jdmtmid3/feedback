@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Licensing Portal Login</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #0a0b0d; color: #f5f9fe; min-height: 100vh; display: grid; place-items: center; margin: 0; }
+        form { width: min(360px, calc(100% - 32px)); padding: 28px; background: #17181a; border: 1px solid #2a2c2e; border-radius: 10px; }
+        h1 { margin-top: 0; font-size: 1.35rem; }
+        label { display: block; margin: 16px 0 6px; color: #a8aaa9; }
+        input, button { width: 100%; box-sizing: border-box; padding: 11px 12px; border-radius: 6px; font: inherit; }
+        input { background: #202123; color: #f5f9fe; border: 1px solid #4a4c4e; }
+        button { margin-top: 22px; border: 0; background: #3ee1a3; color: #07150f; font-weight: 700; cursor: pointer; }
+        .error { color: #ff8b8b; margin: 12px 0 0; }
+    </style>
+</head>
+<body>
+    <form method="post">
+        <h1>Licensing Portal</h1>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% for category, message in messages %}
+                <div class="error">{{ message }}</div>
+            {% endfor %}
+        {% endwith %}
+        <label for="username">Username</label>
+        <input id="username" name="username" required autocomplete="username">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" required autocomplete="current-password">
+        <button type="submit">Sign in</button>
+    </form>
+</body>
+</html>

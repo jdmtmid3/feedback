@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login · Tugon Feedback System</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            /* Match site theme (layout.html) */
+            --header-color: #FF6B35;
+            --primary-800: #212529;
+            --yellow-400: #FF9933;
+            --yellow-500: #FF6B35;
+            --yellow-600: #E85A2A;
+            --yellow-700: #CC4A1F;
+            --neutral-100: #f8fafc;
+            --neutral-200: #f1f5f9;
+            --neutral-300: #e2e8f0;
+            --neutral-400: #94a3b8;
+            --neutral-500: #64748b;
+            --neutral-600: #475569;
+            --neutral-700: #334155;
+            --neutral-800: #1e293b;
+            --neutral-900: #0f172a;
+        }
+
+        body {
+            background: linear-gradient(135deg, #FF6B35 0%, #B03A14 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            position: relative;
+            overflow: hidden;
+        }
+
+        /* Decorative background blobs */
+        body::before,
+        body::after {
+            content: '';
+            position: absolute;
+            border-radius: 50%;
+            filter: blur(80px);
+            opacity: 0.35;
+            pointer-events: none;
+        }
+        body::before {
+            width: 480px;
+            height: 480px;
+            background: var(--yellow-400);
+            top: -120px;
+            right: -120px;
+        }
+        body::after {
+            width: 520px;
+            height: 520px;
+            background: var(--header-color);
+            bottom: -160px;
+            left: -160px;
+        }
+
+        .login-wrapper {
+            position: relative;
+            z-index: 1;
+            width: 100%;
+        }
+
+        .login-card {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+            max-width: 420px;
+            width: 100%;
+            overflow: hidden;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .login-header {
+            background: linear-gradient(135deg, #FF6B35 0%, #B03A14 100%);
+            color: white;
+            padding: 2.25rem 2rem 1.75rem;
+            text-align: center;
+            position: relative;
+        }
+
+        .login-logo-wrap {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            border-radius: 16px;
+            padding: 12px 16px;
+            margin-bottom: 1rem;
+        }
+        .login-logo-wrap img {
+            height: 56px;
+            width: auto;
+            display: block;
+        }
+
+        .login-header h4 {
+            font-weight: 700;
+            letter-spacing: -0.01em;
+        }
+        .login-header .brand-tag {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.15em;
+            opacity: 0.85;
+            font-weight: 500;
+        }
+
+        .login-body {
+            padding: 2rem;
+        }
+
+        .form-label {
+            font-size: 0.875rem;
+            color: var(--neutral-700);
+        }
+
+        .input-group-text {
+            background: var(--neutral-100);
+            color: var(--neutral-500);
+            border-color: var(--neutral-300);
+        }
+        .form-control {
+            border-color: var(--neutral-300);
+            padding: 10px 14px;
+        }
+        .form-control:focus {
+            border-color: var(--header-color);
+            box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.2);
+        }
+        .input-group:focus-within .input-group-text {
+            border-color: var(--header-color);
+        }
+
+        /* CTA button: match site's yellow primary */
+        .btn-primary {
+            background: linear-gradient(135deg, var(--yellow-500), var(--yellow-600));
+            border: none;
+            color: white !important;
+            font-weight: 600;
+            border-radius: 8px;
+            transition: all 0.2s ease;
+        }
+        .btn-primary:hover,
+        .btn-primary:focus {
+            background: linear-gradient(135deg, var(--yellow-600), var(--yellow-700));
+            transform: translateY(-1px);
+            box-shadow: 0 6px 16px rgba(255, 107, 53, 0.35);
+        }
+
+        .login-footer {
+            text-align: center;
+            margin-top: 1.25rem;
+            color: var(--neutral-500);
+            font-size: 0.8rem;
+        }
+        .login-footer i {
+            color: var(--header-color);
+        }
+
+        .alert {
+            border-radius: 8px;
+            border: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-wrapper">
+        <div class="container">
+            <div class="row justify-content-center">
+                <div class="col-12 col-sm-10 col-md-7 col-lg-5 col-xl-4">
+                    <div class="login-card">
+                        <div class="login-header">
+                            <div class="login-logo-wrap">
+                                <img src="{{ url_for('static', filename='logo.png') }}" alt="tugon. Logo">
+                            </div>
+                            <div class="brand-tag mb-2">Feedback System</div>
+                            <h4 class="mb-1">Welcome back</h4>
+                            <p class="mb-0 opacity-75 small">Sign in to continue to your dashboard</p>
+                        </div>
+                        <div class="login-body">
+                            {% with messages = get_flashed_messages(with_categories=true) %}
+                                {% if messages %}
+                                    {% for category, message in messages %}
+                                        <div class="alert alert-{{ 'danger' if category in ['danger', 'error'] else ('warning' if category == 'warning' else 'success') }} alert-dismissible fade show small" role="alert">
+                                            <i class="bi bi-{{ 'exclamation-triangle' if category in ['danger', 'error', 'warning'] else 'check-circle' }} me-2"></i>
+                                            {{ message }}
+                                            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                                        </div>
+                                    {% endfor %}
+                                {% endif %}
+                            {% endwith %}
+
+                            <form method="POST" action="{{ url_for('login') }}">
+                                <div class="mb-3">
+                                    <label class="form-label fw-semibold">Username</label>
+                                    <div class="input-group">
+                                        <span class="input-group-text border-end-0">
+                                            <i class="bi bi-person"></i>
+                                        </span>
+                                        <input class="form-control border-start-0" type="text" name="username" required autofocus placeholder="Enter your username">
+                                    </div>
+                                </div>
+                                <div class="mb-4">
+                                    <label class="form-label fw-semibold">Password</label>
+                                    <div class="input-group">
+                                        <span class="input-group-text border-end-0">
+                                            <i class="bi bi-lock"></i>
+                                        </span>
+                                        <input class="form-control border-start-0" type="password" name="password" required placeholder="Enter your password">
+                                    </div>
+                                </div>
+                                <button class="btn btn-primary w-100 py-2" type="submit">
+                                    <i class="bi bi-box-arrow-in-right me-2"></i>Sign In
+                                </button>
+                            </form>
+
+                            <div class="login-footer">
+                                <i class="bi bi-shield-check me-1"></i>
+                                Secure login powered by <strong>tugon.</strong>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

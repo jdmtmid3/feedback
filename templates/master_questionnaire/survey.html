@@ -1,0 +1,486 @@
+{% extends "layout.html" %} {% set hide_header = True %}
+<!--
+================================================================================
+FILE: public/survey.html
+URL ROUTE: /s/<store_id>
+PURPOSE: The actual "Feedback Form". This is the page the customer sees when
+         they scan the QR code. They fill out their ratings and comments here.
+================================================================================
+-->
+
+{% block title %}{{ questionnaire.title }}{% endblock %} {% block content %}
+<div class="row justify-content-center">
+  <div class="col-12 col-md-10 col-lg-8">
+    <div class="card border-0 shadow-lg">
+      <div class="card-body p-4 p-md-5">
+        <div class="text-center mb-4">
+          {% if store.logo_url %}
+          <img src="{{ store.logo_url }}" alt="{{ store.store_name }} Logo" class="mb-3" style="max-height: 80px; max-width: 200px; object-fit: contain;">
+          {% elif master_logo %}
+          <img src="{{ master_logo }}" alt="Brand Logo" class="mb-3" style="max-height: 80px; max-width: 200px; object-fit: contain;">
+          {% else %}
+          <div
+            class="rounded-circle bg-light p-3 mx-auto mb-3 d-inline-flex align-items-center justify-content-center"
+          >
+            <i class="bi bi-chat-left-text text-primary fs-3"></i>
+          </div>
+          {% endif %}
+          <h1 class="h3 mb-2 fw-bold">{{ questionnaire.title }}</h1>
+          {% if store.location %}
+          <p class="text-muted mb-0">
+            <i class="bi bi-geo-alt me-1"></i>
+            {{ store.location }}
+          </p>
+          {% else %}
+          <p class="text-muted mb-0">We value your feedback.</p>
+          {% endif %}
+        </div>
+
+        {% if questions|length == 0 %}
+        <div class="text-center py-5">
+          <div
+            class="rounded-circle bg-light mx-auto mb-3 d-flex align-items-center justify-content-center"
+            style="width: 80px; height: 80px"
+          >
+            <i class="bi bi-inbox text-muted fs-2"></i>
+          </div>
+          <h5 class="text-muted mb-2">No Questions Available</h5>
+          <p class="text-muted small mb-0">
+            This questionnaire doesn't have any questions yet.
+          </p>
+        </div>
+        {% else %}
+        <form
+          method="POST"
+          action="{{ url_for('submit_survey', store_id=store.id) }}"
+          class="space-y-4"
+        >
+          <div class="mb-4 p-4 bg-light rounded-3">
+            <div class="d-flex align-items-center mb-3">
+              <div class="rounded-circle bg-white shadow-sm p-2 me-3">
+                <i class="bi bi-receipt text-primary"></i>
+              </div>
+              <div>
+                <h6 class="mb-1 fw-semibold">Transaction Information</h6>
+                <p class="text-muted small mb-0">
+                  Please provide your receipt details for feedback verification
+                </p>
+              </div>
+            </div>
+            <div class="row g-3">
+              <div class="col-md-6">
+                <div class="form-group">
+                  <label for="receipt_number" class="form-label fw-medium">
+                    Receipt/Transaction Number <span class="text-danger">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    id="receipt_number"
+                    name="receipt_number"
+                    class="form-control bg-white"
+                    placeholder="e.g. RCP-2024-12345"
+                    required
+                    pattern="[A-Za-z0-9\-]{5,50}"
+                    title="Receipt number should be 5-50 characters (letters, numbers, and hyphens only)"
+                  />
+                  <div class="form-text">
+                    <i class="bi bi-info-circle me-1"></i>
+                    Found on your receipt. Required for feedback submission.
+                  </div>
+                </div>
+              </div>
+              <div class="col-md-6">
+                <div class="form-group">
+                  <label for="user_email" class="form-label fw-medium">
+                    Email Address <span class="text-danger">*</span>
+                  </label>
+                  <input
+                    type="email"
+                    id="user_email"
+                    name="user_email"
+                    class="form-control bg-white"
+                    placeholder="your.email@example.com"
+                    required
+                  />
+                  <div class="form-text">
+                    <i class="bi bi-info-circle me-1"></i>
+                    For feedback tracking and follow-up if needed.
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Staff Commendation Section -->
+          {% if staff_members and staff_members|length > 0 %}
+          <div class="mb-4 p-4 bg-light rounded-3">
+            <div class="d-flex align-items-center mb-3">
+              <div class="rounded-circle bg-white shadow-sm p-2 me-3">
+                <i class="bi bi-award text-primary"></i>
+              </div>
+              <div>
+                <h6 class="mb-1 fw-semibold">Staff Commendation (Optional)</h6>
+                <p class="text-muted small mb-0">
+                  Would you like to rate a staff member who served you?
+                </p>
+              </div>
+            </div>
+            
+            <div class="form-group mb-3">
+              <label for="staff_commendation" class="form-label fw-medium">
+                Select Staff Member
+              </label>
+              <select
+                id="staff_commendation"
+                name="staff_commendation"
+                class="form-select bg-white"
+                onchange="toggleStaffRating()"
+              >
+                <option value="">No staff commendation</option>
+                {% for staff in staff_members %}
+                <option value="{{ staff.id }}">
+                  {{ staff.first_name }} {{ staff.last_name }} - {{ staff.position or staff.role|title }}
+                </option>
+                {% endfor %}
+              </select>
+              <div class="form-text">
+                <i class="bi bi-info-circle me-1"></i>
+                Choose a staff member to rate their service.
+              </div>
+            </div>
+
+            <!-- Staff Star Rating (shown when a staff member is selected) -->
+            <div id="staffRatingSection" class="mb-3" style="display:none;">
+              <label class="form-label fw-medium">Rate this staff member</label>
+              <div class="commendation-stars d-flex gap-1" id="commendationStars">
+                {% for i in range(1, 6) %}
+                <i class="bi bi-star commendation-star" data-value="{{ i }}" onclick="setCommendationRating({{ i }})" style="font-size:1.75rem; cursor:pointer; color:#d1d5db; transition: color .2s, transform .15s;"></i>
+                {% endfor %}
+              </div>
+              <input type="hidden" name="commendation_rating" id="commendationRatingInput" value="0">
+              <div class="form-text mt-1">
+                <i class="bi bi-info-circle me-1"></i>
+                <span id="commendationRatingLabel">Tap a star to rate</span>
+              </div>
+            </div>
+
+            <input type="hidden" name="commendation_type" value="excellent_service">
+          </div>
+          {% endif %}
+
+          {% for q in questions %}
+          <div class="mb-4 p-4 bg-light rounded-3">
+            <div
+              class="d-flex align-items-start justify-content-between gap-3 mb-3"
+            >
+              <label
+                class="form-label fw-semibold mb-0 d-flex align-items-center"
+              >
+                <span class="badge bg-primary rounded-pill me-2"
+                  >{{ loop.index }}</span
+                >
+                {{ q.question_text }} {% if q.is_required %}
+                <span class="text-danger ms-1">*</span>
+                {% endif %}
+              </label>
+              <span class="badge bg-white shadow-sm text-dark">
+                <i
+                  class="bi bi-{% if q.question_type == 'rating' %}star{% elif q.question_type == 'text' %}textarea{% else %}circle{% endif %} me-1"
+                ></i>
+                {{ q.question_type.replace('_', ' ').title() }}
+              </span>
+            </div>
+
+            {% if q.question_type == 'rating' %}
+            <div class="rating-container mb-3">
+              <div class="star-rating" id="rating-{{ q.id }}">
+                {% for n in range(1, 6) %}
+                <button
+                  type="button"
+                  class="star-btn"
+                  data-rating="{{ n }}"
+                  data-question="{{ q.id }}"
+                >
+                  <i class="bi bi-star"></i>
+                </button>
+                {% endfor %}
+              </div>
+              <input
+                type="hidden"
+                name="q_{{ q.id }}"
+                id="hidden-{{ q.id }}"
+                value=""
+                {%
+                if
+                q.is_required
+                %}required{%
+                endif
+                %}
+              />
+            </div>
+            <div class="d-flex justify-content-between small text-muted">
+              <span
+                ><i class="bi bi-emoji-frown me-1"></i>{{ q.min_label or 'Poor'
+                }}</span
+              >
+              <span
+                ><i class="bi bi-emoji-smile me-1"></i>{{ q.max_label or
+                'Excellent' }}</span
+              >
+            </div>
+
+            {% if q.allow_comment %}
+            <div class="mt-3">
+              <label
+                for="q_{{ q.id }}_comment"
+                class="form-label small text-muted"
+              >
+                <i class="bi bi-chat-left-text me-1"></i>
+                Optional: Tell us more about your rating
+              </label>
+              <textarea
+                class="form-control form-control-sm"
+                name="q_{{ q.id }}_comment"
+                id="q_{{ q.id }}_comment"
+                rows="3"
+                placeholder="Why did you give this rating? (optional)"
+              ></textarea>
+            </div>
+            {% endif %} {% elif q.question_type == 'text' %}
+            <textarea
+              class="form-control"
+              name="q_{{ q.id }}"
+              rows="4"
+              placeholder="Share your thoughts here..."
+              {%
+              if
+              q.is_required
+              %}required{%
+              endif
+              %}
+            ></textarea>
+
+            {% elif q.question_type == 'multiple_choice' %} {% set opts =
+            options_by_question_id.get(q.id, []) %} {% if opts|length == 0 %}
+            <div
+              class="alert alert-warning d-flex align-items-center"
+              role="alert"
+            >
+              <i class="bi bi-exclamation-triangle me-2"></i>
+              <div>
+                <strong>No options available.</strong> This question needs
+                choices to be configured.
+              </div>
+            </div>
+            {% else %}
+            <div class="vstack gap-2">
+              {% for opt in opts %}
+              <div class="form-check bg-white p-3 rounded-2 border">
+                <input
+                  class="form-check-input"
+                  type="radio"
+                  name="q_{{ q.id }}"
+                  id="q_{{ q.id }}_opt_{{ opt.id }}"
+                  value="{{ opt.id }}"
+                  {%
+                  if
+                  q.is_required
+                  %}required{%
+                  endif
+                  %}
+                />
+                <label
+                  class="form-check-label d-flex align-items-center"
+                  for="q_{{ q.id }}_opt_{{ opt.id }}"
+                >
+                  <i class="bi bi-circle me-2 text-muted"></i>
+                  {{ opt.option_text }}
+                </label>
+              </div>
+              {% endfor %}
+            </div>
+            {% endif %} {% else %}
+            <div
+              class="alert alert-danger d-flex align-items-center"
+              role="alert"
+            >
+              <i class="bi bi-exclamation-triangle me-2"></i>
+              <div>
+                <strong>Unsupported question type:</strong> {{ q.question_type
+                }}
+              </div>
+            </div>
+            {% endif %}
+          </div>
+          {% endfor %}
+
+          <div class="text-center mt-5">
+            <button
+              type="submit"
+              class="btn btn-primary btn-lg px-5 d-flex align-items-center mx-auto"
+              id="submitBtn"
+            >
+              <i class="bi bi-send me-2"></i>
+              <span id="submitBtnText">Submit Feedback</span>
+            </button>
+            <p class="text-muted small mt-3 mb-0">
+              <i class="bi bi-shield-check me-1"></i>
+              Your responses are anonymous unless you include identifying
+              information.
+            </p>
+          </div>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %} {% block scripts %}
+<style>
+  /* Star rating styling */
+  .rating-container {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .star-rating {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  .star-btn {
+    background: none;
+    border: none;
+    font-size: 2.5rem;
+    color: #ddd;
+    cursor: pointer;
+    padding: 0.25rem;
+    border-radius: 0.25rem;
+    transition: all 0.2s ease;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+
+  .star-btn.active {
+    color: #ffc107 !important;
+  }
+
+  /* Mobile-specific adjustments */
+  @media (max-width: 768px) {
+    .star-btn {
+      font-size: 2rem;
+      padding: 0.3rem;
+    }
+
+    .star-rating {
+      gap: 0.3rem;
+    }
+  }
+</style>
+
+<script>
+  // Prevent double submission
+  document.addEventListener("DOMContentLoaded", function () {
+    const form = document.querySelector('form');
+    const submitBtn = document.getElementById('submitBtn');
+    const submitBtnText = document.getElementById('submitBtnText');
+    let isSubmitting = false;
+
+    if (form && submitBtn) {
+      form.addEventListener('submit', function(e) {
+        if (isSubmitting) {
+          e.preventDefault();
+          return false;
+        }
+        isSubmitting = true;
+        submitBtn.disabled = true;
+        submitBtnText.textContent = 'Submitting...';
+      });
+    }
+  });
+
+  // Simple star rating implementation
+  document.addEventListener("DOMContentLoaded", function () {
+    const starRatings = document.querySelectorAll(".star-rating");
+
+    starRatings.forEach((rating) => {
+      const buttons = rating.querySelectorAll(".star-btn");
+      const questionId = rating.id.replace("rating-", "");
+      const hiddenInput = document.getElementById(`hidden-${questionId}`);
+
+      buttons.forEach((button, index) => {
+        button.addEventListener("click", function () {
+          const ratingValue = parseInt(button.dataset.rating);
+
+          // Update hidden input
+          hiddenInput.value = ratingValue;
+
+          // Update visual state
+          updateStars(buttons, ratingValue);
+
+          console.log(
+            "Rating selected:",
+            ratingValue,
+            "for question:",
+            questionId,
+          );
+        });
+      });
+    });
+
+    function updateStars(buttons, rating) {
+      buttons.forEach((button, index) => {
+        const starRating = parseInt(button.dataset.rating);
+        const icon = button.querySelector("i");
+        if (starRating <= rating) {
+          button.classList.add("active");
+          icon.classList.remove("bi-star");
+          icon.classList.add("bi-star-fill");
+        } else {
+          button.classList.remove("active");
+          icon.classList.remove("bi-star-fill");
+          icon.classList.add("bi-star");
+        }
+      });
+    }
+
+  });
+
+  // Staff commendation star rating functions (global scope)
+  function toggleStaffRating() {
+    const select = document.getElementById('staff_commendation');
+    const section = document.getElementById('staffRatingSection');
+    if (select.value) {
+      section.style.display = 'block';
+    } else {
+      section.style.display = 'none';
+      setCommendationRating(0);
+    }
+  }
+
+  function setCommendationRating(value) {
+    const stars = document.querySelectorAll('#commendationStars .commendation-star');
+    const input = document.getElementById('commendationRatingInput');
+    const label = document.getElementById('commendationRatingLabel');
+    
+    input.value = value;
+    
+    const labels = ['', 'Poor', 'Fair', 'Good', 'Very Good', 'Excellent'];
+    label.textContent = labels[value] || 'Tap a star to rate';
+    
+    stars.forEach(star => {
+      const starValue = parseInt(star.dataset.value);
+      if (starValue <= value) {
+        star.classList.remove('bi-star');
+        star.classList.add('bi-star-fill');
+        star.style.color = '#ffc107';
+      } else {
+        star.classList.remove('bi-star-fill');
+        star.classList.add('bi-star');
+        star.style.color = '#d1d5db';
+      }
+    });
+  }
+</script>
+{% endblock %}

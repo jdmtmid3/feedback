@@ -1,0 +1,794 @@
+<!doctype html>
+<!-- 
+================================================================================
+FILE: layout.html (Admin Base Layout)
+PURPOSE: This is the main "shell" for all Admin pages. It contains the 
+         sidebar, top navigation, and imports Bootstrap & CSS.
+         Other admin pages "extend" this file and inject their content.
+================================================================================
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>{% block title %}Feedback Admin{% endblock %}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+      integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
+      crossorigin="anonymous"
+    />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+      :root {
+        /* Primary Colors - Black Theme */
+        --primary-50: #f8f9fa;
+        --primary-100: #e9ecef;
+        --primary-200: #dee2e6;
+        --primary-300: #ced4da;
+        --primary-400: #adb5bd;
+        --primary-500: #6c757d;
+        --primary-600: #495057;
+        --primary-700: #343a40;
+        --primary-800: #212529;
+        --primary-900: #000000;
+
+        /* Secondary Accent - Orange Theme */
+        --accent-50: #FFF0E6;
+        --accent-100: #FFE0CC;
+        --accent-200: #FFCC99;
+        --accent-300: #FFB366;
+        --accent-400: #FF9933;
+        --accent-500: #FF6B35;
+        --accent-600: #E85A2A;
+        --accent-700: #CC4A1F;
+        --accent-800: #B03A14;
+        --accent-900: #942A09;
+
+        /* Tertiary Accent - Orange Theme for call-to-action */
+        --yellow-50: #FFF0E6;
+        --yellow-100: #FFE0CC;
+        --yellow-200: #FFCC99;
+        --yellow-300: #FFB366;
+        --yellow-400: #FF9933;
+        --yellow-500: #FF6B35;
+        --yellow-600: #E85A2A;
+        --yellow-700: #CC4A1F;
+        --yellow-800: #B03A14;
+        --yellow-900: #942A09;
+
+        /* Header Color - Orange */
+        --header-color: #FF6B35;
+
+        /* Background Color - Light Grey */
+        --bg-color: #F5F5F5;
+
+        /* Neutral Colors */
+        --neutral-50: #ffffff;
+        --neutral-100: #f8fafc;
+        --neutral-200: #f1f5f9;
+        --neutral-300: #e2e8f0;
+        --neutral-400: #94a3b8;
+        --neutral-500: #64748b;
+        --neutral-600: #475569;
+        --neutral-700: #334155;
+        --neutral-800: #1e293b;
+        --neutral-900: #0f172a;
+        --primary-neutral: #0f172a;
+        --accent-neutral: #1e293b;
+      }
+
+      body {
+        background-color: var(--bg-color);
+        color: var(--neutral-900);
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+        font-size: 0.9375rem;
+        line-height: 1.5;
+        display: flex;
+        flex-direction: column;
+        min-height: 100vh;
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      h1 { font-size: 1.5625rem; font-weight: 700; }
+      h2 { font-size: 1.3125rem; font-weight: 700; }
+      h3 { font-size: 1.1875rem; font-weight: 600; }
+      h4 { font-size: 1.0625rem; font-weight: 600; }
+      h5 { font-size: 1rem; font-weight: 600; }
+      h6 { font-size: 0.9375rem; font-weight: 600; }
+      .small, small { font-size: 0.875rem; }
+
+      .sidebar {
+        min-height: 100vh;
+        background: linear-gradient(
+          135deg,
+          var(--header-color) 0%,
+          var(--accent-800) 100%
+        );
+        color: var(--neutral-200);
+        box-shadow: 2px 0 10px rgba(0, 0, 0, 0.1);
+      }
+
+      .sidebar a {
+        color: var(--neutral-300);
+        text-decoration: none;
+        transition: all 0.2s ease;
+        border-radius: 8px;
+      }
+
+      .sidebar .nav-link:hover {
+        background-color: var(--neutral-700);
+        color: var(--neutral-100);
+        transform: translateX(2px);
+      }
+
+      .sidebar .nav-link.active {
+        background: linear-gradient(
+          135deg,
+          var(--primary-600) 0%,
+          var(--primary-700) 100%
+        );
+        color: white;
+        font-weight: 500;
+        box-shadow: 0 2px 8px rgba(37, 99, 235, 0.3);
+      }
+
+      .store-card {
+        transition: all 0.3s ease;
+      }
+
+      /* Fix for overlapping text and flex layouts */
+      .min-width-0 {
+        min-width: 0;
+      }
+
+      .text-truncate {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .topnav-link:hover {
+        background-color: var(--primary-50);
+        color: var(--primary-600) !important;
+      }
+
+      /* Notification item styles */
+      .bg-primary-light {
+        background-color: rgba(0, 0, 0, 0.1);
+      }
+
+      .grayscale {
+        filter: grayscale(1);
+      }
+
+      .opacity-60 {
+        opacity: 0.6;
+      }
+
+      /* Add store button + sign white */
+      .btn-primary .bi-plus-lg,
+      button.btn-primary .bi-plus-lg,
+      .btn-primary i.bi-plus-lg {
+        color: white !important;
+        fill: white !important;
+      }
+
+      /* Active button text white */
+      .btn-primary {
+        color: white !important;
+      }
+      
+      .btn-primary:hover {
+        color: white !important;
+      }
+
+      /* Custom dropdown styling */
+      .dropdown-menu {
+        animation: dropdownFadeIn 0.2s ease-out;
+      }
+
+      @keyframes dropdownFadeIn {
+        from {
+          opacity: 0;
+          transform: translateY(10px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      .store-card {
+        cursor: pointer;
+        border: 1px solid var(--neutral-200);
+        background: white;
+        border-radius: 12px;
+        overflow: hidden;
+      }
+
+      .store-card:hover {
+        transform: translateY(-4px);
+        box-shadow: 0 12px 24px rgba(26, 106, 106, 0.15);
+        border-color: var(--primary-500);
+      }
+
+      .card {
+        border: 1px solid var(--neutral-200);
+        border-radius: 12px;
+      }
+
+      .btn-primary {
+        background: linear-gradient(135deg, var(--yellow-500), var(--yellow-600));
+        color: white;
+        border: none;
+        border-radius: 8px;
+        padding: 8px 16px;
+        font-weight: 500;
+        transition: all 0.2s ease;
+      }
+
+      .btn-primary:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(255, 107, 53, 0.4);
+      }
+
+      .btn-outline-primary {
+        color: var(--yellow-600);
+        border-color: var(--yellow-300);
+        border-radius: 8px;
+        font-weight: 500;
+        transition: all 0.2s ease;
+      }
+
+      .btn-outline-primary:hover {
+        background: var(--yellow-50);
+        color: var(--yellow-700);
+      }
+
+      .form-control,
+      .form-select {
+        border: 1px solid var(--neutral-300);
+        border-radius: 8px;
+        padding: 10px 14px;
+        transition: all 0.2s ease;
+        background-color: white;
+        color: var(--neutral-900);
+      }
+
+      .form-control:focus,
+      .form-select:focus {
+        border-color: var(--yellow-500);
+        box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.2);
+        background-color: white;
+      }
+
+      .alert {
+        border-radius: 8px;
+        border: none;
+      }
+
+      .badge {
+        border-radius: 6px;
+        font-weight: 500;
+        padding: 0.25rem 0.5rem;
+      }
+
+      .badge-primary {
+        background-color: var(--yellow-100);
+        color: var(--yellow-700);
+        border: 1px solid var(--yellow-300);
+      }
+
+      .topnav-link {
+        color: white;
+        text-decoration: none;
+        transition: all 0.2s ease;
+        border-radius: 8px;
+        font-weight: 500;
+        display: flex;
+        align-items: center;
+      }
+
+      .topnav-link:hover {
+        background: rgba(255, 255, 255, 0.15);
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
+        color: white;
+        transform: translateY(-1px);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+      }
+
+      .topnav-link i {
+        color: white;
+      }
+
+      .topnav-link:hover i {
+        color: white !important;
+      }
+
+      .topnav-link.active {
+        background: rgba(255, 255, 255, 0.15);
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
+        color: white !important;
+        font-weight: 600;
+      }
+
+      .topnav-link.active i {
+        color: white !important;
+      }
+
+      /* Page title styling - smaller and more elegant */
+      .page-title {
+        font-size: 1.75rem;
+        font-weight: 600;
+        color: var(--neutral-900);
+        margin-bottom: 0.5rem;
+        line-height: 1.2;
+      }
+
+      .page-subtitle {
+        font-size: 1rem;
+        color: var(--neutral-600);
+        margin-bottom: 0;
+        font-weight: 400;
+      }
+
+      /* Icon colors */
+      .bi-star-fill,
+      .bi-trophy-fill,
+      .bi-speedometer2,
+      .bi-shop,
+      .bi-question-square,
+      .bi-people,
+      .bi-clock-history,
+      .bi-key {
+        color: var(--primary-800) !important;
+      }
+
+      .bi-star-fill,
+      .bi-trophy-fill,
+      .bi-speedometer2,
+      .bi-shop,
+      .bi-question-square,
+      .bi-people,
+      .bi-clock-history,
+      .bi-key {
+        opacity: 0.8;
+      }
+
+      /* Allow star rating icons to be colored independently */
+      .star-btn .bi {
+        color: inherit;
+        opacity: 1;
+      }
+
+      /* Make all star icons bright yellow */
+      .bi-star,
+      .bi-star-fill,
+      .bi-star-half {
+        color: #FFD700 !important;
+      }
+
+      /* Notification tab buttons */
+      .notification-tab-btn {
+        background: transparent;
+        border: none;
+        color: var(--neutral-600);
+        font-weight: 500;
+        border-radius: 6px 6px 0 0;
+        transition: all 0.15s ease;
+      }
+      .notification-tab-btn:hover {
+        background: var(--neutral-100);
+        color: var(--neutral-900);
+      }
+      .notification-tab-btn.active {
+        background: var(--neutral-100);
+        color: var(--header-color);
+        border-bottom: 2px solid var(--header-color);
+      }
+
+      /* Header icon specific override */
+      .bi-chat-left-text {
+        color: var(--primary-600) !important;
+        opacity: 0.8 !important;
+      }
+
+      /* Utility classes for neutral colors */
+      .bg-neutral-600 { background-color: var(--neutral-600); }
+      .bg-neutral-700 { background-color: var(--neutral-700); }
+      .text-neutral-300 { color: var(--neutral-300); }
+      .text-neutral-400 { color: var(--neutral-400); }
+
+      /* Bottom Right Flash Message Styling */
+      .flash-container {
+        position: fixed;
+        bottom: 24px;
+        right: 24px;
+        z-index: 10000;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        pointer-events: none;
+      }
+
+      .flash-message {
+        pointer-events: auto;
+        min-width: 300px;
+        max-width: 450px;
+        padding: 12px 16px;
+        padding-right: 48px;
+        background: white;
+        border-radius: 12px;
+        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+        display: flex;
+        align-items: center;
+        animation: toastIn 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        border: 1px solid var(--neutral-200);
+        margin-bottom: 0;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .flash-message::before {
+        content: '';
+        position: absolute;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        width: 4px;
+      }
+
+      .flash-message.alert-success::before { background: var(--primary-500); }
+      .flash-message.alert-danger::before { background: #ef4444; }
+      .flash-message.alert-warning::before { background: #f59e0b; }
+      .flash-message.alert-info::before { background: #3b82f6; }
+
+      @keyframes toastIn {
+        from { transform: translateX(100%); opacity: 0; }
+        to { transform: translateX(0); opacity: 1; }
+      }
+
+      .flash-message .btn-close {
+        font-size: 0.65rem;
+        padding: 1.25rem;
+        position: absolute;
+        top: 50%;
+        right: 8px;
+        transform: translateY(-50%);
+        opacity: 0.5;
+        transition: opacity 0.2s;
+      }
+
+      .flash-message .btn-close:hover {
+        opacity: 1;
+      }
+    </style>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+    {% block head %}{% endblock %}
+  </head>
+  <body>
+    <!-- Include Header -->
+    {% if not hide_header %}
+      {% include 'header.html' %}
+    {% endif %}
+
+    <!-- Flash Messages Container -->
+    <div class="flash-container" id="global-notification-container">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for category, message in messages %}
+            <div class="flash-message alert alert-{{ category if category != 'error' else 'danger' }} alert-dismissible fade show" role="alert">
+              <i class="bi bi-{% if category == 'success' %}check-circle{% elif category == 'danger' or category == 'error' %}exclamation-triangle{% else %}info-circle{% endif %} me-2 text-{{ category if category != 'error' else 'danger' }}"></i>
+              <span class="small fw-medium">{{ message }}</span>
+              <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+    </div>
+
+    <!-- Main Content Area -->
+    <main class="container-fluid px-4 py-3" style="flex:1 1 0; min-height:0; overflow-y:auto;">
+      {% block content %}{% endblock %}
+    </main>
+
+    <script
+      src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+      integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"
+      crossorigin="anonymous"
+    ></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+    {% block scripts %}{% endblock %}
+
+    <!-- Notification System Script -->
+    {% if not hide_header %}
+    <script>
+      (function() {
+        const badge = document.getElementById('notification-badge');
+        const countText = document.getElementById('unread-count-text');
+        const list = document.getElementById('notification-list');
+        const bellIcon = document.querySelector('#notificationDropdown i');
+        const unseenCountEl = document.getElementById('unseen-count');
+        const seenCountEl = document.getElementById('seen-count');
+        const tabButtons = document.querySelectorAll('.notification-tab-btn');
+        const SEEN_PAGE_SIZE = 20;
+        let lastCount = -1;
+        let unseenList = [];
+        let seenList = [];
+        let seenTotal = 0;
+        let seenHasMore = false;
+        let activeTab = 'unseen';
+        let loadingMore = false;
+
+        function renderItem(n) {
+          const avgRating = n.avg_rating ? parseFloat(n.avg_rating).toFixed(1) : null;
+          let ratingBadge = '';
+          if (avgRating !== null) {
+            const rating = parseFloat(avgRating);
+            let bgClass, textClass, icon;
+            if (rating >= 4) {
+              bgClass = 'bg-success bg-opacity-10';
+              textClass = 'text-success';
+              icon = 'bi-star-fill';
+            } else if (rating <= 2) {
+              bgClass = 'bg-danger bg-opacity-10';
+              textClass = 'text-danger';
+              icon = 'bi-star-fill';
+            } else {
+              bgClass = 'bg-warning bg-opacity-10';
+              textClass = 'text-warning';
+              icon = 'bi-star-half';
+            }
+            ratingBadge = `<span class="badge ${bgClass} ${textClass} ms-2" style="font-size: 0.7rem;"><i class="bi ${icon} me-1"></i>${avgRating}</span>`;
+          }
+
+          return `
+            <li>
+              <a href="/admin/stores/${n.store_id}/feedback?mark_read=${n.id}"
+                 class="dropdown-item px-3 py-3 border-bottom ${n.is_read ? 'opacity-60 grayscale' : 'bg-primary-light'}"
+                 style="transition: all 0.2s ease; ${n.is_read ? '' : 'border-left: 3px solid var(--primary-500);'}">
+                <div class="d-flex align-items-center">
+                  <div class="rounded-circle ${n.is_read ? 'bg-light' : 'bg-primary bg-opacity-10'} p-2 me-3 flex-shrink-0">
+                    <i class="bi ${n.is_read ? 'bi-chat-square-text' : 'bi-chat-square-text-fill'} ${n.is_read ? 'text-muted' : 'text-primary'} small"></i>
+                  </div>
+                  <div class="flex-grow-1 min-width-0">
+                    <div class="d-flex justify-content-between align-items-center mb-1">
+                      <span class="${n.is_read ? 'text-muted' : 'fw-bold text-dark'} text-truncate" style="font-size: 0.85rem; max-width: 140px;">${(n.user_email && n.user_email !== 'undefined') ? n.user_email : 'Anonymous'}</span>
+                      <small class="text-muted flex-shrink-0" style="font-size: 0.7rem;">${n.created_at || ''}</small>
+                    </div>
+                    <p class="mb-0 text-muted small text-truncate" style="font-size: 0.8rem;">
+                      ${n.store_name ? `Feedback for <span class="${n.is_read ? 'text-muted' : 'fw-bold text-dark'}">${n.store_name}</span>${ratingBadge}` : 'Feedback submission'}
+                    </p>
+                  </div>
+                </div>
+              </a>
+            </li>
+          `;
+        }
+
+        function emptyState(msg) {
+          return `
+            <li class="px-3 py-5 text-center text-muted">
+              <div class="rounded-circle bg-light d-inline-flex p-3 mb-3">
+                <i class="bi bi-bell-slash fs-4 opacity-50"></i>
+              </div>
+              <p class="small mb-0 fw-medium">${msg}</p>
+            </li>
+          `;
+        }
+
+        function renderNotifications() {
+          const items = activeTab === 'unseen' ? unseenList : seenList;
+
+          if (items.length === 0) {
+            list.innerHTML = emptyState(activeTab === 'unseen' ? 'No new feedback' : 'No seen notifications');
+            return;
+          }
+
+          let html = '';
+
+          if (activeTab === 'seen') {
+            html += `
+              <li class="px-3 py-2 bg-light border-bottom d-flex justify-content-between align-items-center">
+                <small class="text-muted">${seenTotal} seen notification${seenTotal === 1 ? '' : 's'}</small>
+                <button id="clear-seen-btn" type="button" class="btn btn-sm btn-link text-danger text-decoration-none p-0" style="font-size: 0.8rem;">
+                  <i class="bi bi-trash3 me-1"></i>Clear all
+                </button>
+              </li>
+            `;
+          }
+
+          html += items.map(renderItem).join('');
+
+          if (activeTab === 'seen' && seenHasMore) {
+            html += `
+              <li class="px-3 py-2 text-center border-top">
+                <button id="load-more-seen" type="button" class="btn btn-sm btn-link text-decoration-none fw-medium">
+                  <i class="bi bi-arrow-down-circle me-1"></i>Load more (${seenTotal - seenList.length} remaining)
+                </button>
+              </li>
+            `;
+          }
+
+          list.innerHTML = html;
+
+          const loadBtn = document.getElementById('load-more-seen');
+          if (loadBtn) {
+            loadBtn.addEventListener('click', (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              loadMoreSeen();
+            });
+          }
+
+          const clearBtn = document.getElementById('clear-seen-btn');
+          if (clearBtn) {
+            clearBtn.addEventListener('click', (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              clearSeenNotifications();
+            });
+          }
+        }
+
+        async function clearSeenNotifications() {
+          if (seenTotal === 0) return;
+          if (!confirm(`Clear all ${seenTotal} seen notification${seenTotal === 1 ? '' : 's'}? They will be hidden from this view.`)) return;
+          try {
+            const res = await fetch('/api/notifications/clear-seen', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' }
+            });
+            const data = await res.json();
+            if (data.success) {
+              seenList = [];
+              seenTotal = 0;
+              seenHasMore = false;
+              if (seenCountEl) seenCountEl.textContent = 0;
+              renderNotifications();
+            }
+          } catch (err) {
+            console.error('Failed to clear seen notifications:', err);
+          }
+        }
+
+        async function loadMoreSeen() {
+          if (loadingMore || !seenHasMore) return;
+          loadingMore = true;
+          const btn = document.getElementById('load-more-seen');
+          if (btn) btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Loading...';
+          try {
+            const res = await fetch(`/api/notifications/unread?status=seen&seen_offset=${seenList.length}&seen_limit=${SEEN_PAGE_SIZE}`);
+            const data = await res.json();
+            if (data.success) {
+              seenList = seenList.concat(data.seen || []);
+              seenHasMore = !!data.seen_has_more;
+              seenTotal = data.seen_total ?? seenTotal;
+              renderNotifications();
+            }
+          } catch (err) {
+            console.error('Failed to load more seen notifications:', err);
+          } finally {
+            loadingMore = false;
+          }
+        }
+
+        tabButtons.forEach(btn => {
+          btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            tabButtons.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            activeTab = btn.dataset.tab;
+            renderNotifications();
+          });
+        });
+
+        async function updateNotifications() {
+          try {
+            const response = await fetch(`/api/notifications/unread?status=all&seen_limit=${SEEN_PAGE_SIZE}`);
+            const data = await response.json();
+
+            if (data.success) {
+              const count = data.total_unread;
+              unseenList = data.unseen || [];
+              seenList = data.seen || [];
+              seenTotal = data.seen_total || 0;
+              seenHasMore = !!data.seen_has_more;
+
+              if (unseenCountEl) unseenCountEl.textContent = unseenList.length;
+              if (seenCountEl) seenCountEl.textContent = seenTotal;
+
+              if (count > 0) {
+                badge.textContent = count > 99 ? '99+' : count;
+                badge.classList.remove('d-none');
+                countText.textContent = `${count} New`;
+
+                if (lastCount !== -1 && count > lastCount) {
+                  bellIcon.classList.add('bi-bell-fill', 'text-danger');
+                  bellIcon.classList.remove('bi-bell', 'text-muted');
+                  setTimeout(() => {
+                    bellIcon.classList.add('bi-bell');
+                    bellIcon.classList.remove('bi-bell-fill', 'text-danger');
+                  }, 3000);
+                }
+              } else {
+                badge.classList.add('d-none');
+                countText.textContent = '0 New';
+              }
+
+              renderNotifications();
+              lastCount = count;
+            }
+          } catch (error) {
+            console.error('Failed to fetch notifications:', error);
+          }
+        }
+
+        // Initial fetch
+        updateNotifications();
+
+        // Poll every 30 seconds
+        setInterval(updateNotifications, 30000);
+      })();
+
+      // Auto-hide flash messages
+      document.addEventListener('DOMContentLoaded', function() {
+        const flashes = document.querySelectorAll('.flash-message');
+        flashes.forEach(flash => {
+          setTimeout(() => {
+            const bsAlert = new bootstrap.Alert(flash);
+            bsAlert.close();
+          }, 3000);
+        });
+      });
+
+      /**
+       * Shows a small banner notification at the bottom right.
+       * @param {string} message - The message to display.
+       * @param {string} category - Bootstrap alert category (success, danger, info, etc.)
+       * @param {number} duration - Time in ms before hiding (default 3000)
+       */
+      window.showNotification = function(message, category = 'success', duration = 3000) {
+        const container = document.getElementById('global-notification-container');
+        if (!container) return;
+
+        const iconMap = {
+          'success': 'check-circle',
+          'danger': 'exclamation-triangle',
+          'error': 'exclamation-triangle',
+          'warning': 'exclamation-circle',
+          'info': 'info-circle'
+        };
+        const icon = iconMap[category] || 'info-circle';
+
+        const flashDiv = document.createElement('div');
+        flashDiv.className = `flash-message alert alert-${category} alert-dismissible fade show`;
+        flashDiv.setAttribute('role', 'alert');
+        flashDiv.innerHTML = `
+          <i class="bi bi-${icon} me-2 text-${category}"></i>
+          <span class="small fw-medium">${message}</span>
+          <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+        `;
+
+        container.appendChild(flashDiv);
+
+        // Auto-hide using Bootstrap Alert API
+        setTimeout(() => {
+          if (flashDiv.parentNode) {
+            const bsAlert = bootstrap.Alert.getOrCreateInstance(flashDiv);
+            if (bsAlert) bsAlert.close();
+          }
+        }, duration);
+      };
+    </script>
+    {% endif %}
+  </body>
+</html>

@@ -1,0 +1,2181 @@
+{% extends "layout.html" %}
+<!-- 
+================================================================================
+FILE: admin/feedback.html
+URL ROUTE: /admin/stores/<store_id>/feedback
+PURPOSE: "Feedback Management" page. Displays all customer responses/submissions
+         for a specific store in a two-pane list and detail view.
+================================================================================
+-->
+
+{% block head %}
+<style>
+  .feedback-container {
+    display: flex;
+    min-height: 600px;
+    border: 1px solid #e9ecef;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  #staff.tab-pane,
+  #analytics.tab-pane {
+    padding: 0 !important;
+  }
+
+  #storeTabContent {
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  .tab-pane:not(.show) {
+    display: none !important;
+    height: 0 !important;
+    min-height: 0 !important;
+    overflow: hidden !important;
+  }
+
+  .feedback-list-panel {
+    flex: 0 0 380px;
+    border-right: 1px solid #e9ecef;
+    overflow-y: auto;
+    background-color: #f8f9fa;
+    max-height: 600px;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+  }
+  .feedback-detail-panel {
+    flex: 1;
+    overflow-y: auto;
+    background-color: #fff;
+    padding: 24px;
+    max-height: 600px;
+    position: relative;
+  }
+  .feedback-item {
+    width: 100%;
+    display: block;
+    text-align: left;
+    background: #ffffff;
+    border: 0;
+    appearance: none;
+    -webkit-appearance: none;
+    padding: 18px;
+    border-bottom: 1px solid #f1f3f4;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    position: relative;
+    border-left: 3px solid transparent;
+  }
+  .feedback-item:focus {
+    outline: 2px solid rgba(107, 114, 128, 0.3);
+    outline-offset: 2px;
+  }
+  .feedback-item:hover,
+  .feedback-item.active {
+    background: #f8f9fa;
+    transform: translateX(2px);
+    border-left: 3px solid #6b7280;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+  }
+  .feedback-item .status-badge {
+    position: absolute;
+    top: 18px;
+    right: 18px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 5px 10px;
+    border-radius: 18px;
+  }
+  .feedback-item .status-badge.unresolved {
+    background: #dc2626;
+    color: #fff;
+    border: 1px solid #b91c1c;
+    box-shadow: 0 1px 3px rgba(220, 38, 38, 0.2);
+  }
+  .feedback-item .status-badge.resolved {
+    background: #059669;
+    color: #fff;
+    border: 1px solid #047857;
+    box-shadow: 0 1px 3px rgba(5, 150, 105, 0.2);
+  }
+  .search-section {
+    padding: 16px;
+    border-bottom: 1px solid #e9ecef;
+    background-color: #fff;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    flex-shrink: 0;
+  }
+  .customer-name {
+    font-weight: 700;
+    color: #212529;
+    margin-bottom: 7px;
+    font-size: 0.875rem;
+    letter-spacing: 0.3px;
+  }
+  .feedback-meta {
+    font-size: 0.8125rem;
+    color: #6c757d;
+    font-weight: 500;
+  }
+  .rating-stars {
+    color: #FFD700;
+    font-size: 0.8125rem;
+    margin-bottom: 3px;
+  }
+  .rating-stars .bi-star-fill {
+    color: #FFD700;
+  }
+  .rating-stars .bi-star {
+    color: #FFD700;
+  }
+  .detail-header {
+    border: 1px solid #ca8a04;
+    padding: 20px;
+    margin-bottom: 20px;
+    background: linear-gradient(135deg, #facc15 0%, #a16207 100%);
+    border-radius: 8px;
+    box-shadow: 0 2px 6px rgba(202, 138, 4, 0.25);
+    color: #1f2937;
+  }
+
+  .detail-header h2,
+  .detail-header h3,
+  .detail-header h4,
+  .detail-header h5,
+  .detail-header p {
+    color: #1f2937;
+  }
+  .detail-header .text-muted,
+  .detail-header .small.text-muted {
+    color: #4b5563 !important;
+  }
+  .detail-inner {
+    max-width: 960px;
+    margin: 0 auto;
+  }
+  .section-card {
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 16px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+    transition: all 0.2s ease;
+    color: #212529;
+  }
+
+  .section-card h4,
+  .section-card h5,
+  .section-card h6,
+  .section-card p,
+  .section-card strong,
+  .section-card label {
+    color: #212529;
+  }
+
+  .section-card:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  }
+  .customer-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 18px;
+    margin-bottom: 27px;
+  }
+  .stat-card {
+    background: #f9fafb;
+    padding: 16px;
+    border-radius: 8px;
+    text-align: center;
+    transition: all 0.2s ease;
+    border: 1px solid #e5e7eb;
+    position: relative;
+  }
+
+  .stat-card::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: #6b7280;
+  }
+
+  .stat-card:nth-child(1)::before {
+    background: #6b7280;
+  }
+
+  .stat-card:nth-child(2)::before {
+    background: #6b7280;
+  }
+
+  .stat-card:nth-child(3)::before {
+    background: #6b7280;
+  }
+
+  .stat-card:nth-child(4)::before {
+    background: #6b7280;
+  }
+
+  .stat-card:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  }
+  .stat-value {
+    font-size: 1.5rem;
+    font-weight: 700;
+    margin-bottom: 7px;
+    color: #212529;
+  }
+
+  .stat-card:nth-child(1) .stat-value {
+    color: #374151;
+  }
+
+  .stat-card:nth-child(2) .stat-value {
+    color: #374151;
+  }
+
+  .stat-card:nth-child(3) .stat-value {
+    color: #374151;
+  }
+
+  .stat-card:nth-child(4) .stat-value {
+    color: #374151;
+  }
+  .stat-label {
+    font-size: 0.8125rem;
+    color: #6c757d;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+  }
+
+  .stat-card:nth-child(1) .stat-label,
+  .stat-card:nth-child(2) .stat-label,
+  .stat-card:nth-child(3) .stat-label,
+  .stat-card:nth-child(4) .stat-label {
+    color: #6c757d;
+  }
+
+  /* Enhanced card styling with subdued theme */
+  .card {
+    transition: all 0.2s ease;
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+  }
+
+  .card:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  }
+
+  /* Enhanced form controls with white background */
+  .form-control {
+    border-radius: 0.5rem;
+    border: 1px solid #d1d5db;
+    transition: all 0.2s ease;
+    font-size: 0.875rem;
+    background-color: white;
+    color: #212529;
+  }
+
+  .form-control:focus {
+    border-color: #6b7280;
+    box-shadow: 0 0 0 0.2rem rgba(107, 114, 128, 0.1);
+    transform: translateY(-1px);
+    background-color: white;
+  }
+
+  .form-control-lg {
+    border-radius: 0.5rem;
+    border: 1px solid #d1d5db;
+    font-size: 0.9375rem;
+    background-color: white;
+    color: #212529;
+  }
+
+  .form-control-lg:focus {
+    border-color: #6b7280;
+    box-shadow: 0 0 0 0.2rem rgba(107, 114, 128, 0.15);
+    transform: translateY(-1px);
+    background-color: white;
+  }
+
+  .input-group-text {
+    border-radius: 0.5rem;
+    border: 1px solid #d1d5db;
+    background: #f9fafb;
+  }
+
+  /* Enhanced buttons with subdued theme */
+  .btn {
+    border-radius: 0.5rem;
+    font-weight: 600;
+    transition: all 0.2s ease;
+    font-size: 0.875rem;
+  }
+
+  .btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  }
+
+  .btn-primary {
+    background: #374151;
+    color: white;
+    border: 1px solid #374151;
+  }
+
+  .btn-outline-primary {
+    border: 1px solid #6b7280;
+    color: #6b7280;
+  }
+
+  .btn-outline-primary:hover {
+    background: #374151;
+    border-color: #374151;
+    color: white;
+    transform: translateY(-1px);
+  }
+
+  .btn-outline-secondary {
+    border: 2px solid var(--bs-secondary);
+    color: var(--bs-secondary);
+  }
+
+  .btn-outline-secondary:hover {
+    background: var(--bs-secondary);
+    border-color: var(--bs-secondary);
+  }
+
+  .btn-lg {
+    padding: 0.7rem 1.4rem;
+    font-size: 0.9375rem;
+  }
+
+  /* Enhanced badges to match dashboard */
+  .badge {
+    font-weight: 600;
+    border-radius: 0.5rem;
+    font-size: 0.75rem;
+  }
+
+  /* Enhanced form switch */
+  .form-check-input {
+    border-radius: 1rem;
+    width: 3rem;
+    height: 1.5rem;
+  }
+
+  .form-check-input:checked {
+    background-color: var(--bs-success);
+    border-color: var(--bs-success);
+  }
+
+  .form-check-label {
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  /* Enhanced empty states */
+  .text-center.py-5 {
+    padding: 3rem 0 !important;
+  }
+
+  .text-center.py-5 i {
+    font-size: 3rem !important;
+    margin-bottom: 1rem;
+  }
+
+  .text-center.py-5 h4 {
+    font-size: 1.125rem;
+    margin-bottom: 1rem;
+  }
+
+  /* Enhanced search section */
+  .search-section {
+    background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
+    border-bottom: 2px solid #e9ecef;
+  }
+
+  /* Enhanced feedback list panel */
+  .feedback-list-panel {
+    background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+    border-right: 2px solid #e9ecef;
+  }
+
+  /* Enhanced feedback detail panel */
+  .feedback-detail-panel {
+    background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
+    padding: 1.8rem;
+    height: 100%;
+    overflow-y: auto;
+  }
+
+  /* Enhanced container */
+  .feedback-container {
+    background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
+    border: 1px solid rgba(0, 0, 0, 0.05);
+  }
+
+  
+  /* Success notification card styles */
+  .success-notification {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: #059669;
+    color: white;
+    padding: 16px 20px;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 300px;
+    max-width: 400px;
+    transform: translateX(100%);
+    opacity: 0;
+    pointer-events: none;
+    transition: transform 0.3s ease-in-out, opacity 0.3s ease-in-out;
+  }
+
+  .success-notification.show {
+    transform: translateX(0);
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .success-notification .notification-icon {
+    font-size: 1rem;
+    flex-shrink: 0;
+  }
+
+  .success-notification .notification-content {
+    flex: 1;
+  }
+
+  .success-notification .notification-title {
+    font-weight: 600;
+    margin-bottom: 2px;
+    font-size: 0.875rem;
+  }
+
+  .success-notification .notification-message {
+    font-size: 0.8125rem;
+    opacity: 0.9;
+  }
+
+  .success-notification .notification-close {
+    background: none;
+    border: none;
+    color: white;
+    font-size: 1rem;
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity 0.2s;
+    flex-shrink: 0;
+  }
+
+  .success-notification .notification-close:hover {
+    opacity: 1;
+  }
+
+  /* Enhanced responsive design */
+  @media (max-width: 768px) {
+    .feedback-container {
+      flex-direction: column;
+      min-height: 600px;
+    }
+
+    .feedback-list-panel {
+      flex: none;
+      max-height: 300px;
+      border-right: none;
+      border-bottom: 2px solid #e9ecef;
+      height: 300px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .feedback-detail-panel {
+      padding: 1.3rem;
+      flex: 1;
+      min-height: 300px;
+      overflow-y: auto;
+    }
+
+    .customer-stats {
+      grid-template-columns: repeat(2, 1fr);
+      gap: 1rem;
+    }
+  }
+</style>
+{% endblock %} {% block content %}
+
+
+<!-- Store Dashboard Header -->
+<div class="card border-0 shadow-sm mb-3" style="border-radius: 1rem; overflow: hidden;">
+  <div style="height: 4px; background: linear-gradient(90deg, #FF6B35, #E85A2A, #CC4A1F);"></div>
+  <div class="card-body py-3 px-4">
+    <div class="row g-3 align-items-center">
+      <!-- Store Info -->
+      <div class="col-lg-5">
+        <div class="d-flex align-items-start gap-3">
+          <div class="d-flex align-items-center justify-content-center rounded-circle" style="width: 48px; height: 48px; min-width: 48px; background: linear-gradient(135deg, #FF6B35, #E85A2A); color: white; font-size: 1.2rem; font-weight: 700;">
+            {{ store.store_name[0] | upper }}
+          </div>
+          <div>
+            <div class="d-flex align-items-center gap-2 flex-wrap">
+              <h5 class="mb-0 fw-bold" style="color: #1f2937;">{{ store.store_name }}</h5>
+              <span class="badge rounded-pill bg-{{ 'success' if store.status == 'active' else 'secondary' if store.status == 'inactive' else 'warning' }}" style="font-size: 0.7rem;">{{ store.status|title }}</span>
+              {% if store.store_type %}
+              <span class="badge rounded-pill" style="background: #f3f4f6; color: #6b7280; font-size: 0.7rem;">{{ store.store_type|title }}</span>
+              {% endif %}
+            </div>
+            <div class="mt-1 d-flex flex-column gap-1">
+              <div class="small text-muted">
+                <i class="bi bi-geo-alt-fill me-1" style="color: #FF6B35;"></i>{{ store.address or 'No address' }}{% if store.city %}, {{ store.city }}{% endif %}
+              </div>
+              {% if store.contact_number %}
+              <div class="small text-muted">
+                <i class="bi bi-telephone-fill me-1" style="color: #FF6B35;"></i>{{ store.contact_number }}
+              </div>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Key Metrics -->
+      <div class="col-lg-4">
+        <div class="d-flex gap-2 justify-content-center">
+          <div class="text-center px-3 py-2 rounded-3" style="background: rgba(74, 144, 226, 0.1); min-width: 80px;">
+            <div class="fw-bold" style="font-size: 1.25rem; color: #FF6B35;">{{ responses|length }}</div>
+            <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.5px;">Feedback</div>
+          </div>
+          <div class="text-center px-3 py-2 rounded-3" style="background: #eff6ff; min-width: 80px;">
+            <div class="fw-bold" style="font-size: 1.25rem; color: #3b82f6;">{{ staff_count or 0 }}</div>
+            <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.5px;">Staff</div>
+          </div>
+          <div class="text-center px-3 py-2 rounded-3" style="background: #f0fdf4; min-width: 80px;">
+            <div class="fw-bold" style="font-size: 1.25rem; color: #16a34a;">{{ average_rating or '0.0' }}<span style="font-size: 0.8rem; color: #9ca3af;">/5</span></div>
+            <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.5px;">Rating</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- QR Code -->
+      <div class="col-lg-3">
+        <div class="d-flex align-items-center justify-content-center gap-3 p-2 rounded-3" style="background: #fafafa;">
+          <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={{ request.url_root }}s/{{ store.id }}"
+               alt="QR Code" class="rounded-2" style="width: 60px; height: 60px; border: 2px solid #f3f4f6;">
+          <div class="d-flex flex-column gap-1">
+            <div class="text-muted" style="font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">Feedback Link</div>
+            <a href="{{ request.url_root }}s/{{ store.id }}" target="_blank" class="btn btn-sm py-1 px-2" style="font-size: 0.75rem; background: rgba(255, 107, 53, 0.1); color: #FF6B35; border: 1px solid rgba(255, 107, 53, 0.3);">
+              <i class="bi bi-box-arrow-up-right me-1"></i>Preview
+            </a>
+            <a href="{{ url_for('download_qr', store_id=store.id) }}" class="btn btn-sm py-1 px-2" style="font-size: 0.75rem; background: #FF6B35; color: white; border: none;">
+              <i class="bi bi-download me-1"></i>Download QR
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Tab Navigation -->
+<ul class="nav nav-tabs border-bottom" id="storeTabs" role="tablist">
+  <li class="nav-item" role="presentation">
+    <button class="nav-link active" id="feedback-tab" data-bs-toggle="tab" data-bs-target="#feedback" type="button" role="tab">
+      <i class="bi bi-chat-left-text me-2"></i>Feedback
+    </button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link" id="analytics-tab" data-bs-toggle="tab" data-bs-target="#analytics" type="button" role="tab">
+      <i class="bi bi-speedometer2 me-2"></i>Analytics
+    </button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link" id="staff-tab" data-bs-toggle="tab" data-bs-target="#staff" type="button" role="tab">
+      <i class="bi bi-people me-2"></i>Staff
+    </button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link" id="reports-tab" data-bs-toggle="tab" data-bs-target="#reports" type="button" role="tab">
+      <i class="bi bi-file-earmark-arrow-down me-2"></i>Reports
+    </button>
+  </li>
+</ul>
+
+
+<!-- Tab Content -->
+<div class="tab-content" id="storeTabContent">
+  <!-- Feedback Tab -->
+  <div class="tab-pane fade show active" id="feedback" role="tabpanel">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+      <h4 class="mb-0">Feedback Management</h4>
+      <div class="btn-group" role="group">
+        <button type="button" class="btn btn-outline-primary active" onclick="filterFeedback('unresolved', this)">
+          <i class="bi bi-exclamation-circle me-1"></i>Unresolved ({{ responses|selectattr('status', 'equalto', 'unresolved')|list|length }})
+        </button>
+        <button type="button" class="btn btn-outline-secondary" onclick="filterFeedback('resolved', this)">
+          <i class="bi bi-check-circle me-1"></i>Resolved ({{ responses|selectattr('status', 'equalto', 'resolved')|list|length }})
+        </button>
+        <button type="button" class="btn btn-outline-secondary" onclick="filterFeedback('all', this)">
+          <i class="bi bi-list-ul me-1"></i>All ({{ responses|length }})
+        </button>
+      </div>
+    </div>
+
+    <div class="feedback-container shadow-lg rounded">
+  <!-- Left Panel - Feedback List -->
+  <div class="feedback-list-panel">
+    <div class="search-section p-3">
+      <div class="input-group">
+        <input
+          type="text"
+          class="form-control"
+          placeholder="Search by email..."
+        />
+        <span class="input-group-text"><i class="bi bi-search fs-5"></i></span>
+      </div>
+    </div>
+
+    <div class="feedback-list" style="flex: 1; overflow-y: auto">
+      {% for response in responses %}
+      <button
+        type="button"
+        class="feedback-item"
+        data-response-id="{{ response.id }}"
+        aria-pressed="false"
+      >
+        <div class="customer-name">
+          {{ response.user_email or 'Anonymous' }}
+        </div>
+        {% if response.receipt_number %}
+        <div class="receipt-number">
+          <small class="text-muted">
+            <i class="bi bi-receipt me-1"></i>
+            Receipt: {{ response.receipt_number }}
+          </small>
+        </div>
+        {% endif %}
+        <div class="feedback-meta">
+          {% set answers = answers_by_response_id.get(response.id, []) %} {% set
+          avg_rating = answers|selectattr('question_type', 'equalto',
+          'rating')|map(attribute='rating_value')|list %} {% if avg_rating and avg_rating|length > 0 %}
+          {% set rating_avg = (avg_rating|sum / avg_rating|length) %}
+          <div class="rating-stars">
+            {% for i in range(1, 6) %} {% if i <= rating_avg|round(1) %}
+            <i class="bi bi-star-fill text-primary"></i>
+            {% else %}
+            <i class="bi bi-star text-primary"></i>
+            {% endif %} {% endfor %} {{ rating_avg|round(1) }}/5</div> {% endif %}
+          <div>
+            Last visit: {{ response.submitted_at.strftime('%b %d, %Y') if
+            response.submitted_at else 'N/A' }}
+          </div>
+        </div>
+        <div
+          class="status-badge {% if response.status == 'resolved' %}resolved{% else %}unresolved{% endif %}"
+        >
+          {{ response.status.title() }}
+        </div>
+      </button>
+      {% else %}
+      <div class="text-center py-5">
+        <i class="bi bi-inbox text-muted fs-2"></i>
+        <p class="text-muted mt-2">No feedback found</p>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- Right Panel - Feedback Details -->
+  <div class="feedback-detail-panel">
+    <div id="feedback-detail-content" class="detail-inner">
+      <!-- Default state when no feedback is selected -->
+      <div class="text-center py-5">
+        <div class="rounded-circle bg-primary bg-opacity-10 p-2 me-3">
+          <i class="bi bi-chat-left-text text-primary fs-5"></i>
+        </div>
+        <h4 class="text-muted mt-3">Select a feedback entry to view details</h4>
+      </div>
+    </div>
+  </div>
+</div>
+    </div>
+  </div>
+
+  <!-- Analytics Tab -->
+  <div class="tab-pane fade" id="analytics" role="tabpanel">
+    <div class="pt-3" id="analyticsContent">
+      <div class="text-center py-3">
+        <div class="spinner-border text-primary" role="status">
+          <span class="visually-hidden">Loading analytics...</span>
+        </div>
+        <p class="mt-2 text-muted">Loading store analytics...</p>
+      </div>
+    </div>
+  </div>
+  <!-- Staff Tab -->
+  <div class="tab-pane fade" id="staff" role="tabpanel">
+    <div class="d-flex justify-content-between align-items-center mb-3 pt-3">
+      <h4 class="mb-0">Staff Management</h4>
+      <div class="d-flex gap-2">
+        <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#inlineAddStaffModal">
+          <i class="bi bi-plus-lg me-1"></i>Add Staff
+        </button>
+      </div>
+    </div>
+    <div id="staffContent">
+      <div class="text-center py-3">
+        <div class="spinner-border text-primary" role="status">
+          <span class="visually-hidden">Loading staff data...</span>
+        </div>
+        <p class="mt-2 text-muted">Loading staff data...</p>
+      </div>
+    </div>
+  </div>
+  <!-- Reports Tab -->
+  <div class="tab-pane fade" id="reports" role="tabpanel">
+    <div class="pt-3">
+
+      <!-- Section Header -->
+      <div class="d-flex align-items-center gap-3 mb-4">
+        <div class="rounded-circle d-flex align-items-center justify-content-center flex-shrink-0"
+             style="width:44px;height:44px;background:linear-gradient(135deg,#FF6B35,#E85A2A);">
+          <i class="bi bi-cloud-arrow-down text-white fs-5"></i>
+        </div>
+        <div>
+          <h4 class="mb-0 fw-bold">Backup &amp; Export</h4>
+          <p class="text-muted small mb-0">Download feedback data for this store as a structured CSV file.</p>
+        </div>
+      </div>
+
+      <div class="row g-4">
+
+        <!-- LEFT: Export Settings -->
+        <div class="col-lg-7">
+
+          <!-- Step 1: Period -->
+          <div class="card border-0 shadow-sm mb-3">
+            <div class="card-body p-4">
+              <div class="d-flex align-items-center gap-2 mb-3">
+                <span class="badge rounded-circle d-flex align-items-center justify-content-center fw-bold"
+                      style="width:24px;height:24px;background:#FF6B35;color:#fff;font-size:.75rem;flex-shrink:0;">1</span>
+                <h6 class="mb-0 fw-bold">Select Period</h6>
+              </div>
+              <div class="row g-3">
+                <div class="col-sm-6">
+                  <label class="form-label small fw-semibold text-muted text-uppercase" style="letter-spacing:.05em;">From</label>
+                  <div class="input-group">
+                    <span class="input-group-text bg-white"><i class="bi bi-calendar3 text-muted"></i></span>
+                    <input type="text" id="exportDateFrom" class="form-control" placeholder="Start date..." readonly>
+                  </div>
+                </div>
+                <div class="col-sm-6">
+                  <label class="form-label small fw-semibold text-muted text-uppercase" style="letter-spacing:.05em;">To</label>
+                  <div class="input-group">
+                    <span class="input-group-text bg-white"><i class="bi bi-calendar3 text-muted"></i></span>
+                    <input type="text" id="exportDateTo" class="form-control" placeholder="End date..." readonly>
+                  </div>
+                </div>
+              </div>
+              <div class="d-flex gap-2 mt-3 flex-wrap">
+                <button type="button" class="btn btn-sm btn-outline-secondary" onclick="setExportPreset('all')">All Time</button>
+                <button type="button" class="btn btn-sm btn-outline-secondary" onclick="setExportPreset('this_month')">This Month</button>
+                <button type="button" class="btn btn-sm btn-outline-secondary" onclick="setExportPreset('last_month')">Last Month</button>
+                <button type="button" class="btn btn-sm btn-outline-secondary" onclick="setExportPreset('last_30')">Last 30 Days</button>
+                <button type="button" class="btn btn-sm btn-outline-secondary" onclick="setExportPreset('this_year')">This Year</button>
+              </div>
+              <div class="form-text mt-2"><i class="bi bi-info-circle me-1"></i>Leave both dates empty to export all feedback.</div>
+            </div>
+          </div>
+
+          <!-- Step 2: Status Filter -->
+          <div class="card border-0 shadow-sm mb-3">
+            <div class="card-body p-4">
+              <div class="d-flex align-items-center gap-2 mb-3">
+                <span class="badge rounded-circle d-flex align-items-center justify-content-center fw-bold"
+                      style="width:24px;height:24px;background:#FF6B35;color:#fff;font-size:.75rem;flex-shrink:0;">2</span>
+                <h6 class="mb-0 fw-bold">Filter by Status</h6>
+              </div>
+              <div class="d-flex gap-3 flex-wrap">
+                <div class="form-check">
+                  <input class="form-check-input" type="radio" name="exportStatus" id="exportStatusAll" value="all" checked>
+                  <label class="form-check-label" for="exportStatusAll">All feedback</label>
+                </div>
+                <div class="form-check">
+                  <input class="form-check-input" type="radio" name="exportStatus" id="exportStatusResolved" value="resolved">
+                  <label class="form-check-label" for="exportStatusResolved">Resolved only</label>
+                </div>
+                <div class="form-check">
+                  <input class="form-check-input" type="radio" name="exportStatus" id="exportStatusUnresolved" value="unresolved">
+                  <label class="form-check-label" for="exportStatusUnresolved">Unresolved only</label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Step 3: Format & Download -->
+          <div class="card border-0 shadow-sm">
+            <div class="card-body p-4">
+              <div class="d-flex align-items-center gap-2 mb-3">
+                <span class="badge rounded-circle d-flex align-items-center justify-content-center fw-bold"
+                      style="width:24px;height:24px;background:#FF6B35;color:#fff;font-size:.75rem;flex-shrink:0;">3</span>
+                <h6 class="mb-0 fw-bold">Download</h6>
+              </div>
+              <div class="row g-3">
+                <div class="col-sm-6">
+                  <button class="btn w-100 py-3 d-flex flex-column align-items-center gap-1"
+                          style="background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;border:none;border-radius:.75rem;"
+                          onclick="downloadBackupCSV()">
+                    <i class="bi bi-filetype-csv fs-3"></i>
+                    <span class="fw-semibold">Export CSV</span>
+                    <span style="font-size:.75rem;opacity:.85;">Spreadsheet / Excel</span>
+                  </button>
+                </div>
+                <div class="col-sm-6">
+                  <button class="btn w-100 py-3 d-flex flex-column align-items-center gap-1"
+                          style="background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:.75rem;"
+                          onclick="downloadReport('pdf')">
+                    <i class="bi bi-file-earmark-pdf fs-3"></i>
+                    <span class="fw-semibold">Export PDF</span>
+                    <span style="font-size:.75rem;opacity:.85;">Summary Report</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- RIGHT: What's Included -->
+        <div class="col-lg-5">
+          <div class="card border-0 shadow-sm h-100">
+            <div class="card-body p-4">
+              <h6 class="fw-bold mb-1"><i class="bi bi-table me-2 text-success"></i>CSV Columns Included</h6>
+              <p class="text-muted small mb-3">Each row represents one feedback submission.</p>
+              <div class="d-flex flex-column gap-2">
+                {% set csv_columns = [
+                  ('bi-hash', 'Feedback ID', 'Unique identifier'),
+                  ('bi-calendar-date', 'Submitted Date', 'Date & time of submission'),
+                  ('bi-star-half', 'Overall Rating', '1–5 star score'),
+                  ('bi-person', 'Customer Email', 'Submitter email if provided'),
+                  ('bi-chat-left-text', 'Feedback Comments', 'Open-ended responses'),
+                  ('bi-question-circle', 'Survey Questions', 'All question answers'),
+                  ('bi-award', 'Commended Staff', 'Staff members mentioned'),
+                  ('bi-check-circle', 'Status', 'Resolved or Unresolved'),
+                  ('bi-reply', 'Reply Sent', 'Whether a reply was sent')
+                ] %}
+                {% for icon, label, desc in csv_columns %}
+                <div class="d-flex align-items-start gap-2 py-2 px-3 rounded-2" style="background:#f8f9fa;">
+                  <i class="bi {{ icon }} mt-1 flex-shrink-0" style="color:#FF6B35;"></i>
+                  <div>
+                    <div class="fw-semibold small">{{ label }}</div>
+                    <div class="text-muted" style="font-size:.75rem;">{{ desc }}</div>
+                  </div>
+                </div>
+                {% endfor %}
+              </div>
+              <div class="mt-3 p-2 rounded-2 d-flex align-items-center gap-2" style="background:rgba(255,107,53,.08);border:1px solid rgba(255,107,53,.2);">
+                <i class="bi bi-shield-check" style="color:#FF6B35;"></i>
+                <span class="small text-muted">File is generated server-side and downloaded securely.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Inline Add Staff Modal -->
+<div class="modal fade" id="inlineAddStaffModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title fw-bold">Add Staff Member</h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <form id="inlineAddStaffForm" method="POST" action="{{ url_for('add_staff', store_id=store.id) }}">
+          <div class="row g-2">
+            <div class="col-6">
+              <label class="form-label small fw-semibold mb-1">First Name *</label>
+              <input type="text" name="first_name" class="form-control form-control-sm" required>
+            </div>
+            <div class="col-6">
+              <label class="form-label small fw-semibold mb-1">Last Name *</label>
+              <input type="text" name="last_name" class="form-control form-control-sm" required>
+            </div>
+            <div class="col-6">
+              <label class="form-label small fw-semibold mb-1">Email</label>
+              <input type="email" name="email" class="form-control form-control-sm">
+            </div>
+            <div class="col-6">
+              <label class="form-label small fw-semibold mb-1">Phone</label>
+              <input type="tel" name="phone" class="form-control form-control-sm">
+            </div>
+            <div class="col-6">
+              <label class="form-label small fw-semibold mb-1">Position</label>
+              <input type="text" name="position" class="form-control form-control-sm" placeholder="e.g. Sales Associate">
+            </div>
+            <div class="col-6">
+              <label class="form-label small fw-semibold mb-1">Role</label>
+              <select name="role" class="form-select form-select-sm">
+                <option value="staff">Staff</option>
+                <option value="manager">Manager</option>
+                <option value="supervisor">Supervisor</option>
+              </select>
+            </div>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer py-2">
+        <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" form="inlineAddStaffForm" class="btn btn-sm btn-primary"><i class="bi bi-plus-lg me-1"></i>Add</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Inline Edit Staff Modal -->
+<div class="modal fade" id="inlineEditStaffModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title fw-bold">Edit Staff Member</h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <form id="inlineEditStaffForm" method="POST">
+          <div class="row g-2">
+            <div class="col-6">
+              <label class="form-label small fw-semibold mb-1">First Name *</label>
+              <input type="text" name="first_name" id="inline_edit_first_name" class="form-control form-control-sm" required>
+            </div>
+            <div class="col-6">
+              <label class="form-label small fw-semibold mb-1">Last Name *</label>
+              <input type="text" name="last_name" id="inline_edit_last_name" class="form-control form-control-sm" required>
+            </div>
+            <div class="col-6">
+              <label class="form-label small fw-semibold mb-1">Email</label>
+              <input type="email" name="email" id="inline_edit_email" class="form-control form-control-sm">
+            </div>
+            <div class="col-6">
+              <label class="form-label small fw-semibold mb-1">Phone</label>
+              <input type="tel" name="phone" id="inline_edit_phone" class="form-control form-control-sm">
+            </div>
+            <div class="col-6">
+              <label class="form-label small fw-semibold mb-1">Position</label>
+              <input type="text" name="position" id="inline_edit_position" class="form-control form-control-sm">
+            </div>
+            <div class="col-6">
+              <label class="form-label small fw-semibold mb-1">Role</label>
+              <select name="role" id="inline_edit_role" class="form-select form-select-sm">
+                <option value="staff">Staff</option>
+                <option value="manager">Manager</option>
+                <option value="supervisor">Supervisor</option>
+              </select>
+            </div>
+            <div class="col-6">
+              <label class="form-label small fw-semibold mb-1">Status</label>
+              <select name="status" id="inline_edit_status" class="form-select form-select-sm">
+                <option value="active">Active</option>
+                <option value="inactive">Inactive</option>
+              </select>
+            </div>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer py-2">
+        <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" form="inlineEditStaffForm" class="btn btn-sm btn-primary">Save Changes</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %} {% block scripts %}
+<script>
+  let feedbackData = {};
+
+  // Prepare feedback data from template
+  {% for response in responses %}
+  {% set answers = answers_by_response_id.get(response.id, []) %}
+  {% set avg_rating = answers|selectattr('question_type', 'equalto', 'rating')|map(attribute='rating_value')|list %}
+  feedbackData[{{ response.id }}] = {
+    id: {{ response.id }},
+    customerName: {{ (response.user_email or "Anonymous") | tojson }},
+    customerEmail: {{ (response.user_email or "") | tojson }},
+    receiptNumber: {{ (response.receipt_number or "") | tojson }},
+    submittedAt: {{ (response.submitted_at.strftime("%B %d, %Y at %I:%M %p") if response.submitted_at else "") | tojson }},
+    status: {{ response.status | tojson }},
+    avgRating: {{ ((avg_rating|sum / avg_rating|length)|round(1) if avg_rating else 0) | tojson }},
+    answers: [
+      {% for answer in answers %}
+      {
+        questionText: {{ answer.question_text | tojson }},
+        questionType: {{ answer.question_type | tojson }},
+        answerText: {{ answer.answer_text | tojson }},
+        ratingValue: {{ answer.rating_value if answer.question_type == 'rating' else 0 }}
+      }{% if not loop.last %},{% endif %}
+      {% endfor %}
+    ],
+    commendedStaff: [
+      {% set comms = commendations_by_response_id.get(response.id, []) %}
+      {% for c in comms %}
+      {
+        name: {{ (c.first_name ~ " " ~ c.last_name) | tojson }},
+        position: {{ (c.position or c.role|title) | tojson }},
+        type: {{ (c.commendation_type or "excellent_service") | tojson }},
+        rating: {{ (c.rating or 5) | tojson }},
+        comment: {{ (c.comment or "") | tojson }}
+      }{% if not loop.last %},{% endif %}
+      {% endfor %}
+    ]
+  };
+  {% endfor %}
+
+  console.log('feedbackData populated:', feedbackData);
+
+  function selectFeedback(responseId) {
+    console.log('selectFeedback called with responseId:', responseId);
+
+    // Remove active class from all items
+    document.querySelectorAll('.feedback-item').forEach(item => {
+      item.classList.remove('active');
+      item.setAttribute('aria-pressed', 'false');
+    });
+
+    // Add active class to selected item
+    const selectedItem = document.querySelector(`.feedback-item[data-response-id="${responseId}"]`);
+    if (selectedItem) {
+      selectedItem.classList.add('active');
+      selectedItem.setAttribute('aria-pressed', 'true');
+    }
+
+    // Get feedback details
+    const feedback = feedbackData[responseId];
+    console.log('feedback for responseId:', feedback);
+    if (!feedback) return;
+
+    // Render feedback details
+    renderFeedbackDetail(feedback);
+  }
+
+  function filterFeedback(status, btnEl) {
+    // Remove active class from all buttons
+    document.querySelectorAll('.btn-group .btn').forEach(btn => {
+      btn.classList.remove('active');
+    });
+
+    // Add active class to clicked button
+    if (btnEl) {
+      btnEl.classList.add('active');
+    }
+
+    // Filter feedback items
+    const feedbackItems = document.querySelectorAll('.feedback-item');
+    feedbackItems.forEach(item => {
+      const badge = item.querySelector('.status-badge');
+      const itemStatus = badge ? badge.textContent.trim().toLowerCase() : '';
+      if (status === 'all' || itemStatus === status) {
+        item.style.display = 'block';
+      } else {
+        item.style.display = 'none';
+      }
+    });
+  }
+
+  let currentReplyResponseId = null;
+
+  function openReplyModal(responseId) {
+    currentReplyResponseId = responseId;
+    document.getElementById('replyMessage').value = '';
+    const modal = new bootstrap.Modal(document.getElementById('replyModal'));
+    modal.show();
+  }
+
+  function clearReplyForm() {
+    document.getElementById('replyMessage').value = '';
+    document.getElementById('emailTemplate').value = 'standard';
+  }
+
+  async function sendReply() {
+    const message = document.getElementById('replyMessage').value.trim();
+
+    if (!message) {
+      alert('Please enter a reply message');
+      return;
+    }
+
+    if (!currentReplyResponseId) {
+      alert('Invalid response ID');
+      return;
+    }
+
+    // Get selected template
+    const templateSelect = document.getElementById('modalEmailTemplate');
+    const templateType = templateSelect ? templateSelect.value : 'standard';
+
+    try {
+      // Show loading state
+      const sendBtn = document.querySelector('#replyModal .btn-primary');
+      const originalText = sendBtn.innerHTML;
+      sendBtn.innerHTML = '<i class="bi bi-hourglass-split me-2"></i>Sending...';
+      sendBtn.disabled = true;
+
+      const response = await fetch(`/admin/responses/${currentReplyResponseId}/reply`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          message: message,
+          template_type: templateType
+        })
+      });
+
+      const result = await response.json();
+
+      // Restore button
+      sendBtn.innerHTML = originalText;
+      sendBtn.disabled = false;
+
+      if (result.success) {
+        // Close modal
+        const modal = bootstrap.Modal.getInstance(document.getElementById('replyModal'));
+        modal.hide();
+
+        // Show success message with template info
+        const templateName = templateType.charAt(0).toUpperCase() + templateType.slice(1);
+        showNotification("reply to email sent successfully", "success");
+
+        // Update the reply button to show it was sent
+        const replyBtn = document.querySelector(`button[onclick="openReplyModal(${currentReplyResponseId})"]`);
+        if (replyBtn) {
+          replyBtn.innerHTML = '<i class="bi bi-check-circle me-1"></i>Replied';
+          replyBtn.classList.remove('btn-primary');
+          replyBtn.classList.add('btn-success');
+          replyBtn.disabled = true;
+        }
+
+        // Update the inline reply section if it exists
+        const inlineReplySection = document.querySelector('.reply-section');
+        if (inlineReplySection) {
+          const replyTextarea = inlineReplySection.querySelector('textarea');
+          const replySendBtn = inlineReplySection.querySelector('.btn-primary');
+          if (replyTextarea) replyTextarea.value = '';
+          if (replySendBtn) replySendBtn.disabled = false;
+        }
+      } else {
+        alert('Failed to send reply: ' + result.error);
+      }
+    } catch (error) {
+      console.error('Error sending reply:', error);
+      alert('Failed to send reply. Please try again.');
+
+      // Restore button
+      const sendBtn = document.querySelector('#replyModal .btn-primary');
+      sendBtn.innerHTML = '<i class="bi bi-send me-1"></i>Send Reply';
+      sendBtn.disabled = false;
+    }
+  }
+
+  function renderFeedbackDetail(feedback) {
+    const detailContent = document.getElementById('feedback-detail-content');
+
+    detailContent.innerHTML = `
+      <div class="detail-header" style="padding:14px 16px;margin-bottom:12px;">
+        <div class="d-flex justify-content-between align-items-start">
+          <div>
+            <h5 class="mb-1 fw-bold">${feedback.customerName}</h5>
+            <div class="small text-muted">${feedback.customerEmail || 'No email provided'}</div>
+          </div>
+          <div class="d-flex align-items-center gap-2">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="statusToggle" ${feedback.status === 'resolved' ? 'checked' : ''}
+                     onchange="toggleFeedbackStatus(${feedback.id}, this.checked)">
+              <label class="form-check-label small fw-semibold" for="statusToggle">
+                ${feedback.status === 'resolved' ? 'Resolved' : 'Unresolved'}
+              </label>
+            </div>
+            <button type="button" class="btn btn-primary btn-sm py-1 px-2" onclick="openReplyModal(${feedback.id})"
+                    ${!feedback.customerEmail ? 'disabled' : ''}>
+              <i class="bi bi-reply me-1"></i>Reply
+            </button>
+            <form method="POST" action="/admin/responses/${feedback.id}/delete?store_id={{ store.id }}" class="d-inline" onsubmit="return confirm('Are you sure you want to delete this feedback response? This action cannot be undone.');">
+              <button type="submit" class="btn btn-outline-danger btn-sm py-1 px-2">
+                <i class="bi bi-trash me-1"></i>Delete
+              </button>
+            </form>
+          </div>
+        </div>
+      </div>
+
+      <div class="customer-stats" style="gap:12px;margin-bottom:12px;">
+        <div class="stat-card" style="padding:10px;">
+          <div class="stat-value" style="font-size:1.25rem;">${feedback.avgRating}/5</div>
+          <div class="stat-label">Average Rating</div>
+        </div>
+      </div>
+
+      <div class="feedback-details">
+        <div class="section-card" style="padding:14px 16px;margin-bottom:10px;">
+          <h6 class="mb-2 fw-bold">Feedback Details</h6>
+          <div class="row">
+            <div class="col-md-6">
+              <p class="mb-2"><strong>Date & Time:</strong> ${feedback.submittedAt}</p>
+              <p class="mb-2"><strong>Establishment:</strong> {{ store.store_name }}</p>
+            </div>
+            <div class="col-md-6">
+              <p class="mb-2"><strong>Transaction #:</strong> ${feedback.receiptNumber || '<span class="text-muted">N/A</span>'}</p>
+              <p class="mb-2"><strong>Commended Staff:</strong> ${feedback.commendedStaff && feedback.commendedStaff.length > 0
+                ? feedback.commendedStaff.map(s => '<div class="badge bg-success bg-opacity-10 text-success me-1 mb-1"><i class="bi bi-person-check me-1"></i>' + s.name + ' <span class="text-warning">' + s.rating + '★</span></div>').join('')
+                : '<span class="text-muted">None</span>'}</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-card" style="padding:14px 16px;margin-bottom:10px;">
+          <h6 class="mb-2 fw-bold">Specific Feedback</h6>
+          ${renderFeedbackAnswers(feedback.answers)}
+        </div>
+
+        <div class="section-card reply-section" style="padding:14px 16px;margin-bottom:10px;">
+          <h6 class="mb-2 fw-bold">Reply to Customer</h6>
+
+          <div class="row mb-2">
+            <div class="col-md-6">
+              <label for="emailTemplate" class="form-label small fw-semibold mb-1">Email Template</label>
+              <select class="form-select form-select-sm" id="emailTemplate">
+                <option value="standard">Standard (Auto-selected based on rating)</option>
+                <option value="apology">Apology (For negative feedback)</option>
+                <option value="appreciation">Appreciation (For positive feedback)</option>
+                <option value="follow_up">Follow-up (For checking back)</option>
+              </select>
+              <div class="form-text small">Template will be auto-selected based on customer rating if "Standard" is chosen.</div>
+            </div>
+          </div>
+
+          <div class="mb-2">
+            <label for="replyMessage" class="form-label small fw-semibold mb-1">Your Reply Message</label>
+            <textarea class="form-control" id="replyMessage" rows="4" placeholder="Type your response to the customer feedback here..."></textarea>
+          </div>
+
+          <div class="d-flex gap-2">
+            <button class="btn btn-primary btn-sm" onclick="sendReply(${feedback.id})">
+              <i class="bi bi-send me-1"></i>Send Reply
+            </button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="clearReplyForm()">
+              <i class="bi bi-arrow-clockwise me-1"></i>Clear
+            </button>
+          </div>
+
+          <div class="alert alert-info mt-2 py-2 small">
+            <i class="bi bi-info-circle me-1"></i>
+            <strong>Auto-Template:</strong> Template auto-selected by rating —
+            1-2: Apology, 3: Standard, 4-5: Appreciation
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderFeedbackAnswers(answers) {
+    let html = '';
+    answers.forEach(answer => {
+      if (answer.questionType === 'text') {
+        html += `
+          <div class="mb-2">
+            <p class="mb-1 fw-semibold">${answer.questionText}</p>
+            <div class="bg-light p-2 rounded-3 small">
+              ${answer.answerText}
+            </div>
+          </div>
+        `;
+      } else if (answer.questionType === 'rating') {
+        const value = Number(answer.ratingValue) || 0;
+        const stars = Array.from({ length: 5 }, (_, i) =>
+          i < Math.round(value) ? '<i class="bi bi-star-fill text-warning"></i>' : '<i class="bi bi-star text-muted"></i>'
+        ).join('');
+        html += `
+          <div class="mb-2">
+            <p class="mb-1 fw-semibold">${answer.questionText}</p>
+            <div class="d-flex align-items-center gap-2">
+              <span class="rating-stars">${stars}</span>
+              <span class="fw-bold">${value}/5</span>
+            </div>
+            ${answer.answerText ? `<div class="bg-light p-2 rounded-3 small mt-1 text-muted"><i class="bi bi-chat-left-text me-1"></i>${answer.answerText}</div>` : ''}
+          </div>
+        `;
+      } else {
+        html += `
+          <div class="mb-2">
+            <p class="mb-1 fw-semibold">${answer.questionText}</p>
+            <div class="bg-light p-2 rounded-3 small">
+              ${answer.answerText || ''}
+            </div>
+          </div>
+        `;
+      }
+    });
+    return html;
+  }
+
+  function toggleFeedbackStatus(responseId, isResolved) {
+    const newStatus = isResolved ? 'resolved' : 'unresolved';
+
+    fetch(`/admin/responses/${responseId}/status`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ status: newStatus })
+    })
+    .then(response => response.json())
+    .then(data => {
+      if (data.success) {
+        location.reload();
+      } else {
+        alert('Error: ' + data.error);
+      }
+    })
+    .catch(error => {
+      console.error('Error:', error);
+      alert('An error occurred while updating status.');
+    });
+  }
+
+  async function sendReply(responseId) {
+    const textarea = document.querySelector('.reply-section textarea');
+    const replyText = textarea.value.trim();
+
+    if (!replyText) {
+      alert('Please enter a reply message.');
+      return;
+    }
+
+    // Get selected template
+    const templateSelect = document.getElementById('emailTemplate');
+    const templateType = templateSelect ? templateSelect.value : 'standard';
+
+    try {
+      // Show loading state
+      const sendBtn = document.querySelector('.reply-section .btn-primary');
+      const originalText = sendBtn.innerHTML;
+      sendBtn.innerHTML = '<i class="bi bi-hourglass-split me-2"></i>Sending...';
+      sendBtn.disabled = true;
+
+      const response = await fetch(`/admin/responses/${responseId}/reply`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          message: replyText,
+          template_type: templateType
+        })
+      });
+
+      const result = await response.json();
+
+      // Restore button
+      sendBtn.innerHTML = originalText;
+      sendBtn.disabled = false;
+
+      if (result.success) {
+        // Show success message with template info
+        const templateName = templateType.charAt(0).toUpperCase() + templateType.slice(1);
+        showNotification("reply to email sent successfully", "success");
+
+        // Update the reply button to show it was sent
+        const replyBtn = document.querySelector(`button[onclick="openReplyModal(${responseId})"]`);
+        if (replyBtn) {
+          replyBtn.innerHTML = '<i class="bi bi-check-circle me-1"></i>Replied';
+          replyBtn.classList.remove('btn-primary');
+          replyBtn.classList.add('btn-success');
+          replyBtn.disabled = true;
+        }
+
+        // Clear the inline reply form
+        const replyTextarea = document.querySelector('.reply-section textarea');
+        if (replyTextarea) replyTextarea.value = '';
+
+        // Hide the inline reply section after successful send
+        const inlineReplySection = document.querySelector('.reply-section');
+        if (inlineReplySection) {
+          inlineReplySection.style.display = 'none';
+        }
+      } else {
+        alert('Failed to send reply: ' + result.error);
+      }
+    } catch (error) {
+      console.error('Error sending reply:', error);
+      alert('Failed to send reply. Please try again.');
+
+      // Restore button
+      const sendBtn = document.querySelector('.reply-section .btn-primary');
+      sendBtn.innerHTML = '<i class="bi bi-send me-2"></i>Send Reply';
+      sendBtn.disabled = false;
+    }
+  }
+
+  // Search functionality
+  document.addEventListener('DOMContentLoaded', function() {
+    const searchInput = document.querySelector('.search-section input');
+    if (searchInput) {
+      searchInput.addEventListener('input', function(e) {
+        const searchTerm = e.target.value.toLowerCase();
+        const feedbackItems = document.querySelectorAll('.feedback-item');
+
+        feedbackItems.forEach(item => {
+          const customerName = item.querySelector('.customer-name').textContent.toLowerCase();
+          if (customerName.includes(searchTerm)) {
+            item.style.display = 'block';
+          } else {
+            item.style.display = 'none';
+          }
+        });
+      });
+    }
+
+    // Add click listeners to feedback items
+    const feedbackItems = document.querySelectorAll('.feedback-item');
+    feedbackItems.forEach(item => {
+      item.addEventListener('click', function() {
+        const responseId = this.getAttribute('data-response-id');
+        selectFeedback(responseId);
+      });
+    });
+
+    // Apply initial filter to match the active tab (defaults to Unresolved)
+    const activeTab = document.querySelector('.btn-group .btn.active');
+    if (activeTab) {
+      const text = activeTab.textContent.toLowerCase();
+      if (text.includes('unresolved')) {
+        filterFeedback('unresolved', activeTab);
+      } else if (text.includes('resolved')) {
+        filterFeedback('resolved', activeTab);
+      } else {
+        filterFeedback('all', activeTab);
+      }
+    }
+  });
+
+  // Tab event listeners for analytics and staff data
+  document.addEventListener('DOMContentLoaded', function() {
+    // Add event listeners for tab changes
+    const analyticsTab = document.getElementById('analytics-tab');
+    const staffTab = document.getElementById('staff-tab');
+    
+    if (analyticsTab) {
+      analyticsTab.addEventListener('shown.bs.tab', function () {
+        loadAnalyticsData();
+      });
+    }
+    
+    if (staffTab) {
+      staffTab.addEventListener('shown.bs.tab', function () {
+        loadStaffData();
+      });
+    }
+
+    // Activate staff tab if URL has tab=staff parameter
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('tab') === 'staff' && staffTab) {
+      const staffTabInstance = new bootstrap.Tab(staffTab);
+      staffTabInstance.show();
+    }
+  });
+
+  // Function to load analytics data
+  async function loadAnalyticsData() {
+    const storeId = {{ store.id }};
+    const analyticsContent = document.getElementById('analyticsContent');
+    
+    try {
+      analyticsContent.innerHTML = `
+        <div class="text-center py-3">
+          <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Loading analytics...</span>
+          </div>
+          <p class="mt-2 text-muted">Loading store analytics...</p>
+        </div>
+      `;
+      
+      const response = await fetch(`/api/stores/${storeId}/analytics`);
+      const analyticsData = await response.json();
+      
+      analyticsContent.innerHTML = generateAnalyticsHtml(analyticsData);
+      initAnalyticsCharts(analyticsData);
+      
+    } catch (error) {
+      console.error('Error loading analytics:', error);
+      analyticsContent.innerHTML = `
+        <div class="text-center py-3">
+          <div class="text-danger">
+            <i class="bi bi-exclamation-triangle fs-5"></i>
+            <p class="mt-2">Error loading analytics data</p>
+          </div>
+        </div>
+      `;
+    }
+  }
+
+  function initAnalyticsCharts(data) {
+    const chartDefaults = {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } }
+    };
+
+    // Rating Distribution - Horizontal Bar
+    const distCtx = document.getElementById('ratingDistChart');
+    if (distCtx) {
+      new Chart(distCtx, {
+        type: 'bar',
+        data: {
+          labels: ['5 Star', '4 Star', '3 Star', '2 Star', '1 Star'],
+          datasets: [{
+            data: [...(data.rating_metrics?.distribution || [0,0,0,0,0])].reverse(),
+            backgroundColor: ['#FF6B35', '#FF6B35', '#E85A2A', '#E85A2A', '#CC4A1F'],
+            borderRadius: 4,
+            barThickness: 14
+          }]
+        },
+        options: {
+          ...chartDefaults,
+          indexAxis: 'y',
+          scales: {
+            x: { display: false, grid: { display: false } },
+            y: { grid: { display: false }, ticks: { font: { size: 11 } } }
+          }
+        }
+      });
+    }
+
+    // Feedback Trend - Line Chart
+    const trendCtx = document.getElementById('feedbackTrendChart');
+    if (trendCtx) {
+      new Chart(trendCtx, {
+        type: 'line',
+        data: {
+          labels: data.trend?.labels || [],
+          datasets: [{
+            data: data.trend?.values || [],
+            borderColor: '#FF6B35',
+            backgroundColor: 'rgba(255, 107, 53, 0.1)',
+            fill: true,
+            tension: 0.4,
+            pointRadius: 3,
+            pointBackgroundColor: '#FF6B35',
+            borderWidth: 2
+          }]
+        },
+        options: {
+          ...chartDefaults,
+          scales: {
+            x: { grid: { display: false }, ticks: { font: { size: 11 } } },
+            y: { beginAtZero: true, grid: { color: '#f1f5f9' }, ticks: { font: { size: 11 }, stepSize: 1 } }
+          }
+        }
+      });
+    }
+
+    // Resolution Doughnut
+    const resCtx = document.getElementById('resolutionChart');
+    if (resCtx) {
+      const overview = data.overview || {};
+      new Chart(resCtx, {
+        type: 'doughnut',
+        data: {
+          labels: ['Resolved', 'Unresolved'],
+          datasets: [{
+            data: [overview.resolved || 0, overview.unresolved || 0],
+            backgroundColor: ['#FF6B35', '#E85A2A'],
+            borderWidth: 0
+          }]
+        },
+        options: {
+          ...chartDefaults,
+          cutout: '70%',
+          plugins: { legend: { display: true, position: 'bottom', labels: { boxWidth: 10, font: { size: 11 } } } }
+        }
+      });
+    }
+  }
+
+  // Function to load staff data
+  async function loadStaffData() {
+    const storeId = {{ store.id }};
+    const staffContent = document.getElementById('staffContent');
+    
+    try {
+      staffContent.innerHTML = `
+        <div class="text-center py-3">
+          <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Loading staff data...</span>
+          </div>
+          <p class="mt-2 text-muted">Loading staff rankings...</p>
+        </div>
+      `;
+      
+      const response = await fetch(`/api/stores/${storeId}/staff`);
+      const staffData = await response.json();
+      
+      staffContent.innerHTML = generateStaffHtml(staffData);
+      
+    } catch (error) {
+      console.error('Error loading staff:', error);
+      staffContent.innerHTML = `
+        <div class="text-center py-5">
+          <div class="text-danger">
+            <i class="bi bi-exclamation-triangle fs-2"></i>
+            <p class="mt-3">Error loading staff data</p>
+          </div>
+        </div>
+      `;
+    }
+  }
+
+  // Helper function to generate staff HTML
+  function generateStaffHtml(staffData) {
+    if (!staffData || staffData.length === 0) {
+      return `
+        <div class="text-center py-5">
+          <i class="bi bi-people text-muted fs-2"></i>
+          <p class="text-muted mt-3">No staff members found</p>
+        </div>
+      `;
+    }
+    
+    // Store for edit modal lookups
+    window._staffLookup = {};
+    staffData.forEach(s => { window._staffLookup[s.id] = s; });
+
+    const sortedStaff = [...staffData].sort((a, b) => (b.weighted_score || 0) - (a.weighted_score || 0));
+    const totalStaff = sortedStaff.length;
+    const totalCommendations = sortedStaff.reduce((sum, s) => sum + (s.commendation_count || 0), 0);
+    const maxScore = sortedStaff.length > 0 ? (sortedStaff[0].weighted_score || 0) : 0;
+    const activeStaff = sortedStaff.filter(s => s.status === 'active').length;
+
+    // Summary row
+    let html = `
+      <div class="row g-3 mb-3">
+        <div class="col-4">
+          <div class="card border-0 bg-light">
+            <div class="card-body p-3 text-center">
+              <div class="fw-bold text-primary fs-5">${totalStaff}</div>
+              <div class="small text-muted">Total Staff</div>
+            </div>
+          </div>
+        </div>
+        <div class="col-4">
+          <div class="card border-0 bg-light">
+            <div class="card-body p-3 text-center">
+              <div class="fw-bold text-success fs-5">${activeStaff}</div>
+              <div class="small text-muted">Active</div>
+            </div>
+          </div>
+        </div>
+        <div class="col-4">
+          <div class="card border-0 bg-light">
+            <div class="card-body p-3 text-center">
+              <div class="fw-bold text-warning fs-5">${totalCommendations}</div>
+              <div class="small text-muted">Commendations</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    // Table
+    html += `
+      <div class="card border-0 shadow-sm">
+        <div class="table-responsive">
+          <table class="table table-hover align-middle mb-0" style="font-size: 0.875rem;">
+            <thead>
+              <tr class="bg-light">
+                <th class="ps-3" style="width: 60px;">Rank</th>
+                <th>Staff Member</th>
+                <th>Position</th>
+                <th class="text-center">Status</th>
+                <th class="text-center" style="width: 130px;">Avg Rating</th>
+                <th style="width: 100px;">Performance</th>
+                <th class="text-center" style="width: 90px;">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+    `;
+
+    sortedStaff.forEach((staff, index) => {
+      const rank = index + 1;
+      const initials = (staff.first_name || staff.name.split(' ')[0])[0] + (staff.last_name || staff.name.split(' ').pop())[0];
+      const pct = maxScore > 0 ? Math.round(((staff.weighted_score || 0) / maxScore) * 100) : 0;
+      const statusBadge = staff.status === 'active'
+        ? '<span class="badge bg-success bg-opacity-10 text-success">Active</span>'
+        : '<span class="badge bg-secondary bg-opacity-10 text-secondary">Inactive</span>';
+
+      let rankHtml;
+      if (rank === 1) {
+        rankHtml = '<div class="rounded-circle bg-warning text-white d-inline-flex align-items-center justify-content-center shadow-sm" style="width:28px;height:28px;font-size:0.8125rem;"><i class="bi bi-trophy-fill"></i></div>';
+      } else if (rank === 2) {
+        rankHtml = '<div class="rounded-circle bg-secondary bg-opacity-25 text-dark d-inline-flex align-items-center justify-content-center" style="width:28px;height:28px;font-size:0.8125rem;font-weight:600;">2</div>';
+      } else if (rank === 3) {
+        rankHtml = '<div class="rounded-circle bg-warning bg-opacity-25 text-dark d-inline-flex align-items-center justify-content-center" style="width:28px;height:28px;font-size:0.8125rem;font-weight:600;">3</div>';
+      } else {
+        rankHtml = `<span class="text-muted ps-2" style="font-size:0.875rem;">${rank}</span>`;
+      }
+
+      html += `
+              <tr>
+                <td class="ps-3">${rankHtml}</td>
+                <td>
+                  <div class="d-flex align-items-center">
+                    <div class="rounded-circle bg-primary bg-opacity-10 text-primary d-flex align-items-center justify-content-center me-2" style="width:34px;height:34px;font-size:0.8125rem;font-weight:600;">${initials.toUpperCase()}</div>
+                    <div>
+                      <div class="fw-semibold">${staff.name}</div>
+                    </div>
+                  </div>
+                </td>
+                <td class="text-muted">${staff.position || '—'}</td>
+                <td class="text-center">${statusBadge}</td>
+                <td class="text-center">
+                  <span class="badge bg-warning bg-opacity-10 text-warning px-2 py-1">${(staff.avg_rating || 0).toFixed(1)} ★</span>
+                </td>
+                <td>
+                  <div class="progress" style="height:6px;">
+                    <div class="progress-bar bg-primary" style="width:${pct}%;"></div>
+                  </div>
+                </td>
+                <td class="text-center">
+                  <div class="d-flex gap-1 justify-content-center">
+                    <button class="btn btn-sm btn-outline-primary py-0 px-1" onclick="openEditStaffModal(${staff.id})" title="Edit">
+                      <i class="bi bi-pencil"></i>
+                    </button>
+                    <button class="btn btn-sm btn-outline-danger py-0 px-1" onclick="deleteStaffMember(${staff.id})" title="Delete">
+                      <i class="bi bi-trash"></i>
+                    </button>
+                  </div>
+                </td>
+              </tr>
+      `;
+    });
+
+    html += `
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+
+    return html;
+  }
+
+  // Staff management functions
+  function openEditStaffModal(staffId) {
+    const staff = window._staffLookup[staffId];
+    if (!staff) return;
+    document.getElementById('inline_edit_first_name').value = staff.first_name || '';
+    document.getElementById('inline_edit_last_name').value = staff.last_name || '';
+    document.getElementById('inline_edit_email').value = staff.email || '';
+    document.getElementById('inline_edit_phone').value = staff.phone || '';
+    document.getElementById('inline_edit_position').value = staff.position || '';
+    document.getElementById('inline_edit_role').value = staff.role || 'staff';
+    document.getElementById('inline_edit_status').value = staff.status || 'active';
+    document.getElementById('inlineEditStaffForm').action = `/admin/stores/{{ store.id }}/staff/${staffId}/edit`;
+    const modal = new bootstrap.Modal(document.getElementById('inlineEditStaffModal'));
+    modal.show();
+  }
+
+  function deleteStaffMember(staffId) {
+    const staff = window._staffLookup[staffId];
+    const staffName = staff ? staff.name : 'this staff member';
+    if (!confirm(`Are you sure you want to delete ${staffName}? This action cannot be undone.`)) return;
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = `/admin/stores/{{ store.id }}/staff/${staffId}/delete`;
+    document.body.appendChild(form);
+    form.submit();
+  }
+
+  // Function to download QR code
+  function downloadQRCode(storeId, storeName) {
+    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(window.location.origin + '/s/' + storeId)}`;
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = function() {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      canvas.getContext('2d').drawImage(img, 0, 0);
+      const link = document.createElement('a');
+      link.href = canvas.toDataURL('image/png');
+      link.download = `QR_${storeName.replace(/[^a-z0-9]/gi, '_')}.png`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    };
+    img.onerror = function() {
+      window.open(qrUrl, '_blank');
+    };
+    img.src = qrUrl;
+  }
+
+  // Function to edit store
+  function editStore(storeId) {
+    window.location.href = `/admin/stores/${storeId}/edit`;
+  }
+
+  // Function to download report (PDF only — legacy)
+  function downloadReport(format) {
+    const from = document.getElementById('exportDateFrom')?.value || '';
+    const to   = document.getElementById('exportDateTo')?.value   || '';
+    const status = document.querySelector('input[name="exportStatus"]:checked')?.value || 'all';
+    let url = `/admin/stores/{{ store.id }}/report/${format}`;
+    const params = new URLSearchParams();
+    if (from)           params.set('date_from', from);
+    if (to)             params.set('date_to',   to);
+    if (status !== 'all') params.set('status', status);
+    if ([...params].length) url += '?' + params.toString();
+    window.location.href = url;
+  }
+
+  // Download backup CSV with date range + status filters
+  function downloadBackupCSV() {
+    const from   = document.getElementById('exportDateFrom')?.value || '';
+    const to     = document.getElementById('exportDateTo')?.value   || '';
+    const status = document.querySelector('input[name="exportStatus"]:checked')?.value || 'all';
+    let url = `/admin/stores/{{ store.id }}/report/csv`;
+    const params = new URLSearchParams();
+    if (from)               params.set('date_from', from);
+    if (to)                 params.set('date_to',   to);
+    if (status !== 'all')   params.set('status',    status);
+    if ([...params].length) url += '?' + params.toString();
+    window.location.href = url;
+  }
+
+  // Quick-select date presets
+  function setExportPreset(preset) {
+    const now   = new Date();
+    let from = '', to = '';
+    const fmt = d => d.toISOString().slice(0, 10);
+
+    if (preset === 'this_month') {
+      from = fmt(new Date(now.getFullYear(), now.getMonth(), 1));
+      to   = fmt(now);
+    } else if (preset === 'last_month') {
+      const first = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      const last  = new Date(now.getFullYear(), now.getMonth(), 0);
+      from = fmt(first);
+      to   = fmt(last);
+    } else if (preset === 'last_30') {
+      const d = new Date(now); d.setDate(d.getDate() - 30);
+      from = fmt(d);
+      to   = fmt(now);
+    } else if (preset === 'this_year') {
+      from = fmt(new Date(now.getFullYear(), 0, 1));
+      to   = fmt(now);
+    }
+    // 'all' → clear both
+    const fromEl = document.getElementById('exportDateFrom');
+    const toEl   = document.getElementById('exportDateTo');
+    if (fromEl._flatpickr) { fromEl._flatpickr.setDate(from || null); }
+    else fromEl.value = from;
+    if (toEl._flatpickr)   { toEl._flatpickr.setDate(to   || null); }
+    else toEl.value = to;
+  }
+
+  // Initialize flatpickr for export date range inputs
+  if (typeof flatpickr !== 'undefined') {
+    flatpickr('#exportDateFrom', {
+      dateFormat: 'Y-m-d',
+      maxDate: 'today',
+      disableMobile: true,
+      altInput: true,
+      altFormat: 'M j, Y',
+    });
+    flatpickr('#exportDateTo', {
+      dateFormat: 'Y-m-d',
+      maxDate: 'today',
+      disableMobile: true,
+      altInput: true,
+      altFormat: 'M j, Y',
+    });
+  }
+
+  // Initialize flatpickr month picker (legacy)
+  if (typeof flatpickr !== 'undefined') {
+    flatpickr('#reportMonth', {
+      plugins: [],
+      dateFormat: 'F Y',
+      altInput: false,
+      disableMobile: true,
+      maxDate: 'today',
+      onChange: function(selectedDates, dateStr, instance) {
+        // Store YYYY-MM value as a data attribute for easy access
+        if (selectedDates.length > 0) {
+          instance.element.dataset.monthValue = instance.formatDate(selectedDates[0], 'Y-m');
+        } else {
+          instance.element.dataset.monthValue = '';
+        }
+      }
+    });
+  }
+
+  // Helper function to generate analytics HTML
+  function generateAnalyticsHtml(analyticsData) {
+    const rm = analyticsData.rating_metrics || {};
+    const sm = analyticsData.staff_metrics || {};
+    const ov = analyticsData.overview || {};
+    const dist = rm.distribution || [0,0,0,0,0];
+    const distPcts = rm.distribution_pcts || [0,0,0,0,0];
+    const topStaff = sm.top_staff || [];
+
+    // Overview KPI row
+    let html = `
+      <div class="row g-2 mb-3">
+        <div class="col">
+          <div class="card border-0 bg-light"><div class="card-body p-2 text-center">
+            <div class="fw-bold text-primary">${ov.total_feedback || 0}</div>
+            <div class="small text-muted">Total Feedback</div>
+          </div></div>
+        </div>
+        <div class="col">
+          <div class="card border-0 bg-light"><div class="card-body p-2 text-center">
+            <div class="fw-bold text-success">${rm.quality_score || 0}<span class="small text-muted">/5</span></div>
+            <div class="small text-muted">Avg Rating</div>
+          </div></div>
+        </div>
+        <div class="col">
+          <div class="card border-0 bg-light"><div class="card-body p-2 text-center">
+            <div class="fw-bold text-info">${rm.five_star_rate || 0}%</div>
+            <div class="small text-muted">5-Star Rate</div>
+          </div></div>
+        </div>
+        <div class="col">
+          <div class="card border-0 bg-light"><div class="card-body p-2 text-center">
+            <div class="fw-bold" style="color:#22c55e;">${ov.resolution_rate || 0}%</div>
+            <div class="small text-muted">Resolved</div>
+          </div></div>
+        </div>
+        <div class="col">
+          <div class="card border-0 bg-light"><div class="card-body p-2 text-center">
+            <div class="fw-bold text-warning">${sm.total_commendations || 0}</div>
+            <div class="small text-muted">Commendations</div>
+          </div></div>
+        </div>
+      </div>
+    `;
+
+    // Charts row: Rating Distribution | Feedback Trend | Resolution
+    html += `
+      <div class="row g-2 mb-3">
+        <div class="col-md-4">
+          <div class="card border-0 shadow-sm h-100">
+            <div class="card-body p-3">
+              <h6 class="mb-2">Rating Distribution</h6>
+              <div style="height:160px;"><canvas id="ratingDistChart"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-5">
+          <div class="card border-0 shadow-sm h-100">
+            <div class="card-body p-3">
+              <h6 class="mb-2">Feedback Trend <span class="small text-muted fw-normal">(6 months)</span></h6>
+              <div style="height:160px;"><canvas id="feedbackTrendChart"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-3">
+          <div class="card border-0 shadow-sm h-100">
+            <div class="card-body p-3">
+              <h6 class="mb-2">Resolution</h6>
+              <div style="height:130px;"><canvas id="resolutionChart"></canvas></div>
+              <div class="text-center mt-1">
+                <span class="small"><span class="fw-semibold">${ov.resolved || 0}</span> / ${ov.total_feedback || 0}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    // Bottom row: Rating Breakdown Table | Top Commended Staff
+    html += `
+      <div class="row g-2">
+        <div class="col-md-6">
+          <div class="card border-0 shadow-sm">
+            <div class="card-body p-3">
+              <h6 class="mb-2">Rating Breakdown</h6>
+              <table class="table table-sm mb-0" style="font-size:0.875rem;">
+                <thead><tr class="text-muted small">
+                  <th>Rating</th><th class="text-center">Count</th><th class="text-end">%</th><th style="width:40%;">Distribution</th>
+                </tr></thead>
+                <tbody>
+    `;
+    const starColors = ['#FFF0E6','#FFE0CC','#FFCC99','#FF6B35','#E85A2A'];
+    for (let i = 4; i >= 0; i--) {
+      const stars = '★'.repeat(i + 1) + '☆'.repeat(4 - i);
+      html += `
+                  <tr>
+                    <td class="small" style="color:${starColors[i]};">${stars}</td>
+                    <td class="text-center">${dist[i]}</td>
+                    <td class="text-end small text-muted">${distPcts[i]}%</td>
+                    <td><div class="progress" style="height:6px;"><div class="progress-bar" style="width:${distPcts[i]}%;background:${starColors[i]};"></div></div></td>
+                  </tr>
+      `;
+    }
+    html += `
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="card border-0 shadow-sm">
+            <div class="card-body p-3">
+              <h6 class="mb-2">Top Commended Staff</h6>
+    `;
+
+    if (topStaff.length > 0) {
+      html += `
+              <table class="table table-sm table-hover mb-0" style="font-size:0.875rem;">
+                <thead><tr class="text-muted small">
+                  <th>#</th><th>Staff</th><th>Position</th><th class="text-center">Commendations</th>
+                </tr></thead>
+                <tbody>
+      `;
+      topStaff.forEach((s, i) => {
+        const initials = s.name.split(' ').map(n => n[0]).join('').toUpperCase();
+        html += `
+                  <tr>
+                    <td class="text-muted">${i + 1}</td>
+                    <td>
+                      <div class="d-flex align-items-center">
+                        <div class="rounded-circle bg-primary bg-opacity-10 text-primary d-flex align-items-center justify-content-center me-2" style="width:26px;height:26px;font-size:0.75rem;font-weight:600;">${initials}</div>
+                        <span class="fw-semibold">${s.name}</span>
+                      </div>
+                    </td>
+                    <td class="text-muted">${s.position}</td>
+                    <td class="text-center"><span class="badge bg-warning bg-opacity-10 text-warning">${s.commendations}</span></td>
+                  </tr>
+        `;
+      });
+      html += `</tbody></table>`;
+    } else {
+      html += `<div class="text-center py-3 text-muted small">No commendations yet</div>`;
+    }
+
+    html += `
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    return html;
+  }
+
+</script>
+
+<!-- Reply Modal -->
+<div
+  class="modal fade"
+  id="replyModal"
+  tabindex="-1"
+  aria-labelledby="replyModalLabel"
+  aria-hidden="true"
+>
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="replyModalLabel">Reply to Feedback</h5>
+        <button
+          type="button"
+          class="btn-close"
+          data-bs-dismiss="modal"
+          aria-label="Close"
+        ></button>
+      </div>
+      <div class="modal-body">
+        <form id="replyForm">
+          <div class="row mb-3">
+            <div class="col-md-6">
+              <label for="modalEmailTemplate" class="form-label fw-semibold"
+                >Email Template</label
+              >
+              <select class="form-select" id="modalEmailTemplate">
+                <option value="standard">
+                  Standard (Auto-selected based on rating)
+                </option>
+                <option value="apology">Apology (For negative feedback)</option>
+                <option value="appreciation">
+                  Appreciation (For positive feedback)
+                </option>
+                <option value="follow_up">Follow-up (For checking back)</option>
+              </select>
+              <div class="form-text">
+                Template will be auto-selected based on customer rating if
+                "Standard" is chosen.
+              </div>
+            </div>
+          </div>
+
+          <div class="mb-3">
+            <label for="replyMessage" class="form-label fw-semibold"
+              >Your Reply Message</label
+            >
+            <textarea
+              class="form-control"
+              id="replyMessage"
+              rows="6"
+              placeholder="Type your response to the customer feedback here..."
+              required
+            ></textarea>
+          </div>
+
+          <div class="alert alert-info">
+            <i class="bi bi-info-circle me-2"></i>
+            <strong>Auto-Template Selection:</strong> The system will
+            automatically choose the appropriate template based on the
+            customer's rating:
+            <ul class="mb-0 mt-2">
+              <li>Rating 1-2: Apology template</li>
+              <li>Rating 3: Standard template</li>
+              <li>Rating 4-5: Appreciation template</li>
+            </ul>
+          </div>
+
+          <div class="alert alert-success">
+            <i class="bi bi-check-circle me-2"></i>
+            This reply will be sent via email to the customer. The feedback will
+            be automatically marked as resolved.
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+          Cancel
+        </button>
+        <button type="button" class="btn btn-primary" onclick="sendReply()">
+          <i class="bi bi-send me-1"></i>Send Reply
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

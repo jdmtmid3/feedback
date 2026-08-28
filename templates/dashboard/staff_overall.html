@@ -1,0 +1,210 @@
+{% extends "layout.html" %}
+
+{% block title %}Staff Overall · Feedback Admin{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-start mb-4">
+  <div>
+    <h2 class="page-title">Staff Overall</h2>
+    <p class="page-subtitle">
+      View all staff members with their ratings and performance metrics. Total: <strong>{{ staff_data|length }}</strong> staff
+    </p>
+  </div>
+  <div class="d-flex gap-2">
+    <a href="/admin/dashboard" class="btn btn-outline-primary d-flex align-items-center">
+      <i class="bi bi-bar-chart me-2"></i>Dashboard
+    </a>
+  </div>
+</div>
+
+<!-- Search and Filter Section -->
+<div class="card mb-4 border-0 shadow-sm">
+  <div class="card-body p-4">
+    <div class="row g-3">
+      <div class="col-md-4">
+        <div class="input-group">
+          <span class="input-group-text bg-light border-0">
+            <i class="bi bi-search text-muted"></i>
+          </span>
+          <input type="text" class="form-control border-start-0" id="staffSearch" placeholder="Search staff by name..." oninput="filterStaff()">
+        </div>
+      </div>
+      <div class="col-md-2">
+        <select class="form-select" id="statusFilter" onchange="filterStaff()">
+          <option value="">All Status</option>
+          <option value="active">Active</option>
+          <option value="inactive">Inactive</option>
+        </select>
+      </div>
+      <div class="col-md-3">
+        <select class="form-select" id="storeFilter" onchange="filterStaff()">
+          <option value="">All Stores</option>
+          {% for store in staff_data|map(attribute='store_name')|unique|sort|list %}
+          <option value="{{ store }}">{{ store }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-3">
+        <div class="btn-group w-100" role="group">
+          <button type="button" class="btn btn-outline-secondary" onclick="resetFilters()">
+            <i class="bi bi-x-circle me-1"></i>Clear
+          </button>
+          <button type="button" class="btn btn-primary" onclick="filterStaff()">
+            <i class="bi bi-funnel me-1"></i>Apply
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Staff Table -->
+<div class="card border-0 shadow-sm">
+  <div class="card-body p-4">
+    <div class="table-responsive">
+      <table class="table table-hover align-middle mb-0">
+        <thead>
+          <tr class="bg-light">
+            <th class="ps-3" style="width: 60px;">Rank</th>
+            <th>Staff Member</th>
+            <th>Store</th>
+            <th>Position</th>
+            <th class="text-center">Status</th>
+            <th class="text-center" style="width: 120px;">Avg Rating</th>
+            <th class="text-center" style="width: 140px;">Commendations</th>
+            <th class="text-center" style="width: 120px;">Weighted Score</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for staff in staff_data %}
+          <tr data-name="{{ (staff.first_name ~ ' ' ~ staff.last_name)|lower }}" data-status="{{ staff.status }}" data-store="{{ staff.store_name or '' }}" style="cursor: pointer;" onclick="window.location.href='/admin/stores/{{ staff.store_id }}/feedback'">
+            <td class="ps-3">
+              {% if loop.index == 1 %}
+                <div class="rounded-circle bg-warning text-white d-inline-flex align-items-center justify-content-center shadow-sm" style="width:28px;height:28px;font-size:0.8125rem;"><i class="bi bi-trophy-fill"></i></div>
+              {% elif loop.index == 2 %}
+                <div class="rounded-circle bg-secondary bg-opacity-25 text-dark d-inline-flex align-items-center justify-content-center" style="width:28px;height:28px;font-size:0.8125rem;font-weight:600;">2</div>
+              {% elif loop.index == 3 %}
+                <div class="rounded-circle bg-warning bg-opacity-25 text-dark d-inline-flex align-items-center justify-content-center" style="width:28px;height:28px;font-size:0.8125rem;font-weight:600;">3</div>
+              {% else %}
+                <span class="text-muted ps-2" style="font-size:0.875rem;">{{ loop.index }}</span>
+              {% endif %}
+            </td>
+            <td>
+              <div class="d-flex align-items-center">
+                <div class="rounded-circle bg-primary bg-opacity-10 text-primary d-flex align-items-center justify-content-center me-2" style="width:36px;height:36px;font-size:0.85rem;font-weight:600;">{{ (staff.first_name[0] ~ staff.last_name[0]).upper() }}</div>
+                <div>
+                  <div class="fw-semibold text-dark">{{ staff.first_name }} {{ staff.last_name }}</div>
+                  <small class="text-muted" style="font-size:0.8rem;">{{ staff.email or '—' }}</small>
+                </div>
+              </div>
+            </td>
+            <td class="text-muted">{{ staff.store_name or '—' }}</td>
+            <td class="text-muted">{{ staff.position or staff.role|title }}</td>
+            <td class="text-center">
+              {% if staff.status == 'active' %}
+                <span class="badge bg-primary bg-opacity-10 text-primary">Active</span>
+              {% else %}
+                <span class="badge bg-secondary bg-opacity-10 text-secondary">Inactive</span>
+              {% endif %}
+            </td>
+            <td class="text-center">
+              {% if staff.commendation_count > 0 %}
+                <span class="badge bg-primary bg-opacity-10 text-primary">{{ "%.1f"|format(staff.avg_rating) }} ★</span>
+              {% else %}
+                <span class="text-muted small">—</span>
+              {% endif %}
+            </td>
+            <td class="text-center">
+              {% if staff.commendation_count > 0 %}
+                <span class="badge bg-primary bg-opacity-10 text-primary">{{ staff.commendation_count }}</span>
+              {% else %}
+                <span class="text-muted small">0</span>
+              {% endif %}
+            </td>
+            <td class="text-center">
+              {% if staff.commendation_count > 0 %}
+                {% set score = staff.weighted_score %}
+                {% if score >= 10 %}
+                  <span class="badge bg-primary bg-opacity-10 text-primary">{{ "%.2f"|format(score) }}</span>
+                {% elif score >= 5 %}
+                  <span class="badge bg-primary bg-opacity-10 text-primary">{{ "%.2f"|format(score) }}</span>
+                {% elif score > 0 %}
+                  <span class="badge bg-primary bg-opacity-10 text-primary">{{ "%.2f"|format(score) }}</span>
+                {% else %}
+                  <span class="badge bg-secondary bg-opacity-10 text-secondary">0.00</span>
+                {% endif %}
+              {% else %}
+                <span class="text-muted small">0.00</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          {% if not staff_data %}
+          <tr>
+            <td colspan="8" class="text-center py-5 text-muted">
+              <i class="bi bi-people fs-1 mb-3 d-block"></i>
+              No staff members found
+            </td>
+          </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+function filterStaff() {
+  const searchTerm = document.getElementById('staffSearch').value.toLowerCase();
+  const statusFilter = document.getElementById('statusFilter').value.toLowerCase();
+  const storeFilter = document.getElementById('storeFilter').value.toLowerCase();
+  
+  const rows = document.querySelectorAll('tbody tr');
+  let visibleCount = 0;
+  
+  rows.forEach(row => {
+    const name = row.dataset.name || '';
+    const status = row.dataset.status || '';
+    const store = row.dataset.store || '';
+    
+    const matchesSearch = name.includes(searchTerm);
+    const matchesStatus = !statusFilter || status === statusFilter;
+    const matchesStore = !storeFilter || store.toLowerCase() === storeFilter;
+    
+    if (matchesSearch && matchesStatus && matchesStore) {
+      row.style.display = '';
+      visibleCount++;
+    } else {
+      row.style.display = 'none';
+    }
+  });
+  
+  // Update rank display for visible rows
+  updateRanks();
+}
+
+function resetFilters() {
+  document.getElementById('staffSearch').value = '';
+  document.getElementById('statusFilter').value = '';
+  document.getElementById('storeFilter').value = '';
+  filterStaff();
+}
+
+function updateRanks() {
+  const visibleRows = document.querySelectorAll('tbody tr[style=""]');
+  visibleRows.forEach((row, index) => {
+    const rankCell = row.querySelector('td:first-child');
+    if (index === 0) {
+      rankCell.innerHTML = '<div class="rounded-circle bg-warning text-white d-inline-flex align-items-center justify-content-center shadow-sm" style="width:28px;height:28px;font-size:0.8125rem;"><i class="bi bi-trophy-fill"></i></div>';
+    } else if (index === 1) {
+      rankCell.innerHTML = '<div class="rounded-circle bg-secondary bg-opacity-25 text-dark d-inline-flex align-items-center justify-content-center" style="width:28px;height:28px;font-size:0.8125rem;font-weight:600;">2</div>';
+    } else if (index === 2) {
+      rankCell.innerHTML = '<div class="rounded-circle bg-warning bg-opacity-25 text-dark d-inline-flex align-items-center justify-content-center" style="width:28px;height:28px;font-size:0.8125rem;font-weight:600;">3</div>';
+    } else {
+      rankCell.innerHTML = '<span class="text-muted ps-2" style="font-size:0.875rem;">' + (index + 1) + '</span>';
+    }
+  });
+}
+</script>
+
+{% endblock %}

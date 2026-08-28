@@ -1,0 +1,184 @@
+{% extends "layout.html" %}
+
+{% block title %}Edit User · Feedback Admin{% endblock %}
+
+{% block content %}
+<style>
+  .edit-user-card {
+    max-width: 720px;
+    margin: 0 auto;
+  }
+  .field-hint {
+    font-size: 0.75rem;
+    color: var(--neutral-500);
+  }
+  .role-badge {
+    font-size: 0.7rem;
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-weight: 600;
+  }
+  .role-badge.superadmin { background: linear-gradient(135deg, #854d0e, #a16207); color: white; }
+  .role-badge.admin { background: linear-gradient(135deg, #FF6B35, #B03A14); color: white; }
+  .role-badge.user { background: var(--neutral-200); color: var(--neutral-700); }
+
+  .user-avatar-lg {
+    width: 64px;
+    height: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #FF6B35, #E85A2A);
+    color: white;
+    font-size: 1.6rem;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+
+  .danger-zone {
+    border: 1px dashed var(--bs-danger);
+    border-radius: 10px;
+    background: rgba(220, 38, 38, 0.04);
+  }
+</style>
+
+<div class="d-flex justify-content-between align-items-center mb-4">
+  <div>
+    <h2 class="page-title mb-1">Edit User</h2>
+    <p class="page-subtitle mb-0">Update account details, role, and access</p>
+  </div>
+  <a href="{{ url_for('admin_users') }}" class="btn btn-outline-secondary">
+    <i class="bi bi-arrow-left me-2"></i>Back to Users
+  </a>
+</div>
+
+<div class="edit-user-card">
+  <div class="card border-0 shadow-lg mb-4">
+    <div class="card-body p-4">
+      <div class="d-flex align-items-center gap-3 mb-4 pb-3" style="border-bottom: 1px solid var(--neutral-200);">
+        <div class="user-avatar-lg">{{ user.username[0]|upper }}</div>
+        <div class="flex-grow-1">
+          <h5 class="mb-1 fw-bold">{{ user.username }}</h5>
+          <div class="d-flex align-items-center gap-2 flex-wrap">
+            <span class="text-muted small">{{ user.email }}</span>
+            <span class="role-badge {{ user.role }}">{{ user.role|capitalize }}</span>
+            {% if user.is_active %}
+              <span class="badge rounded-pill bg-success" style="font-size:.7rem; padding: 6px 12px;">Active</span>
+            {% else %}
+              <span class="badge rounded-pill bg-secondary" style="font-size:.7rem; padding: 6px 12px;">Inactive</span>
+            {% endif %}
+          </div>
+          {% if user.created_at %}
+          <small class="text-muted d-block mt-1" style="font-size: 0.75rem;">
+            <i class="bi bi-clock-history me-1"></i>Created {{ user.created_at.strftime('%b %d, %Y') }}
+          </small>
+          {% endif %}
+        </div>
+      </div>
+
+      <form method="POST" action="{{ url_for('admin_edit_user', user_id=user.id) }}" class="vstack gap-3">
+
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label fw-medium" for="username">Username</label>
+            <input class="form-control" id="username" name="username" required value="{{ user.username }}">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label fw-medium" for="email">Email</label>
+            <input class="form-control" type="email" id="email" name="email" required value="{{ user.email }}">
+          </div>
+        </div>
+
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label fw-medium" for="role">Role</label>
+            <select class="form-select" id="role" name="role" onchange="toggleMaxStoresField()"
+                    {% if user.id == session.get('user_id') %}disabled{% endif %}>
+              <option value="admin" {% if user.role == 'admin' %}selected{% endif %}>Admin (Client)</option>
+              <option value="user" {% if user.role == 'user' %}selected{% endif %}>User (View-only)</option>
+              <option value="superadmin" {% if user.role == 'superadmin' %}selected{% endif %}>Superadmin</option>
+            </select>
+            {% if user.id == session.get('user_id') %}
+              <input type="hidden" name="role" value="{{ user.role }}">
+              <small class="field-hint">You cannot change your own role.</small>
+            {% else %}
+              <small class="field-hint">Superadmin: Full system access · Admin: Client account (manages own stores) · User: Per-store view only</small>
+            {% endif %}
+          </div>
+
+          <div class="col-md-6" id="max_stores_field">
+            <label class="form-label fw-medium" for="max_stores">Max Stores (Membership Tier)</label>
+            <input class="form-control" type="number" id="max_stores" name="max_stores"
+                   value="{{ user.max_stores or 0 }}" min="0">
+            <small class="field-hint">Number of stores this client can add (0 = unlimited)</small>
+          </div>
+        </div>
+
+        <div class="form-check form-switch mt-2">
+          <input class="form-check-input" type="checkbox" role="switch" id="is_active" name="is_active"
+                 {% if user.is_active %}checked{% endif %}
+                 {% if user.id == session.get('user_id') %}disabled{% endif %}>
+          <label class="form-check-label fw-medium" for="is_active">
+            Account active
+          </label>
+          {% if user.id == session.get('user_id') %}
+            <input type="hidden" name="is_active" value="on">
+            <div><small class="field-hint">You cannot deactivate your own account.</small></div>
+          {% endif %}
+        </div>
+
+        <hr class="my-2">
+
+        <div>
+          <label class="form-label fw-medium" for="new_password">
+            <i class="bi bi-key me-1"></i>Reset Password
+          </label>
+          <input class="form-control" type="password" id="new_password" name="new_password"
+                 placeholder="Leave blank to keep existing password" autocomplete="new-password">
+          <small class="field-hint">Only fill in if you want to change the user's password.</small>
+        </div>
+
+        <div class="d-flex justify-content-between align-items-center mt-3 pt-3" style="border-top: 1px solid var(--neutral-200);">
+          <a href="{{ url_for('admin_users') }}" class="btn btn-outline-secondary">Cancel</a>
+          <button class="btn btn-primary" type="submit">
+            <i class="bi bi-check-lg me-2"></i>Save Changes
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  {% if session.get('role') == 'superadmin' and user.id != session.get('user_id') %}
+  <div class="card border-0 shadow-sm danger-zone mb-4">
+    <div class="card-body p-4">
+      <div class="d-flex justify-content-between align-items-center flex-wrap gap-3">
+        <div>
+          <h6 class="text-danger mb-1 fw-bold">
+            <i class="bi bi-exclamation-octagon me-1"></i>Danger Zone
+          </h6>
+          <small class="text-muted">Permanently delete this user account. This cannot be undone.</small>
+        </div>
+        <form method="POST" action="{{ url_for('admin_delete_user', user_id=user.id) }}"
+              onsubmit="return confirm('Are you sure you want to delete user {{ user.username }}? This action cannot be undone.');">
+          <button class="btn btn-outline-danger" type="submit">
+            <i class="bi bi-trash me-1"></i>Delete User
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+  function toggleMaxStoresField() {
+    const role = document.getElementById('role').value;
+    const field = document.getElementById('max_stores_field');
+    if (!field) return;
+    // Max stores applies to client accounts (admin role)
+    field.style.display = (role === 'admin') ? 'block' : 'none';
+  }
+  toggleMaxStoresField();
+</script>
+{% endblock %}
