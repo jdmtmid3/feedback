@@ -876,9 +876,13 @@ def create_app() -> Flask:
                 else:
                     logger.critical("Could not initialize database schema after multiple attempts.")
 
-    # Only run schema init if we're not in a testing environment
-    if not os.getenv("TESTING"):
+    # Always initialize schema on startup
+    try:
         init_master_schema()
+        logger.info("Schema initialization completed successfully")
+    except Exception as e:
+        logger.critical(f"CRITICAL: Schema initialization failed: {e}")
+        raise
 
     # --- ERROR HANDLERS ---
     @app.errorhandler(Exception)
