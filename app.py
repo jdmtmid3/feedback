@@ -35,7 +35,7 @@ DEFAULT_PORTAL_URL = os.getenv("LICENSING_PORTAL_URL", "https://feedbacklicensin
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    # --- LOGGING SETUP ---
+    # --- LOGGING SEUP ---
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] %(message)s',
