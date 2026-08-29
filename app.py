@@ -318,6 +318,9 @@ def create_app() -> Flask:
         'logout',
         'login',
         'account_change_password',
+        # Viewers remain read-only for business data, but may participate in
+        # their own private support conversation.
+        'api_send_client_message',
     }
 
     @app.before_request

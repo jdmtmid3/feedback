@@ -40,7 +40,7 @@
           {% endif %}
           <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
           <a href="{{ url_for('client_support') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'client_support' %}active{% endif %}">
-            <i class="bi bi-headset me-2" style="color: white !important;"></i>Support
+            <i class="bi bi-{% if session.get('role') == 'user' %}chat-dots{% else %}headset{% endif %} me-2" style="color: white !important;"></i>{% if session.get('role') == 'user' %}Messages{% else %}Support{% endif %}
           </a>
           {% if session.get('username') %}
           <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
