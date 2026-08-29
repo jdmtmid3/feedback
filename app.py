@@ -1602,6 +1602,81 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+    def get_questionnaire_license_limit(owner: Dict[str, Any]) -> int:
+        """Return the tenant's questionnaire quota; zero means unlimited."""
+        if owner.get('role') != 'admin':
+            return 0
+        license_key = owner.get('license_key')
+        if not license_key:
+            raise ValueError("Configure a valid license key before publishing questionnaires.")
+        config = get_license_config()
+        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
+        try:
+            import requests as http_requests
+            response = http_requests.post(
+                f"{portal_url}/api/validate/{license_key}",
+                headers=licensing_api_headers(), timeout=10,
+            )
+            data = response.json() if response.content else {}
+            if response.status_code != 200 or not data.get('valid'):
+                raise ValueError(data.get('message') or "The license is invalid or inactive.")
+            return max(0, int(data.get('max_questionnaires') or 0))
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.error("Unable to validate questionnaire limit: %s", exc)
+            raise ValueError("Unable to validate the questionnaire license limit. Please try again.")
+
+    def enforce_questionnaire_limit(owner: Dict[str, Any], candidate_store_ids: List[int]) -> None:
+        """Block only new store questionnaires; updates never consume another slot."""
+        max_questionnaires = get_questionnaire_license_limit(owner)
+        if max_questionnaires == 0 or not candidate_store_ids:
+            return
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT COUNT(*) FROM questionnaires
+                   WHERE is_template = FALSE AND owner_user_id = %s AND license_key <=> %s""",
+                (owner['id'], owner.get('license_key')),
+            )
+            current_count = int(cursor.fetchone()[0])
+            placeholders = ",".join(["%s"] * len(candidate_store_ids))
+            cursor.execute(
+                f"""SELECT COUNT(*) FROM stores s
+                    WHERE s.id IN ({placeholders}) AND s.user_id = %s AND s.license_key <=> %s
+                      AND NOT EXISTS (
+                          SELECT 1 FROM questionnaires q
+                          WHERE q.store_id = s.id AND q.is_template = FALSE
+                      )""",
+                tuple(candidate_store_ids) + (owner['id'], owner.get('license_key')),
+            )
+            new_needed = int(cursor.fetchone()[0])
+        finally:
+            conn.close()
+        if current_count + new_needed > max_questionnaires:
+            remaining = max(0, max_questionnaires - current_count)
+            raise ValueError(
+                f"Questionnaire license limit reached. Your plan allows {max_questionnaires}; "
+                f"you can publish to only {remaining} additional store(s)."
+            )
+
+    def questionnaire_quota_status(owner: Dict[str, Any]) -> Dict[str, Any]:
+        max_questionnaires = get_questionnaire_license_limit(owner)
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT COUNT(*) FROM questionnaires
+                   WHERE is_template = FALSE AND owner_user_id = %s AND license_key <=> %s""",
+                (owner['id'], owner.get('license_key')),
+            )
+            used = int(cursor.fetchone()[0])
+        finally:
+            conn.close()
+        return {"used": used, "max": max_questionnaires,
+                "remaining": None if max_questionnaires == 0 else max(0, max_questionnaires - used)}
+
     def update_template_questionnaire(title: str, is_active: bool, updated_at: str | None = None) -> None:
         """Update template questionnaire with validation."""
         # Input validation
@@ -1772,6 +1847,7 @@ def create_app() -> Flask:
 
         stores = [store for store in fetch_stores(user_id=int(owner['id']))
                   if (store.get('license_key') or None) == (owner.get('license_key') or None)]
+        enforce_questionnaire_limit(owner, [int(store['id']) for store in stores])
         with get_db_connection_with_transaction() as conn:
             cursor = conn.cursor(dictionary=True)
             published_count = 0
@@ -1999,12 +2075,21 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+        try:
+            questionnaire_quota = questionnaire_quota_status(user)
+            questionnaire_quota_error = None
+        except ValueError as exc:
+            questionnaire_quota = None
+            questionnaire_quota_error = str(exc)
+
         return render_template(
             "master_questionnaire/master_questionnaire.html",
             master=template,
             questions=questions,
             options_by_question_id=options_by_question_id,
             branding=fetch_tenant_branding(int(user['id'])),
+            questionnaire_quota=questionnaire_quota,
+            questionnaire_quota_error=questionnaire_quota_error,
         )
 
     @app.route("/admin/questionnaire/questions/add", methods=["POST"])
@@ -2211,7 +2296,11 @@ def create_app() -> Flask:
             flash("Add at least 1 question before publishing.", "danger")
             return redirect(url_for("master_questionnaire"))
 
-        count = publish_template_to_all_stores()
+        try:
+            count = publish_template_to_all_stores()
+        except ValueError as exc:
+            flash(str(exc), "danger")
+            return redirect(url_for("master_questionnaire"))
         
         # Log the publish action
         log_audit(
@@ -2236,8 +2325,11 @@ def create_app() -> Flask:
     def sync_to_selected_stores():
         """Sync master questionnaire to selected stores"""
         try:
-            data = request.get_json()
-            store_ids = data.get('store_ids', [])
+            data = request.get_json() or {}
+            try:
+                store_ids = list(dict.fromkeys(int(store_id) for store_id in data.get('store_ids', [])))
+            except (TypeError, ValueError):
+                return {"success": False, "error": "Invalid store selection"}, 400
             
             if not store_ids:
                 return {"success": False, "error": "No stores selected"}, 400
@@ -2246,6 +2338,8 @@ def create_app() -> Flask:
             template_id = int(template["id"])
             template_questions = fetch_template_questions(template_questionnaire_id=template_id)
             template_options_by_question_id = fetch_template_options_by_question([int(q["id"]) for q in template_questions])
+            owner = _tenant_owner()
+            enforce_questionnaire_limit(owner, store_ids)
             
             conn = get_db_connection()
             try:
@@ -2344,6 +2438,9 @@ def create_app() -> Flask:
             finally:
                 conn.close()
                 
+        except ValueError as e:
+            logger.warning(f"Questionnaire sync blocked: {e}")
+            return {"success": False, "error": str(e)}, 409
         except Exception as e:
             logger.error(f"Error syncing to stores: {e}")
             return {"success": False, "error": str(e)}, 500
@@ -4619,66 +4716,20 @@ def create_app() -> Flask:
             return render_template("survey_error.html", store=store, error="Sorry, the system is not accepting any feedbacks right now"), 404
 
         questionnaire = fetch_questionnaire_by_store(store_id=store_id)
-        
-        # If store doesn't have a questionnaire, create one from the master template
         if not questionnaire:
-            template_id = int(master_template["id"])
-            template_questions = fetch_template_questions(template_questionnaire_id=template_id)
-            template_options_by_question_id = fetch_template_options_by_question([int(q["id"]) for q in template_questions])
-            
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor(dictionary=True)
-                
-                # Create new store questionnaire
-                cursor.execute(
-                    """
-                    INSERT INTO questionnaires
-                        (store_id, owner_user_id, license_key, title, is_active, is_template, template_id, logo_url)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (store_id, store['user_id'], master_template.get('license_key'), master_template["title"],
-                     bool(master_template["is_active"]), False, template_id, store.get('logo_url') or master_template.get('logo_url')),
-                )
-                questionnaire_id = int(cursor.lastrowid)
-                
-                # Copy questions from template
-                for template_question in template_questions:
-                    cursor.execute(
-                        """
-                        INSERT INTO questions (questionnaire_id, question_text, question_type, min_label, max_label, allow_comment, is_required, question_order, is_template)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (questionnaire_id, template_question["question_text"], template_question["question_type"],
-                         template_question["min_label"], template_question["max_label"], template_question["allow_comment"],
-                         template_question["is_required"], template_question["question_order"], False),
-                    )
-                    new_question_id = int(cursor.lastrowid)
-                    
-                    # Copy options for this question
-                    template_options = template_options_by_question_id.get(int(template_question["id"]), [])
-                    for option in template_options:
-                        cursor.execute(
-                            """
-                            INSERT INTO question_options (question_id, option_text, is_template)
-                            VALUES (%s, %s, %s)
-                            """,
-                            (new_question_id, option["option_text"], False),
-                        )
-                
-                conn.commit()
-                questionnaire = fetch_questionnaire_by_store(store_id=store_id)
-            finally:
-                conn.close()
-        
-        if not questionnaire or not questionnaire.get("is_active"):
+            return render_template(
+                "survey_error.html", store=store,
+                error="This store does not have a published questionnaire yet."
+            ), 404
+        if not questionnaire.get("is_active"):
             return render_template("survey_error.html", store=store, error="Sorry, the system is not accepting any feedbacks right now"), 404
 
         questions = fetch_questions_for_questionnaire(questionnaire_id=int(questionnaire["id"]))
         question_ids = [int(q["id"]) for q in questions]
         options_by_question_id = fetch_options_for_questions(question_ids=question_ids)
 
-        master_logo = questionnaire.get('logo_url') or store.get('logo_url') or master_template.get('logo_url')
+        # The restaurant/store logo always wins over template branding.
+        master_logo = store.get('logo_url') or questionnaire.get('logo_url') or master_template.get('logo_url')
         branding = fetch_tenant_branding(int(store['user_id']), store.get('license_key'))
 
         # Fetch active staff for this store
