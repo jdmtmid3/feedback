@@ -244,7 +244,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
         <div class="modal-body">
-          <form method="POST" id="editStoreForm">
+          <form method="POST" id="editStoreForm" onsubmit="return confirmStoreEdit();">
             <div class="row g-3">
               <div class="col-md-6">
                 <label for="edit_store_name" class="form-label fw-medium">Store Name *</label>
@@ -454,9 +454,11 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                       <i class="bi bi-three-dots-vertical"></i>
                     </button>
                     <ul class="dropdown-menu dropdown-menu-end shadow" style="min-width:170px;z-index:1080;">
+                      {% if session.get('role') in ('admin', 'superadmin') %}
                       <li><a class="dropdown-item py-2" href="#" onclick="editStore({{ store.id }})">
                         <i class="bi bi-pencil me-2"></i>Edit Store
                       </a></li>
+                      {% endif %}
                       <li><a class="dropdown-item py-2" href="#" onclick="copyDashboardLink({{ store.id }}, '{{ store.access_token }}', '{{ store.subdomain }}')">
                         <i class="bi bi-link-45deg me-2"></i>Copy Dashboard Link
                       </a></li>
@@ -465,9 +467,11 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                         <i class="bi bi-eye me-2"></i>Manage Viewers
                       </a></li>
                       {% endif %}
+                      {% if session.get('role') in ('admin', 'superadmin') %}
                       <li><a class="dropdown-item py-2 text-danger" href="#" onclick="deleteStore({{ store.id }})">
                         <i class="bi bi-trash me-2"></i>Delete Store
                       </a></li>
+                      {% endif %}
                     </ul>
                   </div>
                 </div>
@@ -583,9 +587,11 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                           <i class="bi bi-three-dots-vertical"></i>
                         </button>
                         <ul class="dropdown-menu dropdown-menu-end shadow" style="min-width:170px;z-index:1080;">
+                          {% if session.get('role') in ('admin', 'superadmin') %}
                           <li><a class="dropdown-item py-2" href="#" onclick="editStore({{ store.id }})">
                             <i class="bi bi-pencil me-2"></i>Edit Store
                           </a></li>
+                          {% endif %}
                           <li><a class="dropdown-item py-2" href="#" onclick="copyDashboardLink({{ store.id }}, '{{ store.access_token }}', '{{ store.subdomain }}')">
                             <i class="bi bi-link-45deg me-2"></i>Copy Dashboard Link
                           </a></li>
@@ -594,9 +600,11 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                             <i class="bi bi-eye me-2"></i>Manage Viewers
                           </a></li>
                           {% endif %}
+                          {% if session.get('role') in ('admin', 'superadmin') %}
                           <li><a class="dropdown-item py-2 text-danger" href="#" onclick="deleteStore({{ store.id }})">
                             <i class="bi bi-trash me-2"></i>Delete Store
                           </a></li>
+                          {% endif %}
                         </ul>
                       </div>
                     </div>
@@ -1169,6 +1177,11 @@ function editStore(storeId) {
     // Show the modal
     const modal = new bootstrap.Modal(document.getElementById('editStoreModal'));
     modal.show();
+}
+
+function confirmStoreEdit() {
+    const storeName = document.getElementById('edit_store_name').value.trim() || 'this store';
+    return confirm(`Save all changes to "${storeName}"? Please confirm before updating the store.`);
 }
 
 function deleteStore(storeId) {
