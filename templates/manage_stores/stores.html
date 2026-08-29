@@ -468,6 +468,9 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                       <li><a class="dropdown-item py-2" href="#" onclick="copyDashboardLink({{ store.id }}, '{{ store.access_token }}', '{{ store.subdomain }}')">
                         <i class="bi bi-link-45deg me-2"></i>Copy Dashboard Link
                       </a></li>
+                      <li><a class="dropdown-item py-2" href="#" onclick="copyFeedbackLink({{ store.id }}); return false;">
+                        <i class="bi bi-chat-square-text me-2"></i>Copy Feedback Link
+                      </a></li>
                       {% if session.get('role') in ('admin', 'superadmin') %}
                       <li><a class="dropdown-item py-2" href="#" onclick="openViewersModal({{ store.id }}, '{{ store.store_name|e }}')">
                         <i class="bi bi-eye me-2"></i>Manage Viewers
@@ -600,6 +603,9 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                           {% endif %}
                           <li><a class="dropdown-item py-2" href="#" onclick="copyDashboardLink({{ store.id }}, '{{ store.access_token }}', '{{ store.subdomain }}')">
                             <i class="bi bi-link-45deg me-2"></i>Copy Dashboard Link
+                          </a></li>
+                          <li><a class="dropdown-item py-2" href="#" onclick="copyFeedbackLink({{ store.id }}); return false;">
+                            <i class="bi bi-chat-square-text me-2"></i>Copy Feedback Link
                           </a></li>
                           {% if session.get('role') in ('admin', 'superadmin') %}
                           <li><a class="dropdown-item py-2" href="#" onclick="openViewersModal({{ store.id }}, '{{ store.store_name|e }}')">
@@ -1223,6 +1229,15 @@ function copyDashboardLink(storeId, accessToken, subdomain) {
     } else {
         alert('No access token or subdomain available for this store. Please contact support.');
     }
+}
+
+function copyFeedbackLink(storeId) {
+    const feedbackUrl = window.location.origin + '/s/' + storeId;
+    navigator.clipboard.writeText(feedbackUrl).then(() => {
+        showCustomAlert('Feedback link copied! You can now share it with customers.', 'success');
+    }).catch(() => {
+        window.prompt('Copy this feedback link:', feedbackUrl);
+    });
 }
 
 function loadStoreDetails(storeId) {

@@ -1234,16 +1234,15 @@ def create_app() -> Flask:
         return by_question
 
     def get_store_public_url(store_id: int) -> str:
-        # Get the IP address of the machine to make it accessible on the local network
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-            base_url = f"http://{local_ip}:8000"
-        except Exception:
+        """Return a customer-shareable URL, never an internal container IP."""
+        public_domain = (os.getenv("RAILWAY_PUBLIC_DOMAIN") or "").strip().rstrip('/')
+        static_url = (os.getenv("RAILWAY_STATIC_URL") or "").strip().rstrip('/')
+        if public_domain:
+            base_url = public_domain if public_domain.startswith(("http://", "https://")) else f"https://{public_domain}"
+        elif static_url:
+            base_url = static_url if static_url.startswith(("http://", "https://")) else f"https://{static_url}"
+        else:
             base_url = request.url_root.rstrip('/')
-            
         return f"{base_url}{url_for('public_survey', store_id=store_id)}"
 
     def generate_qr_data_uri(text: str) -> str:
@@ -6017,6 +6016,7 @@ def create_app() -> Flask:
         
         # Calculate average rating
         avg_rating = 0
+        answers_by_response_id = {}
         if all_feedback:
             all_response_ids = [int(r["id"]) for r in all_feedback]
             answers_by_response_id = fetch_answers_for_responses(all_response_ids)
@@ -6077,6 +6077,7 @@ def create_app() -> Flask:
         
         # Fetch commendations
         commendations_by_response_id = {}
+        commendations = []
         if all_feedback:
             conn = get_db_connection()
             cursor = conn.cursor(dictionary=True)
