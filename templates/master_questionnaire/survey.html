@@ -75,17 +75,21 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
                   </label>
                   <input
                     type="text"
+                    inputmode="numeric"
                     id="receipt_number"
                     name="receipt_number"
                     class="form-control bg-white"
-                    placeholder="e.g. RCP-2024-12345"
+                    placeholder="Enter exactly 10 digits"
                     required
-                    pattern="[A-Za-z0-9\-]{5,50}"
-                    title="Receipt number should be 5-50 characters (letters, numbers, and hyphens only)"
+                    pattern="[0-9]{10}"
+                    minlength="10"
+                    maxlength="10"
+                    autocomplete="off"
+                    title="Enter exactly 10 digits"
                   />
                   <div class="form-text">
                     <i class="bi bi-info-circle me-1"></i>
-                    Found on your receipt. Required for feedback submission.
+                    Enter all 10 digits to unlock the questionnaire.
                   </div>
                 </div>
               </div>
@@ -110,6 +114,11 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
               </div>
             </div>
           </div>
+
+          <div id="transactionLockMessage" class="alert alert-warning">
+            <i class="bi bi-lock-fill me-2"></i>Enter a valid 10-digit transaction number before answering.
+          </div>
+          <fieldset id="questionnaireFields" disabled>
 
           <!-- Staff Commendation Section -->
           {% if staff_members and staff_members|length > 0 %}
@@ -313,6 +322,7 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
             {% endif %}
           </div>
           {% endfor %}
+          </fieldset>
 
           <div class="text-center mt-5">
             <button
@@ -337,6 +347,17 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
 </div>
 {% endblock %} {% block scripts %}
 <style>
+  :root {
+    --tenant-primary: {{ branding.primary_color|default('#FF6B35') }};
+    --tenant-secondary: {{ branding.secondary_color|default('#F59E0B') }};
+    --tenant-accent: {{ branding.accent_color|default('#2563EB') }};
+    --tenant-text: {{ branding.text_color|default('#212529') }};
+  }
+  body { color: var(--tenant-text); }
+  .btn-primary, .bg-primary { background-color: var(--tenant-primary) !important; border-color: var(--tenant-primary) !important; }
+  .text-primary { color: var(--tenant-primary) !important; }
+  .form-control:focus, .form-select:focus { border-color: var(--tenant-accent); box-shadow: 0 0 0 .25rem color-mix(in srgb, var(--tenant-accent) 25%, transparent); }
+  #questionnaireFields:disabled { opacity: .48; }
   /* Star rating styling */
   .rating-container {
     display: flex;
@@ -398,6 +419,21 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
         submitBtnText.textContent = 'Submitting...';
       });
     }
+  });
+
+  document.addEventListener("DOMContentLoaded", function () {
+    const receipt = document.getElementById('receipt_number');
+    const fields = document.getElementById('questionnaireFields');
+    const lockMessage = document.getElementById('transactionLockMessage');
+    if (!receipt || !fields) return;
+    const updateLock = () => {
+      receipt.value = receipt.value.replace(/\D/g, '').slice(0, 10);
+      const unlocked = /^\d{10}$/.test(receipt.value);
+      fields.disabled = !unlocked;
+      lockMessage.classList.toggle('d-none', unlocked);
+    };
+    receipt.addEventListener('input', updateLock);
+    updateLock();
   });
 
   // Simple star rating implementation
