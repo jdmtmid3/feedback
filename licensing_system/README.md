@@ -17,6 +17,8 @@ Centralized license management for Tugon feedback system deployments.
    DB_USER=root
    DB_PASSWORD=your-password
    DB_NAME=licensing_db
+   LICENSING_API_KEY=replace-with-a-long-random-shared-key
+   MAIN_APP_URL=https://your-main-app.up.railway.app
    ```
 
 3. Run the application:
@@ -26,16 +28,17 @@ Centralized license management for Tugon feedback system deployments.
 
 The licensing system will run on port 8081 by default.
 
-## Local login
+## Portal login
 
-The management dashboard is protected by a portal login. The local defaults are:
+The management dashboard is protected by a portal login. Configure both
+credentials before starting the service:
 
 ```text
-Username: admin
-Password: change-me-now
+PORTAL_ADMIN_USERNAME=<your-admin-username>
+PORTAL_ADMIN_PASSWORD=<a-long-unique-password>
 ```
 
-Set `PORTAL_ADMIN_USERNAME` and `PORTAL_ADMIN_PASSWORD` before deploying. Never use the local defaults in production.
+The application intentionally has no built-in administrator password.
 
 ## Deployment
 
