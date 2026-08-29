@@ -10,6 +10,7 @@ import traceback
 import socket
 import json
 import re
+import secrets
 import mysql.connector
 from mysql.connector import MySQLConnection, Error
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, session, send_file
@@ -29,7 +30,14 @@ load_dotenv()
 
 
 # Default licensing portal URL when not configured in DB or env
-DEFAULT_PORTAL_URL = os.getenv("LICENSING_PORTAL_URL", "https://feedbacklicensing-production.up.railway.app")
+DEFAULT_PORTAL_URL = os.getenv(
+    "LICENSING_PORTAL_URL",
+    "https://feedbacklicensing-production-c938.up.railway.app",
+).rstrip("/")
+LEGACY_PORTAL_URLS = {
+    "https://feedbacklicensing-production.up.railway.app",
+    "https://feedbacklicensing-production.up.railway.app/",
+}
 
 
 def create_app() -> Flask:
@@ -46,7 +54,12 @@ def create_app() -> Flask:
     logger.info(f"AVAILABLE ENV VARS: {list(os.environ.keys())}")
 
     # --- ENVIRONMENT CONFIG ---
-    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "change-me")
+    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY") or secrets.token_hex(32)
+    app.config.update(
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=os.getenv("RAILWAY_ENVIRONMENT") is not None,
+    )
 
     # Database configuration handling
     # PRIORITY: 1. Railway individual variables (Most reliable)
@@ -105,6 +118,15 @@ def create_app() -> Flask:
             logger.error(f"Failed to connect to database: {e}")
             raise
 
+    def normalize_portal_url(value: Optional[str]) -> str:
+        candidate = (value or "").strip()
+        if not candidate or candidate in LEGACY_PORTAL_URLS:
+            candidate = DEFAULT_PORTAL_URL
+        return candidate.rstrip("/")
+
+    def licensing_api_headers() -> Dict[str, str]:
+        return {"X-Licensing-API-Key": os.getenv("LICENSING_API_KEY", "")}
+
     from contextlib import contextmanager
 
     @contextmanager
@@ -157,7 +179,7 @@ def create_app() -> Flask:
         try:
             cursor = conn.cursor(dictionary=True)
             # Create table if it doesn't exist
-            cursor.execute("CREATE TABLE IF NOT EXISTS license_config (id INT AUTO_INCREMENT PRIMARY KEY, license_key VARCHAR(255) NOT NULL, api_key VARCHAR(255) NOT NULL, licensing_portal_url VARCHAR(255) DEFAULT 'https://feedbacklicensing-production.up.railway.app', main_system_url VARCHAR(255) NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS license_config (id INT AUTO_INCREMENT PRIMARY KEY, license_key VARCHAR(255) NOT NULL, api_key VARCHAR(255) NOT NULL, licensing_portal_url VARCHAR(255) DEFAULT 'https://feedbacklicensing-production-c938.up.railway.app', main_system_url VARCHAR(255) NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)")
             # Check if main_system_url column exists
             cursor.execute("SHOW COLUMNS FROM license_config LIKE 'main_system_url'")
             if not cursor.fetchone():
@@ -178,9 +200,10 @@ def create_app() -> Flask:
             return {"valid": False, "error": "No license configured"}
         
         try:
+            portal_url = normalize_portal_url(config.get("licensing_portal_url"))
             response = requests.post(
-                f"{config['licensing_portal_url']}/api/validate/{config['license_key']}",
-                timeout=10
+                f"{portal_url}/api/validate/{config['license_key']}",
+                headers=licensing_api_headers(), timeout=10
             )
             
             if response.status_code == 200:
@@ -299,6 +322,30 @@ def create_app() -> Flask:
 
     @app.before_request
     def _enforce_view_only_user():
+        # Central guard for legacy routes that predate per-route decorators.
+        # Public survey/store pages remain accessible; all admin and internal
+        # JSON endpoints require an active application session.
+        protected_path = (
+            request.path.startswith("/admin/")
+            or request.path.startswith("/api/")
+            or request.path == "/dashboard/staff-overall"
+        )
+        api_exempt = request.path == "/api/licensing/users"  # shared-key auth
+        if protected_path and not api_exempt and 'user_id' not in session:
+            if request.path.startswith("/api/") or request.is_json:
+                return jsonify({"success": False, "error": "Authentication required"}), 401
+            flash("Please log in to access this page.", "warning")
+            return redirect(url_for('login', next=request.full_path))
+        if protected_path and not api_exempt and 'user_id' in session:
+            current_user = get_user_by_id(session['user_id'])
+            if not current_user or not current_user.get('is_active'):
+                session.clear()
+                if request.path.startswith("/api/") or request.is_json:
+                    return jsonify({"success": False, "error": "Session is no longer active"}), 401
+                flash("Your session is no longer active. Please log in again.", "warning")
+                return redirect(url_for('login'))
+            session['role'] = current_user['role']
+
         if request.method in ('GET', 'HEAD', 'OPTIONS'):
             return None
         if session.get('role') != 'user':
@@ -619,23 +666,27 @@ def create_app() -> Flask:
                                 id INT AUTO_INCREMENT PRIMARY KEY,
                                 license_key VARCHAR(255) NOT NULL,
                                 api_key VARCHAR(255) NOT NULL,
-                                licensing_portal_url VARCHAR(255) DEFAULT 'https://feedbacklicensing-production.up.railway.app',
+                                licensing_portal_url VARCHAR(255) DEFAULT 'https://feedbacklicensing-production-c938.up.railway.app',
                                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                             )
                         """)
                         conn.commit()
                     
-                    # Create default superadmin user (was 'dev')
-                    import bcrypt
-                    default_password = "dev123"
-                    password_hash = bcrypt.hashpw(default_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-                    cursor.execute(
-                        "INSERT INTO users (username, email, password_hash, role) VALUES (%s, %s, %s, %s)",
-                        ("dev", "dev@tugon.com", password_hash, "superadmin")
-                    )
-                    conn.commit()
-                    logger.info("Created default superadmin user (username: dev, password: dev123)")
+                    # Optional one-time bootstrap. Never ship a default password.
+                    bootstrap_username = os.getenv("BOOTSTRAP_ADMIN_USERNAME")
+                    bootstrap_email = os.getenv("BOOTSTRAP_ADMIN_EMAIL")
+                    bootstrap_password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD")
+                    if bootstrap_username and bootstrap_email and bootstrap_password:
+                        password_hash = bcrypt.hashpw(bootstrap_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+                        cursor.execute(
+                            "INSERT INTO users (username, email, password_hash, role) VALUES (%s, %s, %s, %s)",
+                            (bootstrap_username, bootstrap_email, password_hash, "superadmin")
+                        )
+                        conn.commit()
+                        logger.info("Created bootstrap superadmin user from environment")
+                    else:
+                        logger.warning("Users table created without a bootstrap admin; configure BOOTSTRAP_ADMIN_* variables if this is a new installation")
                 
                 # ----------------------------------------------------------------
                 # Role hierarchy migration (legacy -> new):
@@ -2447,7 +2498,9 @@ def create_app() -> Flask:
             cursor = conn.cursor(dictionary=True)
             cursor.execute("SELECT * FROM users ORDER BY created_at DESC")
             users = cursor.fetchall()
-            return render_template("admin/users.html", users=users)
+            config = get_license_config()
+            portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
+            return render_template("admin/users.html", users=users, licensing_portal_url=portal_url)
         finally:
             conn.close()
 
@@ -2537,6 +2590,52 @@ def create_app() -> Flask:
             logger.error(f"Error toggling user: {e}")
             flash("Failed to update user status.", "danger")
         
+        return redirect(url_for("admin_users"))
+
+    @app.route("/admin/users/<int:user_id>/generate-license", methods=["POST"])
+    @role_required('superadmin')
+    def admin_generate_user_license(user_id: int):
+        """Generate and attach a client license without a second portal login."""
+        user = get_user_by_id(user_id)
+        if not user or user.get("role") != "admin":
+            flash("A license can only be generated for an Admin (Client) account.", "danger")
+            return redirect(url_for("admin_users"))
+
+        config = get_license_config()
+        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
+        try:
+            import requests as http_requests
+            response = http_requests.post(
+                f"{portal_url}/api/licenses/generate",
+                headers=licensing_api_headers(),
+                json={
+                    "external_user_id": user_id,
+                    "company_name": user.get("username") or user.get("email"),
+                    "contact_email": user.get("email"),
+                    "max_stores": int(user.get("max_stores") or 0),
+                    "max_questionnaires": 0,
+                },
+                timeout=15,
+            )
+            payload = response.json() if response.content else {}
+            if response.status_code not in (200, 201) or not payload.get("license_key"):
+                logger.error("Portal license generation failed: %s %s", response.status_code, response.text)
+                flash(payload.get("error") or "Unable to generate license from the licensing portal.", "danger")
+                return redirect(url_for("admin_users"))
+
+            conn = get_db_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE users SET license_key = %s WHERE id = %s", (payload["license_key"], user_id))
+                conn.commit()
+            finally:
+                conn.close()
+
+            flash(f"License generated and connected to {user['username']}.", "success")
+            log_audit("user", user_id, "license_generated", new_values=f"Portal: {portal_url}")
+        except Exception as exc:
+            logger.error("Error generating client license: %s", exc)
+            flash("Unable to connect to the licensing portal. Check the portal URL and shared API key.", "danger")
         return redirect(url_for("admin_users"))
 
     @app.route("/account/password", methods=["GET", "POST"])
@@ -3010,7 +3109,10 @@ def create_app() -> Flask:
         """API endpoint for licensing portal to fetch users"""
         # Simple API key check for security
         api_key = request.headers.get("X-Licensing-API-Key")
-        if not api_key or api_key != os.getenv("LICENSING_API_KEY", "change-me"):
+        expected_api_key = os.getenv("LICENSING_API_KEY")
+        if not expected_api_key:
+            return jsonify({"error": "Licensing API is not configured"}), 503
+        if not api_key or not secrets.compare_digest(api_key, expected_api_key):
             return jsonify({"error": "Unauthorized"}), 401
         
         conn = get_db_connection()
@@ -3039,7 +3141,7 @@ def create_app() -> Flask:
         try:
             cursor = conn.cursor(dictionary=True)
             # Create table if it doesn't exist
-            cursor.execute("CREATE TABLE IF NOT EXISTS license_config (id INT AUTO_INCREMENT PRIMARY KEY, license_key VARCHAR(255) NOT NULL, api_key VARCHAR(255) NOT NULL, licensing_portal_url VARCHAR(255) DEFAULT 'https://feedbacklicensing-production.up.railway.app', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS license_config (id INT AUTO_INCREMENT PRIMARY KEY, license_key VARCHAR(255) NOT NULL, api_key VARCHAR(255) NOT NULL, licensing_portal_url VARCHAR(255) DEFAULT 'https://feedbacklicensing-production-c938.up.railway.app', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)")
             cursor.execute("SELECT * FROM license_config ORDER BY id DESC LIMIT 1")
             config = cursor.fetchone()
             
@@ -3049,11 +3151,12 @@ def create_app() -> Flask:
             if config:
                 try:
                     import requests
-                    portal_url = (config.get("licensing_portal_url") if config else None) or DEFAULT_PORTAL_URL
+                    portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
                     
                     logger.info(f"Fetching license status from portal: {portal_url}/api/validate/{config['license_key']}")
                     response = requests.post(
                         f"{portal_url}/api/validate/{config['license_key']}",
+                        headers=licensing_api_headers(),
                         timeout=10
                     )
                     
@@ -3080,7 +3183,7 @@ def create_app() -> Flask:
         """Save license configuration"""
         license_key = request.form.get("license_key", "").strip()
         api_key = request.form.get("api_key", "").strip()
-        licensing_portal_url = request.form.get("licensing_portal_url", DEFAULT_PORTAL_URL).strip()
+        licensing_portal_url = normalize_portal_url(request.form.get("licensing_portal_url"))
         
         if not license_key or not api_key:
             flash("License key and API key are required.", "danger")
@@ -3142,13 +3245,14 @@ def create_app() -> Flask:
         try:
             # Validate license against the licensing portal
             config = get_license_config()
-            portal_url = (config.get("licensing_portal_url") if config else None) or DEFAULT_PORTAL_URL
+            portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
             
             # Call the licensing portal API to validate the license
             import requests
             try:
                 response = requests.post(
                     f"{portal_url}/api/validate/{license_key}",
+                    headers=licensing_api_headers(),
                     timeout=10
                 )
                 
@@ -3207,7 +3311,7 @@ def create_app() -> Flask:
         """AJAX endpoint — fetch license status + tickets from portal"""
         user = get_user_by_id(session['user_id'])
         config = get_license_config()
-        portal_url = (config.get("licensing_portal_url") if config else None) or DEFAULT_PORTAL_URL
+        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
         license_key = user.get('license_key') or (config.get('license_key') if config else None)
 
         result = {"license_status": None, "license_error": None, "tickets": []}
@@ -3218,7 +3322,7 @@ def create_app() -> Flask:
         import requests as http_requests
         # Fetch license status (short timeout)
         try:
-            resp = http_requests.post(f"{portal_url}/api/validate/{license_key}", timeout=5)
+            resp = http_requests.post(f"{portal_url}/api/validate/{license_key}", headers=licensing_api_headers(), timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
                 result["license_status"] = data
@@ -3232,7 +3336,7 @@ def create_app() -> Flask:
 
         # Fetch tickets (short timeout, best-effort)
         try:
-            resp = http_requests.get(f"{portal_url}/api/tickets/{license_key}", timeout=5)
+            resp = http_requests.get(f"{portal_url}/api/tickets/{license_key}", headers=licensing_api_headers(), timeout=5)
             if resp.status_code == 200:
                 result["tickets"] = resp.json().get('tickets', [])
         except Exception:
@@ -3246,7 +3350,7 @@ def create_app() -> Flask:
         """Submit a support ticket to the licensing portal"""
         user = get_user_by_id(session['user_id'])
         config = get_license_config()
-        portal_url = (config.get("licensing_portal_url") if config else None) or DEFAULT_PORTAL_URL
+        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
 
         license_key = request.form.get("license_key", "").strip()
         subject = request.form.get("subject", "").strip()
@@ -3266,7 +3370,7 @@ def create_app() -> Flask:
                 "subject": subject,
                 "message": message,
                 "ticket_type": ticket_type
-            }, timeout=10)
+            }, headers=licensing_api_headers(), timeout=10)
             if resp.status_code in (200, 201):
                 flash("Ticket submitted successfully. We'll get back to you soon.", "success")
             else:
@@ -3283,7 +3387,7 @@ def create_app() -> Flask:
         """Submit a renewal request to the licensing portal"""
         user = get_user_by_id(session['user_id'])
         config = get_license_config()
-        portal_url = (config.get("licensing_portal_url") if config else None) or DEFAULT_PORTAL_URL
+        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
 
         license_key = request.form.get("license_key", "").strip()
         contact_email = request.form.get("contact_email", "").strip() or user.get('email', '')
@@ -3300,7 +3404,7 @@ def create_app() -> Flask:
                 "subject": f"License Renewal Request - {user.get('username', 'Client')}",
                 "message": f"Requesting license renewal for account: {user.get('username', 'N/A')}.",
                 "ticket_type": "renewal"
-            }, timeout=10)
+            }, headers=licensing_api_headers(), timeout=10)
             if resp.status_code in (200, 201):
                 flash("Renewal request submitted. Our team will process it shortly.", "success")
             else:
@@ -3314,7 +3418,7 @@ def create_app() -> Flask:
     # ── Client Messaging System (proxies to licensing portal) ────────
     def _get_portal_url():
         config = get_license_config()
-        return (config.get("licensing_portal_url") if config else None) or DEFAULT_PORTAL_URL
+        return normalize_portal_url(config.get("licensing_portal_url") if config else None)
 
     def _ensure_portal_conversation(license_key, contact_email, company_name=""):
         """Ensure conversation exists on portal and return its ID"""
@@ -3330,7 +3434,7 @@ def create_app() -> Flask:
                 "license_key": license_key or "",
                 "contact_email": effective_email,
                 "company_name": company_name or effective_email
-            }, timeout=10)
+            }, headers=licensing_api_headers(), timeout=10)
             if resp.status_code in (200, 201):
                 conv_id = resp.json().get('conversation', {}).get('id')
                 logger.info(f"Portal conversation ID: {conv_id}")
@@ -3361,7 +3465,7 @@ def create_app() -> Flask:
         portal_url = _get_portal_url()
         try:
             import requests as http_requests
-            resp = http_requests.get(f"{portal_url}/api/conversations/{conv_id}/messages", timeout=10)
+            resp = http_requests.get(f"{portal_url}/api/conversations/{conv_id}/messages", headers=licensing_api_headers(), timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 return jsonify({"messages": data.get('messages', []), "conversation_id": conv_id})
@@ -3396,7 +3500,7 @@ def create_app() -> Flask:
                 "message": message,
                 "sender_type": "client",
                 "sender_name": contact_email or user.get('username', 'Client')
-            }, timeout=10)
+            }, headers=licensing_api_headers(), timeout=10)
             if resp.status_code in (200, 201):
                 return jsonify({"success": True})
             logger.error(f"Failed to send message to portal: {resp.status_code} - {resp.text}")
@@ -3413,11 +3517,11 @@ def create_app() -> Flask:
         """Admin messages page - view all client conversations from licensing portal"""
         # Fetch conversations from licensing portal
         config = get_license_config()
-        portal_url = (config.get("licensing_portal_url") if config else None) or DEFAULT_PORTAL_URL
+        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
         conversations = []
         try:
             import requests as http_requests
-            resp = http_requests.get(f"{portal_url}/api/conversations", timeout=5)
+            resp = http_requests.get(f"{portal_url}/api/conversations", headers=licensing_api_headers(), timeout=5)
             if resp.status_code == 200:
                 conversations = resp.json().get('conversations', [])
         except Exception as e:
@@ -3430,11 +3534,11 @@ def create_app() -> Flask:
     def api_admin_get_conversations():
         """API endpoint to get all conversations from licensing portal"""
         config = get_license_config()
-        portal_url = (config.get("licensing_portal_url") if config else None) or DEFAULT_PORTAL_URL
+        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
         try:
             import requests as http_requests
             logger.info(f"Fetching conversations from portal at {portal_url}")
-            resp = http_requests.get(f"{portal_url}/api/conversations", timeout=5)
+            resp = http_requests.get(f"{portal_url}/api/conversations", headers=licensing_api_headers(), timeout=5)
             if resp.status_code == 200:
                 logger.info(f"Successfully fetched {len(resp.json().get('conversations', []))} conversations from portal")
                 return jsonify(resp.json())
@@ -3450,10 +3554,10 @@ def create_app() -> Flask:
     def api_admin_get_conversation_messages(conversation_id):
         """API endpoint to get messages for a conversation from licensing portal"""
         config = get_license_config()
-        portal_url = (config.get("licensing_portal_url") if config else None) or DEFAULT_PORTAL_URL
+        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
         try:
             import requests as http_requests
-            resp = http_requests.get(f"{portal_url}/api/conversations/{conversation_id}/messages", timeout=5)
+            resp = http_requests.get(f"{portal_url}/api/conversations/{conversation_id}/messages", headers=licensing_api_headers(), timeout=5)
             if resp.status_code == 200:
                 return jsonify(resp.json())
             return jsonify({"messages": []})
@@ -3472,14 +3576,14 @@ def create_app() -> Flask:
             return jsonify({"error": "Message is required"}), 400
 
         config = get_license_config()
-        portal_url = (config.get("licensing_portal_url") if config else None) or DEFAULT_PORTAL_URL
+        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
         try:
             import requests as http_requests
             resp = http_requests.post(f"{portal_url}/api/conversations/{conversation_id}/send", json={
                 "message": message,
                 "sender_type": "admin",
                 "sender_name": "Support Team"
-            }, timeout=5)
+            }, headers=licensing_api_headers(), timeout=5)
             if resp.status_code in (200, 201):
                 return jsonify({"success": True})
             return jsonify({"error": "Failed to send message"}), 500
@@ -4518,6 +4622,7 @@ def create_app() -> Flask:
         return render_template("master_questionnaire/thank_you.html", store=store)
 
     @app.route("/admin/stores/add", methods=["POST"])
+    @login_required
     def add_store():
         store_name = request.form.get("store_name", "").strip()
         address = request.form.get("address", "").strip()
@@ -4552,12 +4657,13 @@ def create_app() -> Flask:
             
             # Validate license against portal and get max_stores
             config = get_license_config()
-            portal_url = (config.get("licensing_portal_url") if config else None) or DEFAULT_PORTAL_URL
+            portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
             
             try:
                 import requests
                 response = requests.post(
                     f"{portal_url}/api/validate/{user['license_key']}",
+                    headers=licensing_api_headers(),
                     timeout=10
                 )
                 
@@ -4590,18 +4696,9 @@ def create_app() -> Flask:
                 logger.error(f"Error validating license: {e}")
                 flash("Unable to validate license. Please try again later.", "danger")
                 return redirect(url_for("stores_management"))
-        else:
-            # Admin/Dev/Superadmin - check global license
-            config = get_license_config()
-            if not config or not config.get("license_key"):
-                flash("No license configured. Please configure a license to create stores.", "danger")
-                return redirect(url_for("admin_license_config"))
-            
-            if not check_store_limit():
-                license_status = validate_license_from_portal()
-                max_stores = license_status.get("max_stores", 0)
-                flash(f"License limit reached. You can only create up to {max_stores} stores.", "danger")
-                return redirect(url_for("stores_management"))
+        elif user['role'] != 'superadmin':
+            flash("You don't have permission to add stores.", "danger")
+            return redirect(url_for("stores_management"))
 
         # Handle logo upload
         logo_url = None

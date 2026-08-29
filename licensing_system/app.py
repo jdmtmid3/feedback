@@ -20,11 +20,16 @@ def create_app() -> Flask:
     app = Flask(__name__, template_folder='templates', static_folder='static')
 
     # Configuration
-    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "licensing-secret-key-change-me")
+    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY") or secrets.token_hex(32)
+    app.config.update(
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=os.getenv("RAILWAY_ENVIRONMENT") is not None,
+    )
 
     # Licensing management credentials come from the hosting environment.
-    portal_admin_username = os.getenv("PORTAL_ADMIN_USERNAME", "admin")
-    portal_admin_password = os.getenv("PORTAL_ADMIN_PASSWORD", "change-me-now")
+    portal_admin_username = os.getenv("PORTAL_ADMIN_USERNAME")
+    portal_admin_password = os.getenv("PORTAL_ADMIN_PASSWORD")
 
     # Login required decorator
     def login_required(f):
@@ -32,6 +37,22 @@ def create_app() -> Flask:
         def decorated_function(*args, **kwargs):
             if not session.get("portal_admin_authenticated"):
                 return redirect(url_for("login", next=request.path))
+            return f(*args, **kwargs)
+        return decorated_function
+
+    def api_key_required(f):
+        """Protect server-to-server APIs with the shared licensing key."""
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            # The portal's own authenticated admin UI also consumes these APIs.
+            if session.get("portal_admin_authenticated"):
+                return f(*args, **kwargs)
+            expected = os.getenv("LICENSING_API_KEY")
+            if not expected:
+                return jsonify({"error": "Licensing API is not configured"}), 503
+            supplied = request.headers.get("X-Licensing-API-Key", "")
+            if not supplied or not secrets.compare_digest(supplied, expected):
+                return jsonify({"error": "Unauthorized"}), 401
             return f(*args, **kwargs)
         return decorated_function
     
@@ -217,7 +238,10 @@ def create_app() -> Flask:
         """Fetch users from the main application API"""
         import requests
         main_app_url = os.getenv("MAIN_APP_URL", "http://localhost:8000")
-        api_key = os.getenv("LICENSING_API_KEY", "change-me")
+        api_key = os.getenv("LICENSING_API_KEY")
+        if not api_key:
+            logger.error("LICENSING_API_KEY is not configured")
+            return []
         
         try:
             response = requests.get(
@@ -360,12 +384,16 @@ def create_app() -> Flask:
     @app.route("/login", methods=["GET", "POST"])
     def login():
         if request.method == "POST":
+            if not portal_admin_username or not portal_admin_password:
+                flash("Portal administrator credentials are not configured", "danger")
+                return render_template("licensing/login.html"), 503
             username = request.form.get("username", "").strip()
             password = request.form.get("password", "")
             if secrets.compare_digest(username, portal_admin_username) and secrets.compare_digest(password, portal_admin_password):
                 session["portal_admin_authenticated"] = True
                 next_url = request.args.get("next") or url_for("index")
-                return redirect(next_url if next_url.startswith("/") else url_for("index"))
+                safe_next = next_url.startswith("/") and not next_url.startswith("//")
+                return redirect(next_url if safe_next else url_for("index"))
             flash("Invalid username or password", "danger")
         return render_template("licensing/login.html")
 
@@ -452,6 +480,36 @@ def create_app() -> Flask:
             flash("Failed to generate license", "danger")
         
         return redirect(url_for("index"))
+
+    @app.route("/api/licenses/generate", methods=["POST"])
+    @api_key_required
+    def api_generate_license():
+        """Generate a license directly from the main superadmin application."""
+        data = request.get_json(silent=True) or {}
+        company_name = (data.get("company_name") or "").strip()
+        contact_email = (data.get("contact_email") or "").strip() or None
+        try:
+            max_stores = int(data.get("max_stores") or 0)
+            max_questionnaires = int(data.get("max_questionnaires") or 0)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Store and questionnaire limits must be numbers"}), 400
+
+        if not company_name:
+            return jsonify({"error": "company_name is required"}), 400
+
+        features = {
+            "analytics": True,
+            "reports": True,
+            "email_notifications": True,
+            "custom_branding": True,
+        }
+        result = save_license(
+            company_name, contact_email, max_stores, max_questionnaires,
+            features, None,
+        )
+        if not result:
+            return jsonify({"error": "Failed to generate license"}), 500
+        return jsonify(result), 201
     
     @app.route("/license/<int:license_id>/toggle", methods=["POST"])
     @login_required
@@ -546,6 +604,7 @@ def create_app() -> Flask:
 
     # ── API routes ────────────────────────────────────────────────
     @app.route("/api/validate", methods=["POST"])
+    @api_key_required
     def api_validate_json():
         """Validate a license from a JSON request."""
         data = request.get_json(silent=True) or {}
@@ -555,12 +614,14 @@ def create_app() -> Flask:
         return jsonify(validate_license_key(license_key))
 
     @app.route("/api/validate/<license_key>", methods=["GET", "POST"])
+    @api_key_required
     def api_validate(license_key):
         """API endpoint for validating licenses"""
         result = validate_license_key(license_key)
         return jsonify(result)
 
     @app.route("/api/tickets/create", methods=["POST"])
+    @api_key_required
     def api_create_ticket():
         """API endpoint for creating tickets from the main app"""
         data = request.get_json() or {}
@@ -612,6 +673,7 @@ def create_app() -> Flask:
         return jsonify({"error": "Failed to create ticket"}), 500
 
     @app.route("/api/tickets/<license_key>", methods=["GET"])
+    @api_key_required
     def api_get_tickets(license_key):
         """API endpoint for fetching tickets by license key"""
         tickets = get_tickets_by_license(license_key)
@@ -671,6 +733,7 @@ def create_app() -> Flask:
             conn.close()
 
     @app.route("/api/conversations")
+    @api_key_required
     def api_get_conversations():
         """API endpoint to get all conversations"""
         conn = get_db_connection()
@@ -690,6 +753,7 @@ def create_app() -> Flask:
             conn.close()
 
     @app.route("/api/conversations/<int:conversation_id>/messages")
+    @api_key_required
     def api_get_conversation_messages(conversation_id):
         """API endpoint to get messages for a conversation"""
         conn = get_db_connection()
@@ -723,6 +787,7 @@ def create_app() -> Flask:
             conn.close()
 
     @app.route("/api/conversations/<int:conversation_id>/send", methods=["POST"])
+    @api_key_required
     def api_send_message(conversation_id):
         """API endpoint to send a message to a conversation"""
         data = request.get_json() or {}
@@ -791,6 +856,7 @@ def create_app() -> Flask:
             conn.close()
 
     @app.route("/api/conversations/by-identifier/<client_identifier>", methods=["GET"])
+    @api_key_required
     def api_get_conversation_by_identifier(client_identifier):
         """API endpoint to get conversation by client identifier (license_key or email)"""
         conn = get_db_connection()
@@ -812,6 +878,7 @@ def create_app() -> Flask:
             conn.close()
 
     @app.route("/api/conversations/create", methods=["POST"])
+    @api_key_required
     def api_create_conversation():
         """API endpoint to create a conversation from external system"""
         data = request.get_json() or {}

@@ -85,11 +85,14 @@
     <h2 class="page-title mb-1">User Management</h2>
     <p class="page-subtitle mb-0">Manage system users and their roles</p>
   </div>
-  <form method="POST" action="{{ url_for('admin_reset_database') }}" onsubmit="return confirm('⚠️ DANGER: This will delete ALL data (stores, feedback, questionnaires, etc.) except users. This cannot be undone. Are you sure?');">
-    <button class="btn btn-danger">
-      <i class="bi bi-trash3 me-2"></i>Reset Database
-    </button>
-  </form>
+  <div class="d-flex gap-2">
+    <a class="btn btn-primary" href="{{ licensing_portal_url }}/login?next=/" target="_blank" rel="noopener noreferrer">
+      <i class="bi bi-key-fill me-2"></i>Open Licensing Portal
+    </a>
+    <form method="POST" action="{{ url_for('admin_reset_database') }}" onsubmit="return confirm('⚠️ DANGER: This will delete ALL data (stores, feedback, questionnaires, etc.) except users. This cannot be undone. Are you sure?');">
+      <button class="btn btn-danger"><i class="bi bi-trash3 me-2"></i>Reset Database</button>
+    </form>
+  </div>
 </div>
 
 <div class="row g-4">
@@ -195,6 +198,13 @@
               </td>
               <td>
                 <div class="d-flex gap-2">
+                  {% if user.role == 'admin' %}
+                  <form method="POST" action="{{ url_for('admin_generate_user_license', user_id=user.id) }}" onsubmit="return confirm('Generate and connect a new license for this client?');">
+                    <button class="btn btn-sm btn-outline-success action-btn" type="submit" title="Generate license">
+                      <i class="bi bi-key-fill"></i>
+                    </button>
+                  </form>
+                  {% endif %}
                   <a href="{{ url_for('admin_edit_user', user_id=user.id) }}"
                      class="btn btn-sm btn-outline-primary action-btn"
                      title="Edit user">

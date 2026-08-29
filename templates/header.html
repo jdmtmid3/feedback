@@ -33,6 +33,10 @@
           <a href="{{ url_for('admin_users') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'admin_users' %}active{% endif %}">
             <i class="bi bi-people me-2" style="color: white !important;"></i>Users
           </a>
+          <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
+          <a href="{{ url_for('admin_messages') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'admin_messages' %}active{% endif %}">
+            <i class="bi bi-chat-dots me-2" style="color: white !important;"></i>Messages
+          </a>
           {% endif %}
           <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
           <a href="{{ url_for('client_support') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'client_support' %}active{% endif %}">
