@@ -64,6 +64,10 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
           </p>
         </div>
         <div class="d-flex gap-2">
+          <button type="button" class="btn btn-primary" onclick="copyFeedbackLink()">
+            <i class="bi bi-link-45deg me-2"></i>
+            Copy Feedback Link
+          </button>
           <button type="button" class="btn btn-outline-info" data-bs-toggle="modal" data-bs-target="#qrCodeModal">
             <i class="bi bi-qr-code me-2"></i>
             QR Code
@@ -360,7 +364,6 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
                     {% else %}
                       <p class="text-muted text-center py-2">No staff commendations yet</p>
                     {% endif %}
-                    {% endif %}
                   </div>
                 </div>
               </div>
@@ -614,6 +617,17 @@ document.addEventListener('DOMContentLoaded', function() {
             button.classList.remove('btn-success');
             button.classList.add('btn-outline-primary');
         }, 2000);
+    };
+
+    window.copyFeedbackLink = async function() {
+        const feedbackUrl = {{ public_url|tojson }};
+        try {
+            await navigator.clipboard.writeText(feedbackUrl);
+            if (window.showNotification) window.showNotification('Feedback link copied!', 'success');
+            else alert('Feedback link copied: ' + feedbackUrl);
+        } catch (error) {
+            window.prompt('Copy this feedback link:', feedbackUrl);
+        }
     };
     
     window.downloadQRCode = function() {
