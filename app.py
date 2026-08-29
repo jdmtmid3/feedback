@@ -789,12 +789,33 @@ def create_app() -> Flask:
                     except Exception as e:
                         logger.info(f"Column may already be LONGTEXT: {e}")
 
-                # Ensure Master Template exists
-                cursor.execute("SELECT id FROM questionnaires WHERE is_template = 1 LIMIT 1")
+                cursor.execute("SHOW COLUMNS FROM questionnaires LIKE 'owner_user_id'")
                 if not cursor.fetchone():
-                    logger.info("No master template found. Creating default master template...")
-                    cursor.execute("INSERT INTO questionnaires (title, is_active, is_template) VALUES ('Master Questionnaire', 1, 1)")
+                    logger.info("Adding tenant owner to questionnaires...")
+                    cursor.execute("ALTER TABLE questionnaires ADD COLUMN owner_user_id INT NULL AFTER store_id")
                     conn.commit()
+
+                cursor.execute("SHOW COLUMNS FROM questionnaires LIKE 'license_key'")
+                if not cursor.fetchone():
+                    logger.info("Adding license scope to questionnaires...")
+                    cursor.execute("ALTER TABLE questionnaires ADD COLUMN license_key VARCHAR(255) NULL AFTER owner_user_id")
+                    conn.commit()
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS tenant_branding (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        owner_user_id INT NOT NULL,
+                        scope_key VARCHAR(255) NOT NULL UNIQUE,
+                        license_key VARCHAR(255) NULL,
+                        primary_color VARCHAR(7) NOT NULL DEFAULT '#FF6B35',
+                        secondary_color VARCHAR(7) NOT NULL DEFAULT '#F59E0B',
+                        accent_color VARCHAR(7) NOT NULL DEFAULT '#2563EB',
+                        text_color VARCHAR(7) NOT NULL DEFAULT '#212529',
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
+                    )
+                """)
+                conn.commit()
 
                 # Check for questions table columns
                 cursor.execute("SHOW COLUMNS FROM questions LIKE 'is_active'")
@@ -841,7 +862,8 @@ def create_app() -> Flask:
                     ("logo_url", "VARCHAR(500)"),
                     ("access_token", "VARCHAR(100) UNIQUE"),
                     ("subdomain", "VARCHAR(100) UNIQUE"),
-                    ("user_id", "INT")
+                    ("user_id", "INT"),
+                    ("license_key", "VARCHAR(255)")
                 ]
                 
                 for column_name, column_type in store_columns:
@@ -851,6 +873,12 @@ def create_app() -> Flask:
                         cursor.execute(f"ALTER TABLE stores ADD COLUMN {column_name} {column_type}")
                         conn.commit()
                         logger.info(f"Column {column_name} added successfully")
+
+                try:
+                    cursor.execute("ALTER TABLE stores MODIFY COLUMN logo_url LONGTEXT")
+                    conn.commit()
+                except Exception as e:
+                    logger.info(f"Store logo column may already be LONGTEXT: {e}")
 
                 # Assign user_id to existing stores that don't have it
                 cursor.execute("SELECT id FROM stores WHERE user_id IS NULL")
@@ -869,6 +897,12 @@ def create_app() -> Flask:
                         logger.info(f"Assigned {len(stores_without_user)} stores to user {admin_id}")
                     else:
                         logger.warning("No admin user found to assign existing stores to")
+
+                cursor.execute("""UPDATE stores s
+                                  INNER JOIN users u ON u.id = s.user_id
+                                  SET s.license_key = u.license_key
+                                  WHERE s.license_key IS NULL AND u.license_key IS NOT NULL""")
+                conn.commit()
 
                 # Generate access tokens for existing stores that don't have them
                 import secrets
@@ -1013,7 +1047,7 @@ def create_app() -> Flask:
                     f"""
                     SELECT id, store_name, address, city, province, postal_code,
                            contact_number, email, store_manager_name, manager_contact,
-                           store_type, status, created_at, access_token, subdomain, user_id
+                           store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key
                     FROM stores
                     WHERE id IN ({placeholders})
                     ORDER BY id ASC
@@ -1027,7 +1061,7 @@ def create_app() -> Flask:
                     """
                     SELECT id, store_name, address, city, province, postal_code,
                            contact_number, email, store_manager_name, manager_contact,
-                           store_type, status, created_at, access_token, subdomain, user_id
+                           store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key
                     FROM stores
                     WHERE user_id = %s
                     ORDER BY id ASC
@@ -1041,7 +1075,7 @@ def create_app() -> Flask:
                     """
                     SELECT id, store_name, address, city, province, postal_code,
                            contact_number, email, store_manager_name, manager_contact,
-                           store_type, status, created_at, access_token, subdomain, user_id
+                           store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key
                     FROM stores
                     ORDER BY id ASC
                     """
@@ -1061,7 +1095,7 @@ def create_app() -> Flask:
                 """
                 SELECT id, store_name, address, city, province, postal_code,
                        contact_number, email, store_manager_name, manager_contact,
-                       store_type, status, created_at, logo_url, access_token, subdomain
+                       store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key
                 FROM stores
                 WHERE id = %s
                 LIMIT 1
@@ -1088,7 +1122,8 @@ def create_app() -> Flask:
         status: str = "active",
         logo_url: str | None = None,
         subdomain: str | None = None,
-        user_id: int | None = None
+        user_id: int | None = None,
+        license_key: str | None = None
     ) -> int:
         """Create a new store with validation."""
         # Input validation
@@ -1115,14 +1150,14 @@ def create_app() -> Flask:
                 INSERT INTO stores (
                     store_name, address, city, province, postal_code,
                     contact_number, email, store_manager_name, manager_contact,
-                    store_type, status, logo_url, access_token, subdomain, user_id
+                    store_type, status, logo_url, access_token, subdomain, user_id, license_key
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     store_name.strip(), address, city, province, postal_code,
                     contact_number, email, store_manager_name, manager_contact,
-                    store_type, status, logo_url, access_token, subdomain, user_id
+                    store_type, status, logo_url, access_token, subdomain, user_id, license_key
                 ),
             )
             new_store_id = int(cursor.lastrowid)
@@ -1135,7 +1170,7 @@ def create_app() -> Flask:
             cursor = conn.cursor(dictionary=True)
             cursor.execute(
                 """
-                SELECT id, store_id, title, is_active, created_at
+                SELECT id, store_id, owner_user_id, license_key, title, is_active, logo_url, created_at
                 FROM questionnaires
                 WHERE store_id = %s
                 ORDER BY id ASC
@@ -1480,39 +1515,89 @@ def create_app() -> Flask:
     # -------------------------
     # TEMPLATE QUESTIONNAIRE CRUD
     # -------------------------
-    def fetch_template_questionnaire() -> Dict[str, Any] | None:
+    def _tenant_owner(user_id: int | None = None) -> Dict[str, Any]:
+        uid = int(user_id or session['user_id'])
+        user = get_user_by_id(uid)
+        if not user:
+            raise ValueError("Tenant owner not found")
+        return user
+
+    def fetch_template_questionnaire(owner_user_id: int | None = None, license_key: str | None = None) -> Dict[str, Any] | None:
+        owner = _tenant_owner(owner_user_id)
+        effective_license = license_key if license_key is not None else owner.get('license_key')
         conn = get_db_connection()
         try:
             cursor = conn.cursor(dictionary=True)
             cursor.execute(
                 """
-                SELECT id, title, is_active, version, created_at, updated_at, logo_url
+                SELECT id, title, is_active, version, created_at, updated_at, logo_url,
+                       owner_user_id, license_key
                 FROM questionnaires
-                WHERE is_template = TRUE
+                WHERE is_template = TRUE AND owner_user_id = %s AND license_key <=> %s
                 ORDER BY id ASC
                 LIMIT 1
-                """
+                """,
+                (owner['id'], effective_license),
             )
             row = cursor.fetchone()
         finally:
             conn.close()
         return row
 
-    def ensure_template_questionnaire() -> Dict[str, Any]:
-        existing = fetch_template_questionnaire()
+    def ensure_template_questionnaire(owner_user_id: int | None = None) -> Dict[str, Any]:
+        owner = _tenant_owner(owner_user_id)
+        existing = fetch_template_questionnaire(int(owner['id']))
         if existing:
             return existing
         with get_db_connection_with_transaction() as conn:
             cursor = conn.cursor()
+            cursor.execute("""SELECT id, title, is_active, version, logo_url
+                              FROM questionnaires
+                              WHERE is_template = TRUE AND owner_user_id IS NULL
+                              ORDER BY id ASC LIMIT 1""")
+            legacy = cursor.fetchone()
+            default_title = legacy[1] if legacy else "Customer Feedback"
+            default_active = bool(legacy[2]) if legacy else True
+            default_version = int(legacy[3] or 1) if legacy else 1
+            default_logo = legacy[4] if legacy else None
             cursor.execute(
                 """
-                INSERT INTO questionnaires (store_id, title, is_active, is_template, version)
-                VALUES (NULL, %s, %s, %s, %s)
+                INSERT INTO questionnaires
+                    (store_id, owner_user_id, license_key, title, is_active, is_template, version, logo_url)
+                VALUES (NULL, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                ("Customer Feedback", True, True, 1),
+                (owner['id'], owner.get('license_key'), default_title, default_active, True, default_version, default_logo),
             )
             template_id = int(cursor.lastrowid)
-        return {"id": template_id, "title": "Customer Feedback", "is_active": 1, "version": 1, "created_at": None, "is_template": True}
+            if legacy:
+                cursor.execute("""INSERT INTO questions
+                    (questionnaire_id, question_text, question_type, min_label, max_label,
+                     allow_comment, is_required, question_order, is_active, is_template, template_id)
+                    SELECT %s, question_text, question_type, min_label, max_label,
+                           allow_comment, is_required, question_order, is_active, TRUE, id
+                    FROM questions WHERE questionnaire_id = %s""", (template_id, legacy[0]))
+                cursor.execute("""INSERT INTO question_options (question_id, option_text, is_template)
+                    SELECT new_q.id, old_o.option_text, TRUE
+                    FROM questions new_q
+                    INNER JOIN question_options old_o ON old_o.question_id = new_q.template_id
+                    WHERE new_q.questionnaire_id = %s""", (template_id,))
+        return {"id": template_id, "title": default_title, "is_active": default_active,
+                "version": default_version, "created_at": None, "is_template": True,
+                "owner_user_id": owner['id'], "license_key": owner.get('license_key'), "logo_url": default_logo}
+
+    def fetch_tenant_branding(owner_user_id: int, license_key: str | None = None) -> Dict[str, Any]:
+        defaults = {"primary_color": "#FF6B35", "secondary_color": "#F59E0B",
+                    "accent_color": "#2563EB", "text_color": "#212529"}
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            owner = _tenant_owner(owner_user_id)
+            effective_license = license_key if license_key is not None else owner.get('license_key')
+            scope_key = effective_license or f"user:{owner_user_id}"
+            cursor.execute("SELECT primary_color, secondary_color, accent_color, text_color FROM tenant_branding WHERE scope_key = %s", (scope_key,))
+            return cursor.fetchone() or defaults
+        finally:
+            conn.close()
 
     def update_template_questionnaire(title: str, is_active: bool, updated_at: str | None = None) -> None:
         """Update template questionnaire with validation."""
@@ -1618,9 +1703,10 @@ def create_app() -> Flask:
 
     def delete_template_question(template_question_id: int) -> None:
         """Delete a template question by ID."""
+        template = ensure_template_questionnaire()
         with get_db_connection_with_transaction() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM questions WHERE id = %s", (template_question_id,))
+            cursor.execute("DELETE FROM questions WHERE id = %s AND questionnaire_id = %s AND is_template = TRUE", (template_question_id, template['id']))
 
     def update_template_question(question_id: int, question_text: str, question_type: str, is_required: bool, min_label: str = "Poor", max_label: str = "Excellent", allow_comment: bool = False) -> None:
         """Update a template question with validation."""
@@ -1630,15 +1716,16 @@ def create_app() -> Flask:
         if question_type not in ["rating", "text", "multiple_choice"]:
             raise ValueError("Invalid question type")
         
+        template = ensure_template_questionnaire()
         with get_db_connection_with_transaction() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 UPDATE questions
                 SET question_text = %s, question_type = %s, is_required = %s, min_label = %s, max_label = %s, allow_comment = %s
-                WHERE id = %s AND is_template = TRUE
+                WHERE id = %s AND questionnaire_id = %s AND is_template = TRUE
                 """,
-                (question_text.strip(), question_type, is_required, min_label, max_label, allow_comment, question_id),
+                (question_text.strip(), question_type, is_required, min_label, max_label, allow_comment, question_id, template['id']),
             )
 
     def add_template_option(template_question_id: int, option_text: str) -> int:
@@ -1647,8 +1734,12 @@ def create_app() -> Flask:
         if not option_text or not option_text.strip():
             raise ValueError("Option text is required")
         
+        template = ensure_template_questionnaire()
         with get_db_connection_with_transaction() as conn:
             cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM questions WHERE id = %s AND questionnaire_id = %s AND is_template = TRUE", (template_question_id, template['id']))
+            if not cursor.fetchone():
+                raise ValueError("Question does not belong to this license")
             cursor.execute(
                 """
                 INSERT INTO question_options (question_id, option_text)
@@ -1660,18 +1751,24 @@ def create_app() -> Flask:
 
     def delete_template_option(template_option_id: int) -> None:
         """Delete a template option by ID."""
+        template = ensure_template_questionnaire()
         with get_db_connection_with_transaction() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM question_options WHERE id = %s", (template_option_id,))
+            cursor.execute("""DELETE qo FROM question_options qo
+                              INNER JOIN questions q ON q.id = qo.question_id
+                              WHERE qo.id = %s AND q.questionnaire_id = %s AND q.is_template = TRUE""",
+                           (template_option_id, template['id']))
 
     def publish_template_to_all_stores() -> int:
-        """Publish template questionnaire to all stores with transaction safety."""
+        """Publish only inside the signed-in admin's tenant/license scope."""
+        owner = _tenant_owner()
         template = ensure_template_questionnaire()
         template_id = int(template["id"])
         template_questions = fetch_template_questions(template_questionnaire_id=template_id)
         template_options_by_question_id = fetch_template_options_by_question([int(q["id"]) for q in template_questions])
 
-        stores = fetch_stores()
+        stores = [store for store in fetch_stores(user_id=int(owner['id']))
+                  if (store.get('license_key') or None) == (owner.get('license_key') or None)]
         with get_db_connection_with_transaction() as conn:
             cursor = conn.cursor(dictionary=True)
             published_count = 0
@@ -1688,10 +1785,12 @@ def create_app() -> Flask:
                     cursor.execute(
                         """
                         UPDATE questionnaires
-                        SET title = %s, is_active = %s, template_id = %s
+                        SET title = %s, is_active = %s, template_id = %s,
+                            owner_user_id = %s, license_key = %s, logo_url = %s
                         WHERE id = %s
                         """,
-                        (template["title"], bool(template["is_active"]), template_id, int(existing["id"])),
+                        (template["title"], bool(template["is_active"]), template_id,
+                         owner['id'], owner.get('license_key'), store.get('logo_url') or template.get('logo_url'), int(existing["id"])),
                     )
                     questionnaire_id = int(existing["id"])
                     
@@ -1708,10 +1807,12 @@ def create_app() -> Flask:
                     # Create new store questionnaire
                     cursor.execute(
                         """
-                        INSERT INTO questionnaires (store_id, title, is_active, is_template, template_id)
-                        VALUES (%s, %s, %s, %s, %s)
+                        INSERT INTO questionnaires
+                            (store_id, owner_user_id, license_key, title, is_active, is_template, template_id, logo_url)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                         """,
-                        (store_id, template["title"], bool(template["is_active"]), False, template_id),
+                        (store_id, owner['id'], owner.get('license_key'), template["title"],
+                         bool(template["is_active"]), False, template_id, store.get('logo_url') or template.get('logo_url')),
                     )
                     questionnaire_id = int(cursor.lastrowid)
 
@@ -1803,6 +1904,10 @@ def create_app() -> Flask:
     @app.route("/admin/questionnaire", methods=["GET", "POST"])
     @login_required
     def master_questionnaire():
+        user = get_user_by_id(session['user_id'])
+        if not user or user.get('role') not in ('admin', 'superadmin'):
+            flash("You don't have permission to manage questionnaires.", "danger")
+            return redirect(url_for("admin_dashboard"))
         if request.method == "POST":
             title = request.form.get("title", "").strip()
             updated_at = request.form.get("updated_at", "").strip()
@@ -1836,17 +1941,8 @@ def create_app() -> Flask:
         try:
             cursor = conn.cursor(dictionary=True)
             
-            # Get template
-            cursor.execute(
-                """
-                SELECT id, title, is_active, version, created_at, updated_at, logo_url
-                FROM questionnaires
-                WHERE is_template = TRUE
-                ORDER BY id ASC
-                LIMIT 1
-                """
-            )
-            template = cursor.fetchone()
+            # One master template per admin/license tenant.
+            template = ensure_template_questionnaire()
             
             # Initialize questions and options
             questions = []
@@ -1905,6 +2001,7 @@ def create_app() -> Flask:
             master=template,
             questions=questions,
             options_by_question_id=options_by_question_id,
+            branding=fetch_tenant_branding(int(user['id'])),
         )
 
     @app.route("/admin/questionnaire/questions/add", methods=["POST"])
@@ -2013,6 +2110,7 @@ def create_app() -> Flask:
 
     @app.route("/admin/questionnaire/upload-logo", methods=["POST"])
     def master_upload_logo():
+        template = ensure_template_questionnaire()
         # Handle logo upload for master questionnaire - store as base64 in database
         logo_data = None
         if 'logo' in request.files:
@@ -2020,7 +2118,7 @@ def create_app() -> Flask:
             if logo_file and logo_file.filename:
                 # Validate file type
                 allowed_extensions = {'png', 'jpg', 'jpeg'}
-                if logo_file.filename.rsplit('.', 1)[1].lower() not in allowed_extensions:
+                if '.' not in logo_file.filename or logo_file.filename.rsplit('.', 1)[1].lower() not in allowed_extensions:
                     flash("Invalid file type. Only PNG, JPG, and JPEG files are allowed.", "danger")
                     return redirect(url_for("master_questionnaire"))
                 
@@ -2044,7 +2142,7 @@ def create_app() -> Flask:
             conn = get_db_connection()
             try:
                 cursor = conn.cursor()
-                cursor.execute("UPDATE questionnaires SET logo_url = %s WHERE is_template = 1", (logo_data,))
+                cursor.execute("UPDATE questionnaires SET logo_url = %s WHERE id = %s", (logo_data, template['id']))
                 conn.commit()
                 flash("Brand logo uploaded successfully", "success")
             except Exception as e:
@@ -2060,10 +2158,11 @@ def create_app() -> Flask:
     @app.route("/admin/questionnaire/delete-logo", methods=["POST"])
     def master_delete_logo():
         # Delete the logo from the master questionnaire
+        template = ensure_template_questionnaire()
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute("UPDATE questionnaires SET logo_url = NULL WHERE is_template = 1")
+            cursor.execute("UPDATE questionnaires SET logo_url = NULL WHERE id = %s", (template['id'],))
             conn.commit()
             flash("Brand logo deleted successfully", "success")
         except Exception as e:
@@ -2072,6 +2171,32 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+        return redirect(url_for("master_questionnaire"))
+
+    @app.route("/admin/questionnaire/branding", methods=["POST"])
+    @login_required
+    def save_tenant_branding():
+        user = get_user_by_id(session['user_id'])
+        if not user or user.get('role') not in ('admin', 'superadmin'):
+            return jsonify({"success": False, "error": "Access denied"}), 403
+        fields = ("primary_color", "secondary_color", "accent_color", "text_color")
+        colors = {name: request.form.get(name, "").strip().upper() for name in fields}
+        if any(not re.fullmatch(r"#[0-9A-F]{6}", value) for value in colors.values()):
+            flash("Please select valid brand colors.", "danger")
+            return redirect(url_for("master_questionnaire"))
+        with get_db_connection_with_transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO tenant_branding
+                       (owner_user_id, scope_key, license_key, primary_color, secondary_color, accent_color, text_color)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
+                   ON DUPLICATE KEY UPDATE license_key = VALUES(license_key),
+                       primary_color = VALUES(primary_color), secondary_color = VALUES(secondary_color),
+                       accent_color = VALUES(accent_color), text_color = VALUES(text_color)""",
+                (user['id'], user.get('license_key') or f"user:{user['id']}", user.get('license_key'), colors['primary_color'], colors['secondary_color'],
+                 colors['accent_color'], colors['text_color']),
+            )
+        flash("Brand colors saved for your company license.", "success")
         return redirect(url_for("master_questionnaire"))
 
     @app.route("/admin/questionnaire/publish", methods=["POST"])
@@ -2098,8 +2223,10 @@ def create_app() -> Flask:
 
     @app.route("/admin/api/stores", methods=["GET"])
     def api_stores():
-        """API endpoint to get all stores for sync wizard"""
-        stores = fetch_stores()
+        """Return only stores owned by the current questionnaire tenant."""
+        template = ensure_template_questionnaire()
+        stores = [store for store in fetch_stores(user_id=session['user_id'])
+                  if (store.get('license_key') or None) == (template.get('license_key') or None)]
         return jsonify(stores)
 
     @app.route("/admin/questionnaire/sync", methods=["POST"])
@@ -2126,8 +2253,11 @@ def create_app() -> Flask:
                     store_id = int(store_id)
                     
                     # Check if store exists
-                    cursor.execute("SELECT id FROM stores WHERE id = %s", (store_id,))
-                    if not cursor.fetchone():
+                    cursor.execute("""SELECT id, logo_url FROM stores
+                                      WHERE id = %s AND user_id = %s AND license_key <=> %s""",
+                                   (store_id, session['user_id'], template.get('license_key')))
+                    scoped_store = cursor.fetchone()
+                    if not scoped_store:
                         continue
                     
                     # Check if store already has a questionnaire
@@ -2139,10 +2269,12 @@ def create_app() -> Flask:
                         cursor.execute(
                             """
                             UPDATE questionnaires
-                            SET title = %s, is_active = %s, template_id = %s
+                            SET title = %s, is_active = %s, template_id = %s,
+                                owner_user_id = %s, license_key = %s, logo_url = %s
                             WHERE id = %s
                             """,
-                            (template["title"], bool(template["is_active"]), template_id, int(existing["id"])),
+                            (template["title"], bool(template["is_active"]), template_id,
+                             session['user_id'], template.get('license_key'), scoped_store.get('logo_url') or template.get('logo_url'), int(existing["id"])),
                         )
                         questionnaire_id = int(existing["id"])
                         
@@ -2159,10 +2291,12 @@ def create_app() -> Flask:
                         # Create new store questionnaire
                         cursor.execute(
                             """
-                            INSERT INTO questionnaires (store_id, title, is_active, is_template, template_id)
-                            VALUES (%s, %s, %s, %s, %s)
+                            INSERT INTO questionnaires
+                                (store_id, owner_user_id, license_key, title, is_active, is_template, template_id, logo_url)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                             """,
-                            (store_id, template["title"], bool(template["is_active"]), False, template_id),
+                            (store_id, session['user_id'], template.get('license_key'), template["title"],
+                             bool(template["is_active"]), False, template_id, scoped_store.get('logo_url') or template.get('logo_url')),
                         )
                         questionnaire_id = int(cursor.lastrowid)
                     
@@ -2222,7 +2356,8 @@ def create_app() -> Flask:
             cursor = conn.cursor(dictionary=True)
             
             # Get total stores
-            cursor.execute("SELECT COUNT(*) as total FROM stores")
+            cursor.execute("SELECT COUNT(*) as total FROM stores WHERE user_id = %s AND license_key <=> %s",
+                           (session['user_id'], template.get('license_key')))
             total_stores = cursor.fetchone()['total']
             
             # Get stores with synced questionnaire
@@ -2230,8 +2365,9 @@ def create_app() -> Flask:
                 SELECT COUNT(DISTINCT s.id) as synced
                 FROM stores s
                 JOIN questionnaires q ON s.id = q.store_id
-                WHERE q.is_template = FALSE AND q.template_id = %s
-            """, (template_id,))
+                WHERE q.is_template = FALSE AND q.template_id = %s AND s.user_id = %s
+                  AND s.license_key <=> %s
+            """, (template_id, session['user_id'], template.get('license_key')))
             synced_stores = cursor.fetchone()['synced']
             
             cursor.close()
@@ -4352,7 +4488,7 @@ def create_app() -> Flask:
                     recent_feedback = cursor.fetchall()
 
                     # Fetch master questionnaire logo
-                    cursor.execute("SELECT logo_url FROM questionnaires WHERE is_template = 1 LIMIT 1")
+                    cursor.execute("SELECT logo_url FROM questionnaires WHERE is_template = 1 AND owner_user_id = %s AND license_key <=> %s LIMIT 1", (store['user_id'], store.get('license_key')))
                     master_logo = cursor.fetchone()
 
                 finally:
@@ -4450,7 +4586,7 @@ def create_app() -> Flask:
             recent_feedback = cursor.fetchall()
 
             # Fetch master questionnaire logo
-            cursor.execute("SELECT logo_url FROM questionnaires WHERE is_template = 1 LIMIT 1")
+            cursor.execute("SELECT logo_url FROM questionnaires WHERE is_template = 1 AND owner_user_id = %s AND license_key <=> %s LIMIT 1", (store['user_id'], store.get('license_key')))
             master_logo = cursor.fetchone()
 
         finally:
@@ -4475,7 +4611,7 @@ def create_app() -> Flask:
             return render_template("survey_error.html", store=None, error="Page not found"), 404
 
         # Check if master questionnaire is active
-        master_template = fetch_template_questionnaire()
+        master_template = fetch_template_questionnaire(int(store['user_id']), store.get('license_key'))
         if not master_template or not master_template.get("is_active"):
             return render_template("survey_error.html", store=store, error="Sorry, the system is not accepting any feedbacks right now"), 404
 
@@ -4494,10 +4630,12 @@ def create_app() -> Flask:
                 # Create new store questionnaire
                 cursor.execute(
                     """
-                    INSERT INTO questionnaires (store_id, title, is_active, is_template, template_id)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO questionnaires
+                        (store_id, owner_user_id, license_key, title, is_active, is_template, template_id, logo_url)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (store_id, master_template["title"], bool(master_template["is_active"]), False, template_id),
+                    (store_id, store['user_id'], master_template.get('license_key'), master_template["title"],
+                     bool(master_template["is_active"]), False, template_id, store.get('logo_url') or master_template.get('logo_url')),
                 )
                 questionnaire_id = int(cursor.lastrowid)
                 
@@ -4537,13 +4675,8 @@ def create_app() -> Flask:
         question_ids = [int(q["id"]) for q in questions]
         options_by_question_id = fetch_options_for_questions(question_ids=question_ids)
 
-        # Fetch master questionnaire logo (brand logo)
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT logo_url FROM questionnaires WHERE is_template = 1 LIMIT 1")
-        master_logo = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        master_logo = questionnaire.get('logo_url') or store.get('logo_url') or master_template.get('logo_url')
+        branding = fetch_tenant_branding(int(store['user_id']), store.get('license_key'))
 
         # Fetch active staff for this store
         conn = get_db_connection()
@@ -4561,7 +4694,8 @@ def create_app() -> Flask:
         return render_template(
             "master_questionnaire/survey.html",
             store=store,
-            master_logo=master_logo.get('logo_url') if master_logo else None,
+            master_logo=master_logo,
+            branding=branding,
             questionnaire=questionnaire,
             questions=questions,
             options_by_question_id=options_by_question_id,
@@ -4575,7 +4709,7 @@ def create_app() -> Flask:
             return render_template("survey_error.html", store=None, error="Page not found"), 404
 
         # Check if master questionnaire is active
-        master_template = fetch_template_questionnaire()
+        master_template = fetch_template_questionnaire(int(store['user_id']), store.get('license_key'))
         if not master_template or not master_template.get("is_active"):
             return render_template("survey_error.html", store=store, error="Sorry, the system is not accepting any feedbacks right now"), 404
 
@@ -4592,9 +4726,9 @@ def create_app() -> Flask:
             flash("Receipt/Transaction number is required.", "danger")
             return redirect(url_for("public_survey", store_id=store_id))
         
-        # Basic receipt number validation (5-50 characters, letters, numbers, hyphens only)
-        if not re.match(r'^[A-Za-z0-9\-]{5,50}$', receipt_number):
-            flash("Receipt number should be 5-50 characters (letters, numbers, and hyphens only).", "danger")
+        # A questionnaire cannot be submitted without the exact 10-digit transaction code.
+        if not re.fullmatch(r'\d{10}', receipt_number):
+            flash("Receipt/Transaction number must contain exactly 10 digits.", "danger")
             return redirect(url_for("public_survey", store_id=store_id))
 
         # Get and validate email
@@ -4822,7 +4956,7 @@ def create_app() -> Flask:
             if logo_file and logo_file.filename:
                 # Validate file type
                 allowed_extensions = {'png', 'jpg', 'jpeg'}
-                if logo_file.filename.rsplit('.', 1)[1].lower() not in allowed_extensions:
+                if '.' not in logo_file.filename or logo_file.filename.rsplit('.', 1)[1].lower() not in allowed_extensions:
                     flash("Invalid file type. Only PNG, JPG, and JPEG files are allowed.", "danger")
                     return redirect(url_for("stores_management"))
                 
@@ -4834,15 +4968,10 @@ def create_app() -> Flask:
                     flash("File size exceeds 5MB limit.", "danger")
                     return redirect(url_for("stores_management"))
                 
-                # Save the file
-                from werkzeug.utils import secure_filename
-                import uuid
-                filename = secure_filename(logo_file.filename)
-                unique_filename = f"{uuid.uuid4()}_{filename}"
-                upload_path = os.path.join('static', 'uploads', 'logos')
-                os.makedirs(upload_path, exist_ok=True)
-                logo_file.save(os.path.join(upload_path, unique_filename))
-                logo_url = f"/static/uploads/logos/{unique_filename}"
+                import base64
+                ext = logo_file.filename.rsplit('.', 1)[1].lower()
+                mime = "image/jpeg" if ext in ('jpg', 'jpeg') else "image/png"
+                logo_url = f"data:{mime};base64,{base64.b64encode(logo_file.read()).decode('utf-8')}"
 
         new_store_id = create_store(
             store_name=store_name,
@@ -4858,7 +4987,8 @@ def create_app() -> Flask:
             status=status,
             logo_url=logo_url,
             subdomain=subdomain if subdomain else None,
-            user_id=session.get('user_id')
+            user_id=session.get('user_id'),
+            license_key=user.get('license_key')
         )
         
         logger.info(f"Created store {new_store_id} for user {session.get('user_id')}")
@@ -4937,7 +5067,7 @@ def create_app() -> Flask:
             if logo_file and logo_file.filename:
                 # Validate file type
                 allowed_extensions = {'png', 'jpg', 'jpeg'}
-                if logo_file.filename.rsplit('.', 1)[1].lower() not in allowed_extensions:
+                if '.' not in logo_file.filename or logo_file.filename.rsplit('.', 1)[1].lower() not in allowed_extensions:
                     flash("Invalid file type. Only PNG, JPG, and JPEG files are allowed.", "danger")
                     return redirect(url_for("store_details", store_id=store_id))
                 
@@ -4949,15 +5079,10 @@ def create_app() -> Flask:
                     flash("File size exceeds 5MB limit.", "danger")
                     return redirect(url_for("store_details", store_id=store_id))
                 
-                # Save the file
-                from werkzeug.utils import secure_filename
-                import uuid
-                filename = secure_filename(logo_file.filename)
-                unique_filename = f"{uuid.uuid4()}_{filename}"
-                upload_path = os.path.join('static', 'uploads', 'logos')
-                os.makedirs(upload_path, exist_ok=True)
-                logo_file.save(os.path.join(upload_path, unique_filename))
-                logo_url = f"/static/uploads/logos/{unique_filename}"
+                import base64
+                ext = logo_file.filename.rsplit('.', 1)[1].lower()
+                mime = "image/jpeg" if ext in ('jpg', 'jpeg') else "image/png"
+                logo_url = f"data:{mime};base64,{base64.b64encode(logo_file.read()).decode('utf-8')}"
 
         # Update only the logo_url in the database
         if logo_url:
@@ -5007,7 +5132,7 @@ def create_app() -> Flask:
             if logo_file and logo_file.filename:
                 # Validate file type
                 allowed_extensions = {'png', 'jpg', 'jpeg'}
-                if logo_file.filename.rsplit('.', 1)[1].lower() not in allowed_extensions:
+                if '.' not in logo_file.filename or logo_file.filename.rsplit('.', 1)[1].lower() not in allowed_extensions:
                     flash("Invalid file type. Only PNG, JPG, and JPEG files are allowed.", "danger")
                     return redirect(url_for("stores_management"))
                 
@@ -5019,15 +5144,10 @@ def create_app() -> Flask:
                     flash("File size exceeds 5MB limit.", "danger")
                     return redirect(url_for("stores_management"))
                 
-                # Save the file
-                from werkzeug.utils import secure_filename
-                import uuid
-                filename = secure_filename(logo_file.filename)
-                unique_filename = f"{uuid.uuid4()}_{filename}"
-                upload_path = os.path.join('static', 'uploads', 'logos')
-                os.makedirs(upload_path, exist_ok=True)
-                logo_file.save(os.path.join(upload_path, unique_filename))
-                logo_url = f"/static/uploads/logos/{unique_filename}"
+                import base64
+                ext = logo_file.filename.rsplit('.', 1)[1].lower()
+                mime = "image/jpeg" if ext in ('jpg', 'jpeg') else "image/png"
+                logo_url = f"data:{mime};base64,{base64.b64encode(logo_file.read()).decode('utf-8')}"
 
         success = update_store(
             store_id=store_id,
@@ -5357,11 +5477,12 @@ def create_app() -> Flask:
             cursor = conn.cursor(dictionary=True)
 
             # Fetch all stores
-            cursor.execute("SELECT * FROM stores")
+            cursor.execute("SELECT * FROM stores WHERE user_id = %s", (session['user_id'],))
             stores = cursor.fetchall()
 
             # Fetch template questionnaire
-            cursor.execute("SELECT * FROM questionnaires WHERE is_template = TRUE LIMIT 1")
+            user = get_user_by_id(session['user_id'])
+            cursor.execute("SELECT * FROM questionnaires WHERE is_template = TRUE AND owner_user_id = %s AND license_key <=> %s LIMIT 1", (session['user_id'], user.get('license_key') if user else None))
             template_questionnaire = cursor.fetchone()
 
             if not template_questionnaire:

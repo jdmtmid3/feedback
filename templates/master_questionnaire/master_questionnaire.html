@@ -15,7 +15,7 @@ PURPOSE: "Master Questionnaire" editor. Allows admins to build the global templa
     <div>
       <h2 class="page-title mb-1">Master Questionnaire</h2>
       <p class="page-subtitle mb-0">
-        Create a uniform questionnaire and publish it to all stores.
+        Create a questionnaire for stores under your company license only.
       </p>
     </div>
     <div class="d-flex gap-2 align-items-center">
@@ -70,21 +70,37 @@ PURPOSE: "Master Questionnaire" editor. Allows admins to build the global templa
             </div>
             <div>
               <h6 class="mb-0 fw-bold" style="font-size:1rem;">Publish</h6>
-              <small class="text-muted" style="font-size:.75rem;">Sync questionnaire to stores</small>
+              <small class="text-muted" style="font-size:.75rem;">Sync only to stores under this license</small>
             </div>
           </div>
-          <form method="POST" action="{{ url_for('master_publish') }}" onsubmit="return confirm('Are you sure you want to sync to all stores? This will overwrite their current questionnaires.');">
+          <form method="POST" action="{{ url_for('master_publish') }}" onsubmit="return confirm('Sync this questionnaire only to stores under your license? Existing questionnaires in those stores will be updated.');">
             <button class="btn btn-warning w-100 d-flex align-items-center justify-content-center" type="submit">
               <i class="bi bi-cloud-upload me-2"></i>
-              <span class="fw-bold">Publish / Sync to all stores</span>
+              <span class="fw-bold">Publish to My Licensed Stores</span>
             </button>
           </form>
           <div class="alert alert-info d-flex align-items-start mt-3" role="alert">
             <i class="bi bi-info-circle me-2 flex-shrink-0 mt-0.5"></i>
             <small class="mb-0">
-              <strong>Note:</strong> When you sync, all stores will receive the current master questionnaire. This will overwrite any store-specific questionnaires.
+              <strong>Tenant-safe:</strong> Only stores owned by your admin account and license key will be updated.
             </small>
           </div>
+        </div>
+      </div>
+
+      <div class="card border-0 shadow-lg mb-4 survey-panel-card">
+        <div class="card-body p-4">
+          <h6 class="fw-bold mb-1"><i class="bi bi-palette-fill me-2"></i>Company Brand Colors</h6>
+          <small class="text-muted d-block mb-3">Applied only to questionnaires under your company license.</small>
+          <form method="POST" action="{{ url_for('save_tenant_branding') }}" class="vstack gap-3">
+            {% for field, label in [('primary_color','Primary'), ('secondary_color','Secondary'), ('accent_color','Accent'), ('text_color','Text')] %}
+            <div class="d-flex align-items-center justify-content-between gap-3">
+              <label class="form-label mb-0" for="{{ field }}">{{ label }} Color</label>
+              <input type="color" id="{{ field }}" name="{{ field }}" value="{{ branding[field] }}" class="form-control form-control-color" required>
+            </div>
+            {% endfor %}
+            <button class="btn btn-primary" type="submit"><i class="bi bi-check-lg me-1"></i>Save Brand Colors</button>
+          </form>
         </div>
       </div>
 
@@ -539,4 +555,3 @@ document.addEventListener('DOMContentLoaded', function() {
 }
 </style>
 {% endblock %}
-

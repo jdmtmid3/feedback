@@ -87,7 +87,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
         <div class="modal-body">
-          <form method="POST" action="{{ url_for('add_store') }}" id="addStoreForm">
+          <form method="POST" action="{{ url_for('add_store') }}" id="addStoreForm" enctype="multipart/form-data">
             <div class="row g-3">
               <div class="col-md-6">
                 <label for="store_name" class="form-label fw-medium">Store Name *</label>
@@ -111,6 +111,12 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   <option value="warehouse">Warehouse</option>
                   <option value="other">Other</option>
                 </select>
+              </div>
+
+              <div class="col-12">
+                <label for="logo" class="form-label fw-medium">Store Logo</label>
+                <input type="file" id="logo" name="logo" class="form-control" accept="image/png,image/jpeg,image/jpg">
+                <div class="form-text">This logo will appear on this store's questionnaire. PNG or JPG, maximum 5MB.</div>
               </div>
               
               <div class="col-12">
