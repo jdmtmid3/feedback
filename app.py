@@ -3286,6 +3286,10 @@ def create_app() -> Flask:
     @login_required
     def client_save_license_config():
         """Save client license configuration"""
+        user = get_user_by_id(session['user_id'])
+        if not user or user.get('role') != 'admin':
+            flash("Only client administrator accounts can configure a license.", "danger")
+            return redirect(url_for("client_support"))
         license_key = request.form.get("license_key", "").strip()
         
         if not license_key:
@@ -3340,6 +3344,20 @@ def create_app() -> Flask:
         return redirect(url_for("client_license_config"))
 
     # ── Client Support Portal ──────────────────────────────────────
+    def _user_license_key(user: Dict[str, Any]) -> Optional[str]:
+        """Return only the license assigned to this client account.
+
+        Never fall back to the system/global license: doing so would make
+        superadmins and view-only users share the same support thread.
+        """
+        if user and user.get('role') == 'admin':
+            return user.get('license_key') or None
+        return None
+
+    def _support_identity(user: Dict[str, Any]) -> str:
+        """Stable, private conversation identity for the signed-in account."""
+        return _user_license_key(user) or f"user:{int(user['id'])}"
+
     @app.route("/client/support")
     @login_required
     def client_support():
@@ -3349,8 +3367,7 @@ def create_app() -> Flask:
             flash("Access denied.", "danger")
             return redirect(url_for("admin_dashboard"))
 
-        config = get_license_config()
-        license_key = user.get('license_key') or (config.get('license_key') if config else None)
+        license_key = _user_license_key(user)
 
         return render_template("client/support.html",
                                user=user, license_key=license_key or '')
@@ -3362,7 +3379,7 @@ def create_app() -> Flask:
         user = get_user_by_id(session['user_id'])
         config = get_license_config()
         portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-        license_key = user.get('license_key') or (config.get('license_key') if config else None)
+        license_key = _user_license_key(user)
 
         result = {"license_status": None, "license_error": None, "tickets": []}
 
@@ -3402,11 +3419,11 @@ def create_app() -> Flask:
         config = get_license_config()
         portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
 
-        license_key = request.form.get("license_key", "").strip()
+        license_key = _user_license_key(user) or ""
         subject = request.form.get("subject", "").strip()
         message = request.form.get("message", "").strip()
         ticket_type = request.form.get("ticket_type", "general")
-        contact_email = request.form.get("contact_email", "").strip() or user.get('email', '')
+        contact_email = user.get('email', '') or user.get('username', '')
 
         if not subject or not message:
             flash("Subject and message are required.", "danger")
@@ -3439,8 +3456,8 @@ def create_app() -> Flask:
         config = get_license_config()
         portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
 
-        license_key = request.form.get("license_key", "").strip()
-        contact_email = request.form.get("contact_email", "").strip() or user.get('email', '')
+        license_key = _user_license_key(user) or ""
+        contact_email = user.get('email', '') or user.get('username', '')
 
         if not license_key:
             flash("No license key found.", "danger")
@@ -3470,9 +3487,8 @@ def create_app() -> Flask:
         config = get_license_config()
         return normalize_portal_url(config.get("licensing_portal_url") if config else None)
 
-    def _ensure_portal_conversation(license_key, contact_email, company_name=""):
+    def _ensure_portal_conversation(client_identifier, license_key, contact_email, company_name=""):
         """Ensure conversation exists on portal and return its ID"""
-        client_identifier = license_key or contact_email
         # Fallback contact_email if empty (portal requires it)
         effective_email = contact_email or company_name or client_identifier or "client@unknown"
         portal_url = _get_portal_url()
@@ -3499,15 +3515,15 @@ def create_app() -> Flask:
     def api_get_client_messages():
         """Get messages for the current user from licensing portal"""
         user = get_user_by_id(session['user_id'])
-        config = get_license_config()
-        license_key = user.get('license_key') or (config.get('license_key') if config else None)
+        license_key = _user_license_key(user)
+        client_identifier = _support_identity(user)
         contact_email = user.get('email', '') or user.get('username', '')
 
         if not license_key and not contact_email:
             return jsonify({"error": "No license key or email found"}), 400
 
         # Ensure conversation exists on portal
-        conv_id = _ensure_portal_conversation(license_key, contact_email, user.get('username', ''))
+        conv_id = _ensure_portal_conversation(client_identifier, license_key, contact_email, user.get('username', ''))
         if not conv_id:
             return jsonify({"messages": [], "conversation_id": None, "error": "Portal unavailable"})
 
@@ -3528,8 +3544,8 @@ def create_app() -> Flask:
     def api_send_client_message():
         """Send a client message directly to licensing portal"""
         user = get_user_by_id(session['user_id'])
-        config = get_license_config()
-        license_key = user.get('license_key') or (config.get('license_key') if config else None)
+        license_key = _user_license_key(user)
+        client_identifier = _support_identity(user)
         contact_email = user.get('email', '') or user.get('username', '')
 
         data = request.get_json() or {}
@@ -3538,7 +3554,7 @@ def create_app() -> Flask:
             return jsonify({"error": "Message is required"}), 400
 
         # Ensure conversation exists on portal
-        conv_id = _ensure_portal_conversation(license_key, contact_email, user.get('username', ''))
+        conv_id = _ensure_portal_conversation(client_identifier, license_key, contact_email, user.get('username', ''))
         if not conv_id:
             return jsonify({"error": "Failed to reach licensing portal"}), 500
 
