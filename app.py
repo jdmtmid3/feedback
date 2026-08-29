@@ -2512,7 +2512,8 @@ def create_app() -> Flask:
         email = request.form.get("email", "").strip()
         password = request.form.get("password", "")
         role = request.form.get("role", "user")
-        max_stores = int(request.form.get("max_stores", "0"))
+        license_key = request.form.get("license_key", "").strip()
+        max_stores = 0
         
         if not username or not email or not password:
             flash("Username, email, and password are required.", "danger")
@@ -2521,6 +2522,29 @@ def create_app() -> Flask:
         if role not in ['superadmin', 'admin', 'user']:
             flash("Invalid role.", "danger")
             return redirect(url_for("admin_users"))
+
+        # The licensing portal is the source of truth for client limits.
+        if role == 'admin':
+            if not license_key:
+                flash("A License Key from the Licensing Portal is required for a client account.", "danger")
+                return redirect(url_for("admin_users"))
+            try:
+                import requests as http_requests
+                config = get_license_config()
+                portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
+                response = http_requests.post(
+                    f"{portal_url}/api/validate/{license_key}",
+                    headers=licensing_api_headers(), timeout=10,
+                )
+                license_data = response.json() if response.content else {}
+                if response.status_code != 200 or not license_data.get("valid"):
+                    flash(license_data.get("message") or "The License Key is invalid or inactive.", "danger")
+                    return redirect(url_for("admin_users"))
+                max_stores = int(license_data.get("max_stores") or 0)
+            except Exception as exc:
+                logger.error("Unable to validate client license: %s", exc)
+                flash("Unable to connect to the Licensing Portal. Please try again.", "danger")
+                return redirect(url_for("admin_users"))
         
         try:
             conn = get_db_connection()
@@ -2531,18 +2555,22 @@ def create_app() -> Flask:
             if cursor.fetchone():
                 flash("Username or email already exists.", "danger")
                 return redirect(url_for("admin_users"))
+            if license_key:
+                cursor.execute("SELECT id FROM users WHERE license_key = %s", (license_key,))
+                if cursor.fetchone():
+                    flash("This License Key is already connected to another client.", "danger")
+                    return redirect(url_for("admin_users"))
             
-            # Create user (license_key will be configured by client from portal)
             password_hash = hash_password(password)
             cursor.execute(
                 "INSERT INTO users (username, email, password_hash, role, max_stores, license_key) VALUES (%s, %s, %s, %s, %s, %s)",
-                (username, email, password_hash, role, max_stores if role == 'admin' else 0, None)
+                (username, email, password_hash, role, max_stores if role == 'admin' else 0, license_key if role == 'admin' else None)
             )
             conn.commit()
             conn.close()
             
             if role == 'admin':
-                flash(f"Client account created successfully. Please create a license in the licensing portal and give the license key to the client.", "success")
+                flash(f"Client account created and connected to its license ({max_stores or 'Unlimited'} stores).", "success")
                 log_audit(
                     entity_type="user",
                     entity_id=0,
@@ -2562,6 +2590,28 @@ def create_app() -> Flask:
             flash("Failed to create user.", "danger")
         
         return redirect(url_for("admin_users"))
+
+    @app.route("/api/admin/licenses/validate", methods=["POST"])
+    @role_required('superadmin')
+    def admin_validate_license():
+        """Validate a pasted portal key and return its licensed limits."""
+        data = request.get_json(silent=True) or {}
+        license_key = (data.get("license_key") or "").strip()
+        if not license_key:
+            return jsonify({"valid": False, "error": "License Key is required"}), 400
+        try:
+            import requests as http_requests
+            config = get_license_config()
+            portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
+            response = http_requests.post(
+                f"{portal_url}/api/validate/{license_key}",
+                headers=licensing_api_headers(), timeout=10,
+            )
+            payload = response.json() if response.content else {}
+            return jsonify(payload), response.status_code
+        except Exception as exc:
+            logger.error("License preview validation failed: %s", exc)
+            return jsonify({"valid": False, "error": "Licensing Portal is unavailable"}), 502
 
     @app.route("/admin/users/<int:user_id>/toggle", methods=["POST"])
     @role_required('superadmin')
