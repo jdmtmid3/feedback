@@ -983,6 +983,21 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+    def can_manage_store(user_id: int, store_id: int) -> bool:
+        """Superadmins manage all stores; clients manage only stores they own."""
+        user = get_user_by_id(user_id)
+        if not user or user.get('role') == 'user':
+            return False
+        if user.get('role') == 'superadmin':
+            return True
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM stores WHERE id = %s AND user_id = %s", (store_id, user_id))
+            return cursor.fetchone() is not None
+        finally:
+            conn.close()
+
     def fetch_stores(user_id: int | None = None, assigned_store_ids: List[int] | None = None) -> List[Dict[str, Any]]:
         conn = get_db_connection()
         try:
@@ -2298,12 +2313,35 @@ def create_app() -> Flask:
         try:
             cursor = conn.cursor(dictionary=True)
 
+            # One scope drives every dashboard query so totals, rankings,
+            # activity, and staff never leak stores outside the user's access.
+            dashboard_user = get_user_by_id(session['user_id'])
+            scoped_store_ids: Optional[List[int]] = None
+            if dashboard_user['role'] == 'admin':
+                scoped_store_ids = [s['id'] for s in fetch_stores(user_id=session['user_id'])]
+            elif dashboard_user['role'] == 'user':
+                scoped_store_ids = get_assigned_store_ids(session['user_id'])
+
+            scope_join = ""
+            if scoped_store_ids is not None:
+                cursor.execute("CREATE TEMPORARY TABLE dashboard_store_scope (store_id INT PRIMARY KEY)")
+                if scoped_store_ids:
+                    cursor.executemany(
+                        "INSERT INTO dashboard_store_scope (store_id) VALUES (%s)",
+                        [(store_id,) for store_id in scoped_store_ids],
+                    )
+                scope_join = "INNER JOIN dashboard_store_scope dss ON dss.store_id = s.id"
+
             # Global average rating across all stores (prior `m`).
             # Falls back to 4.0 (mid-high default) when there are no ratings yet.
             cursor.execute(
-                """
+                f"""
                 SELECT AVG(a.rating_value) as global_avg
-                FROM answers a
+                FROM stores s
+                {scope_join}
+                LEFT JOIN questionnaires q ON s.id = q.store_id
+                LEFT JOIN responses r ON q.id = r.questionnaire_id
+                LEFT JOIN answers a ON r.id = a.response_id
                 JOIN questions q2 ON a.question_id = q2.id
                 WHERE q2.question_type = 'rating' AND a.rating_value IS NOT NULL
                 """
@@ -2316,7 +2354,7 @@ def create_app() -> Flask:
             # which keeps the score on the 1–5 scale and pulls low-volume stores
             # toward the global mean until they accumulate enough feedback.
             cursor.execute(
-                """
+                f"""
                 SELECT s.id, s.store_name, s.address, s.city, s.created_at,
                        COUNT(DISTINCT r.id) as total_responses,
                        AVG(CASE WHEN q2.question_type = 'rating' THEN a.rating_value END) as avg_rating,
@@ -2328,6 +2366,7 @@ def create_app() -> Flask:
                        ) as weighted_score,
                        COUNT(DISTINCT r.user_email) as unique_users
                 FROM stores s
+                {scope_join}
                 LEFT JOIN questionnaires q ON s.id = q.store_id
                 LEFT JOIN responses r ON q.id = r.questionnaire_id
                 LEFT JOIN answers a ON r.id = a.response_id
@@ -2347,7 +2386,7 @@ def create_app() -> Flask:
             
             # Overall statistics
             cursor.execute(
-                """
+                f"""
                 SELECT 
                     COUNT(DISTINCT r.id) as total_responses,
                     COUNT(DISTINCT s.id) as total_stores,
@@ -2355,6 +2394,7 @@ def create_app() -> Flask:
                     AVG(CASE WHEN q2.question_type = 'rating' THEN a.rating_value END) as overall_avg_rating,
                     COUNT(DISTINCT q.id) as total_questionnaires
                 FROM stores s
+                {scope_join}
                 LEFT JOIN questionnaires q ON s.id = q.store_id
                 LEFT JOIN responses r ON q.id = r.questionnaire_id
                 LEFT JOIN answers a ON r.id = a.response_id
@@ -2376,11 +2416,12 @@ def create_app() -> Flask:
             
             # Recent activity (last 7 days, linked to stores)
             cursor.execute(
-                """
+                f"""
                 SELECT DATE(r.submitted_at) as date, COUNT(DISTINCT r.id) as responses
                 FROM responses r
                 INNER JOIN questionnaires q ON r.questionnaire_id = q.id
                 INNER JOIN stores s ON q.store_id = s.id
+                {scope_join}
                 WHERE r.submitted_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
                 GROUP BY DATE(r.submitted_at)
                 ORDER BY date
@@ -2390,9 +2431,10 @@ def create_app() -> Flask:
             
             # Top performing stores by feedback
             cursor.execute(
-                """
+                f"""
                 SELECT s.store_name, COUNT(r.id) as response_count
                 FROM stores s
+                {scope_join}
                 LEFT JOIN questionnaires q ON s.id = q.store_id
                 LEFT JOIN responses r ON q.id = r.questionnaire_id
                 GROUP BY s.id, s.store_name
@@ -2405,7 +2447,7 @@ def create_app() -> Flask:
             # Best overall store ranked by Bayesian-average score so a store
             # with one lucky 5★ doesn't beat a store with sustained 4.6★.
             cursor.execute(
-                """
+                f"""
                 SELECT s.id, s.store_name, s.address, s.city,
                        COUNT(DISTINCT r.id) as total_responses,
                        AVG(CASE WHEN q2.question_type = 'rating' THEN a.rating_value END) as avg_rating,
@@ -2415,6 +2457,7 @@ def create_app() -> Flask:
                            %s + COUNT(CASE WHEN q2.question_type = 'rating' AND a.rating_value IS NOT NULL THEN 1 END)
                        ) as weighted_score
                 FROM stores s
+                {scope_join}
                 LEFT JOIN questionnaires q ON s.id = q.store_id
                 LEFT JOIN responses r ON q.id = r.questionnaire_id
                 LEFT JOIN answers a ON r.id = a.response_id
@@ -2433,14 +2476,19 @@ def create_app() -> Flask:
 
             # Global average commendation rating (Bayesian prior `m`).
             cursor.execute(
-                "SELECT AVG(rating) as global_avg FROM staff_commendations WHERE rating IS NOT NULL"
+                f"""SELECT AVG(sc.rating) as global_avg
+                    FROM stores s
+                    {scope_join}
+                    LEFT JOIN staff stf ON stf.store_id = s.id
+                    LEFT JOIN staff_commendations sc ON sc.staff_id = stf.id
+                    WHERE sc.rating IS NOT NULL"""
             )
             srow = cursor.fetchone()
             staff_global_avg = float(srow['global_avg']) if srow and srow['global_avg'] is not None else 4.0
 
             # Best overall staff (highest Bayesian-average score).
             cursor.execute(
-                """
+                f"""
                 SELECT s.id, s.first_name, s.last_name, s.position, s.role,
                        AVG(sc.rating) as avg_rating,
                        COUNT(sc.id) as commendation_count,
@@ -2455,6 +2503,7 @@ def create_app() -> Flask:
                 LEFT JOIN responses r ON sc.response_id = r.id
                 LEFT JOIN questionnaires q ON r.questionnaire_id = q.id
                 LEFT JOIN stores st ON q.store_id = st.id
+                {scope_join.replace('s.id', 'st.id')}
                 GROUP BY s.id, s.first_name, s.last_name, s.position, s.role, st.store_name
                 HAVING avg_rating IS NOT NULL
                 ORDER BY weighted_score DESC
@@ -3286,6 +3335,10 @@ def create_app() -> Flask:
     @login_required
     def client_save_license_config():
         """Save client license configuration"""
+        user = get_user_by_id(session['user_id'])
+        if not user or user.get('role') != 'admin':
+            flash("Only client administrator accounts can configure a license.", "danger")
+            return redirect(url_for("client_support"))
         license_key = request.form.get("license_key", "").strip()
         
         if not license_key:
@@ -3340,6 +3393,20 @@ def create_app() -> Flask:
         return redirect(url_for("client_license_config"))
 
     # ── Client Support Portal ──────────────────────────────────────
+    def _user_license_key(user: Dict[str, Any]) -> Optional[str]:
+        """Return only the license assigned to this client account.
+
+        Never fall back to the system/global license: doing so would make
+        superadmins and view-only users share the same support thread.
+        """
+        if user and user.get('role') == 'admin':
+            return user.get('license_key') or None
+        return None
+
+    def _support_identity(user: Dict[str, Any]) -> str:
+        """Stable, private conversation identity for the signed-in account."""
+        return _user_license_key(user) or f"user:{int(user['id'])}"
+
     @app.route("/client/support")
     @login_required
     def client_support():
@@ -3349,8 +3416,7 @@ def create_app() -> Flask:
             flash("Access denied.", "danger")
             return redirect(url_for("admin_dashboard"))
 
-        config = get_license_config()
-        license_key = user.get('license_key') or (config.get('license_key') if config else None)
+        license_key = _user_license_key(user)
 
         return render_template("client/support.html",
                                user=user, license_key=license_key or '')
@@ -3362,7 +3428,7 @@ def create_app() -> Flask:
         user = get_user_by_id(session['user_id'])
         config = get_license_config()
         portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-        license_key = user.get('license_key') or (config.get('license_key') if config else None)
+        license_key = _user_license_key(user)
 
         result = {"license_status": None, "license_error": None, "tickets": []}
 
@@ -3402,11 +3468,11 @@ def create_app() -> Flask:
         config = get_license_config()
         portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
 
-        license_key = request.form.get("license_key", "").strip()
+        license_key = _user_license_key(user) or ""
         subject = request.form.get("subject", "").strip()
         message = request.form.get("message", "").strip()
         ticket_type = request.form.get("ticket_type", "general")
-        contact_email = request.form.get("contact_email", "").strip() or user.get('email', '')
+        contact_email = user.get('email', '') or user.get('username', '')
 
         if not subject or not message:
             flash("Subject and message are required.", "danger")
@@ -3439,8 +3505,8 @@ def create_app() -> Flask:
         config = get_license_config()
         portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
 
-        license_key = request.form.get("license_key", "").strip()
-        contact_email = request.form.get("contact_email", "").strip() or user.get('email', '')
+        license_key = _user_license_key(user) or ""
+        contact_email = user.get('email', '') or user.get('username', '')
 
         if not license_key:
             flash("No license key found.", "danger")
@@ -3470,9 +3536,8 @@ def create_app() -> Flask:
         config = get_license_config()
         return normalize_portal_url(config.get("licensing_portal_url") if config else None)
 
-    def _ensure_portal_conversation(license_key, contact_email, company_name=""):
+    def _ensure_portal_conversation(client_identifier, license_key, contact_email, company_name=""):
         """Ensure conversation exists on portal and return its ID"""
-        client_identifier = license_key or contact_email
         # Fallback contact_email if empty (portal requires it)
         effective_email = contact_email or company_name or client_identifier or "client@unknown"
         portal_url = _get_portal_url()
@@ -3499,15 +3564,15 @@ def create_app() -> Flask:
     def api_get_client_messages():
         """Get messages for the current user from licensing portal"""
         user = get_user_by_id(session['user_id'])
-        config = get_license_config()
-        license_key = user.get('license_key') or (config.get('license_key') if config else None)
+        license_key = _user_license_key(user)
+        client_identifier = _support_identity(user)
         contact_email = user.get('email', '') or user.get('username', '')
 
         if not license_key and not contact_email:
             return jsonify({"error": "No license key or email found"}), 400
 
         # Ensure conversation exists on portal
-        conv_id = _ensure_portal_conversation(license_key, contact_email, user.get('username', ''))
+        conv_id = _ensure_portal_conversation(client_identifier, license_key, contact_email, user.get('username', ''))
         if not conv_id:
             return jsonify({"messages": [], "conversation_id": None, "error": "Portal unavailable"})
 
@@ -3528,8 +3593,8 @@ def create_app() -> Flask:
     def api_send_client_message():
         """Send a client message directly to licensing portal"""
         user = get_user_by_id(session['user_id'])
-        config = get_license_config()
-        license_key = user.get('license_key') or (config.get('license_key') if config else None)
+        license_key = _user_license_key(user)
+        client_identifier = _support_identity(user)
         contact_email = user.get('email', '') or user.get('username', '')
 
         data = request.get_json() or {}
@@ -3538,7 +3603,7 @@ def create_app() -> Flask:
             return jsonify({"error": "Message is required"}), 400
 
         # Ensure conversation exists on portal
-        conv_id = _ensure_portal_conversation(license_key, contact_email, user.get('username', ''))
+        conv_id = _ensure_portal_conversation(client_identifier, license_key, contact_email, user.get('username', ''))
         if not conv_id:
             return jsonify({"error": "Failed to reach licensing portal"}), 500
 
@@ -4860,7 +4925,11 @@ def create_app() -> Flask:
             conn.close()
 
     @app.route("/admin/stores/<int:store_id>/upload-logo", methods=["POST"])
+    @login_required
     def upload_store_logo(store_id: int):
+        if not can_manage_store(session['user_id'], store_id):
+            flash("You don't have permission to update this store.", "danger")
+            return redirect(url_for("stores_management"))
         # Handle logo upload only
         logo_url = None
         if 'logo' in request.files:
@@ -4909,7 +4978,11 @@ def create_app() -> Flask:
         return redirect(url_for("store_details", store_id=store_id))
 
     @app.route("/admin/stores/<int:store_id>/edit", methods=["POST"])
+    @login_required
     def edit_store(store_id: int):
+        if not can_manage_store(session['user_id'], store_id):
+            flash("You don't have permission to edit this store.", "danger")
+            return redirect(url_for("stores_management"))
         store_name = request.form.get("store_name", "").strip()
         store_type = request.form.get("store_type", "").strip() or None
         address = request.form.get("address", "").strip() or None
@@ -4988,7 +5061,11 @@ def create_app() -> Flask:
         return redirect(url_for("stores_management", store_id=store_id))
 
     @app.route("/admin/stores/<int:store_id>/delete", methods=["POST"])
+    @login_required
     def delete_store_route(store_id: int):
+        if not can_manage_store(session['user_id'], store_id):
+            flash("You don't have permission to delete this store.", "danger")
+            return redirect(url_for("stores_management"))
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
