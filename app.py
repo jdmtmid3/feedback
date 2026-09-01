@@ -4511,7 +4511,7 @@ def create_app() -> Flask:
             # staff just because of a single 5★ commendation.
             cursor.execute(
                 """
-                SELECT s.id, s.first_name, s.last_name, s.email, s.phone, s.position, s.role, s.status,
+                SELECT s.id, s.first_name, s.last_name, s.email, s.phone, s.position, s.photo_url, s.role, s.status,
                        AVG(sc.rating) as avg_rating,
                        COUNT(sc.id) as commendation_count,
                        (
@@ -4543,6 +4543,7 @@ def create_app() -> Flask:
                     "position": staff["position"] or staff["role"].title(),
                     "email": staff.get("email", "") or "",
                     "phone": staff.get("phone", "") or "",
+                    "photo_url": staff.get("photo_url", "") or "",
                     "role": staff["role"],
                     "status": staff["status"],
                     "avg_rating": float(staff["avg_rating"]) if staff["avg_rating"] else 0.0,
