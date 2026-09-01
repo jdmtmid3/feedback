@@ -124,7 +124,7 @@ PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/del
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
         <div class="modal-body">
-          <form method="POST" action="{{ url_for('add_staff', store_id=store.id) }}" id="addStaffForm">
+          <form method="POST" enctype="multipart/form-data" action="{{ url_for('add_staff', store_id=store.id) }}" id="addStaffForm">
             <div class="row g-3">
               <div class="col-md-6">
                 <label for="first_name" class="form-label fw-medium">First Name *</label>
@@ -190,6 +190,11 @@ PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/del
               </div>
               
               <div class="col-12">
+                <label for="photo" class="form-label fw-medium">Profile Photo</label>
+                <input type="file" id="photo" name="photo" class="form-control" accept="image/png,image/jpeg" />
+                <small class="text-muted">Optional · PNG/JPG · maximum 5MB</small>
+              </div>
+              <div class="col-12">
                 <label for="hire_date" class="form-label fw-medium">Hire Date</label>
                 <input
                   type="date"
@@ -221,7 +226,7 @@ PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/del
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
         <div class="modal-body">
-          <form method="POST" id="editStaffForm">
+          <form method="POST" enctype="multipart/form-data" id="editStaffForm">
             <div class="row g-3">
               <div class="col-md-6">
                 <label for="edit_first_name" class="form-label fw-medium">First Name *</label>
@@ -298,6 +303,10 @@ PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/del
                   class="form-control"
                 />
               </div>
+              <div class="col-12">
+                <label for="edit_photo" class="form-label fw-medium">Replace Profile Photo</label>
+                <input type="file" id="edit_photo" name="photo" class="form-control" accept="image/png,image/jpeg" />
+              </div>
             </div>
           </form>
         </div>
@@ -324,9 +333,11 @@ PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/del
           <div class="card staff-card h-100">
             <div class="card-body p-3">
               <div class="d-flex align-items-start justify-content-between mb-3">
-                <div class="rounded-circle bg-light p-2">
-                  <i class="bi bi-person text-muted fs-4"></i>
-                </div>
+                {% if member.photo_url %}
+                  <img src="{{ member.photo_url }}" alt="{{ member.first_name }}" class="rounded-circle object-fit-cover" style="width:48px;height:48px;" />
+                {% else %}
+                  <div class="rounded-circle bg-light p-2"><i class="bi bi-person text-muted fs-4"></i></div>
+                {% endif %}
                 <div class="d-flex gap-1">
                   <button class="btn btn-sm btn-outline-primary" onclick="editStaff({{ member.id }}); event.stopPropagation();" title="Edit Staff">
                     <i class="bi bi-pencil"></i>

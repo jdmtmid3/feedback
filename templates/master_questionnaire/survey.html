@@ -121,7 +121,7 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
           <fieldset id="questionnaireFields" disabled>
 
           <!-- Staff Commendation Section -->
-          {% if staff_members and staff_members|length > 0 %}
+          {% if false %}
           <div class="mb-4 p-4 bg-light rounded-3">
             <div class="d-flex align-items-center mb-3">
               <div class="rounded-circle bg-white shadow-sm p-2 me-3">
@@ -199,6 +199,30 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
                 {{ q.question_type.replace('_', ' ').title() }}
               </span>
             </div>
+
+            {% if (q.target_scope or 'overall') in ['staff', 'manager'] %}
+            <div class="mb-3 p-3 bg-white border rounded-3">
+              <label for="target_{{ q.id }}" class="form-label fw-semibold">
+                Select {{ 'Manager' if q.target_scope == 'manager' else 'Staff Member' }}
+              </label>
+              <select id="target_{{ q.id }}" name="target_{{ q.id }}"
+                      class="form-select person-target-select"
+                      data-preview="targetPhoto_{{ q.id }}" {% if q.is_required %}required{% endif %}>
+                <option value="">Choose a person</option>
+                {% for member in staff_members %}
+                  {% if (q.target_scope == 'manager' and member.role == 'manager') or (q.target_scope == 'staff' and member.role != 'manager') %}
+                  <option value="{{ member.id }}">
+                    {{ member.first_name }} {{ member.last_name }} — {{ member.position or member.role|title }}
+                  </option>
+                  {% endif %}
+                {% endfor %}
+              </select>
+              <div id="targetPhoto_{{ q.id }}" class="mt-3 d-none align-items-center gap-2">
+                <img src="" alt="Selected profile" class="rounded-circle object-fit-cover" style="width:56px;height:56px;" />
+                <span class="small text-muted">Please confirm this is the person who assisted you.</span>
+              </div>
+            </div>
+            {% endif %}
 
             {% if q.question_type == 'rating' %}
             <div class="rating-container mb-3">
@@ -518,5 +542,23 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
       }
     });
   }
+
+  const staffPhotoMap = {{ staff_photo_map|default({})|tojson }};
+  document.querySelectorAll('.person-target-select').forEach(select => {
+    select.addEventListener('change', () => {
+      const preview = document.getElementById(select.dataset.preview);
+      const photo = staffPhotoMap[select.value] || '';
+      const image = preview.querySelector('img');
+      if (photo) {
+        image.src = photo;
+        preview.classList.remove('d-none');
+        preview.classList.add('d-flex');
+      } else {
+        image.src = '';
+        preview.classList.add('d-none');
+        preview.classList.remove('d-flex');
+      }
+    });
+  });
 </script>
 {% endblock %}

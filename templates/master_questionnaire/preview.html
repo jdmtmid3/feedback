@@ -92,65 +92,21 @@
                 </div>
               </div>
 
-              <!-- Staff Commendation Section (Preview) -->
-              <div class="mb-4 p-4 bg-light rounded-3">
-                <div class="d-flex align-items-center mb-3">
-                  <div class="rounded-circle bg-white shadow-sm p-2 me-3">
-                    <i class="bi bi-award text-primary"></i>
-                  </div>
-                  <div>
-                    <h6 class="mb-1 fw-semibold">Staff Commendation (Optional)</h6>
-                    <p class="text-muted small mb-0">
-                      Would you like to rate a staff member who served you?
-                    </p>
-                  </div>
-                </div>
-                
-                <div class="form-group mb-3">
-                  <label for="staff_commendation" class="form-label fw-medium">
-                    Select Staff Member
-                  </label>
-                  <select
-                    id="staff_commendation"
-                    name="staff_commendation"
-                    class="form-select bg-white"
-                    disabled
-                  >
-                    <option value="">No staff commendation</option>
-                    <option value="1">John Doe - Manager</option>
-                    <option value="2">Jane Smith - Cashier</option>
-                  </select>
-                  <div class="form-text">
-                    <i class="bi bi-info-circle me-1"></i>
-                    Choose a staff member to rate their service.
-                  </div>
-                </div>
-
-                <!-- Staff Star Rating (Preview) -->
-                <div class="mb-3">
-                  <label class="form-label fw-medium">Rate this staff member</label>
-                  <div class="commendation-stars d-flex gap-1">
-                    {% for i in range(1, 6) %}
-                    <i class="bi bi-star" style="font-size:1.75rem; color:#d1d5db;"></i>
-                    {% endfor %}
-                  </div>
-                  <div class="form-text mt-1">
-                    <i class="bi bi-info-circle me-1"></i>
-                    Tap a star to rate
-                  </div>
-                </div>
-              </div>
-
               <!-- Questions Section -->
               <div class="vstack gap-4">
-                {% for q in questions %}
+              {% for q in questions %}
                   <div class="mb-3 p-4 bg-light rounded-3">
                     <label class="form-label fw-bold">
                       <span class="badge bg-primary rounded-pill me-2">{{ loop.index }}</span>
                       {{ q.question_text }}
                       {% if q.is_required %}<span class="text-danger ms-1">*</span>{% endif %}
                     </label>
-                    {% if q.question_type == 'rating' %}
+                  {% if (q.target_scope or 'overall') in ['staff', 'manager'] %}
+                    <div class="alert alert-light border py-2 small">
+                      Customer selects a {{ 'manager' if q.target_scope == 'manager' else 'staff member' }} here.
+                    </div>
+                  {% endif %}
+                  {% if q.question_type == 'rating' %}
                       <div class="rating-container mb-3">
                         <div class="star-rating">
                           {% for i in range(1, 6) %}

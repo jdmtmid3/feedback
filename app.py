@@ -410,6 +410,7 @@ def create_app() -> Flask:
                         email VARCHAR(255),
                         phone VARCHAR(20),
                         position VARCHAR(100),
+                        photo_url LONGTEXT,
                         role ENUM('staff', 'manager', 'supervisor') DEFAULT 'staff',
                         hire_date DATE,
                         status ENUM('active', 'inactive') DEFAULT 'active',
@@ -455,6 +456,7 @@ def create_app() -> Flask:
                         questionnaire_id INT NOT NULL,
                         question_text TEXT NOT NULL,
                         question_type ENUM('rating', 'text', 'multiple_choice') NOT NULL,
+                        target_scope ENUM('overall', 'staff', 'manager') DEFAULT 'overall',
                         min_label VARCHAR(255) DEFAULT 'Poor',
                         max_label VARCHAR(255) DEFAULT 'Excellent',
                         allow_comment BOOLEAN DEFAULT FALSE,
@@ -494,6 +496,7 @@ def create_app() -> Flask:
                         id INT AUTO_INCREMENT PRIMARY KEY,
                         response_id INT NOT NULL,
                         question_id INT NOT NULL,
+                        staff_id INT NULL,
                         answer_text TEXT,
                         rating_value DECIMAL(3,1)
                     )
@@ -854,6 +857,24 @@ def create_app() -> Flask:
                     logger.info("Adding 'allow_comment' column to questions table...")
                     cursor.execute("ALTER TABLE questions ADD COLUMN allow_comment BOOLEAN DEFAULT FALSE AFTER max_label")
                     conn.commit()
+
+                cursor.execute("SHOW COLUMNS FROM questions LIKE 'target_scope'")
+                if not cursor.fetchone():
+                    logger.info("Adding question target scope...")
+                    cursor.execute("ALTER TABLE questions ADD COLUMN target_scope ENUM('overall', 'staff', 'manager') DEFAULT 'overall' AFTER question_type")
+                    conn.commit()
+
+                cursor.execute("SHOW COLUMNS FROM staff LIKE 'photo_url'")
+                if not cursor.fetchone():
+                    logger.info("Adding staff profile photo...")
+                    cursor.execute("ALTER TABLE staff ADD COLUMN photo_url LONGTEXT AFTER position")
+                    conn.commit()
+
+                cursor.execute("SHOW COLUMNS FROM answers LIKE 'staff_id'")
+                if not cursor.fetchone():
+                    logger.info("Adding selected staff to questionnaire answers...")
+                    cursor.execute("ALTER TABLE answers ADD COLUMN staff_id INT NULL AFTER question_id")
+                    conn.commit()
                 
                 # Check for stores table columns
                 store_columns = [
@@ -1193,7 +1214,7 @@ def create_app() -> Flask:
             cursor = conn.cursor(dictionary=True)
             cursor.execute(
                 """
-                SELECT id, question_text, question_type, min_label, max_label, allow_comment, is_required, question_order
+                SELECT id, question_text, question_type, target_scope, min_label, max_label, allow_comment, is_required, question_order
                 FROM questions
                 WHERE questionnaire_id = %s AND is_active = TRUE
                 ORDER BY question_order ASC, id ASC
@@ -1571,18 +1592,23 @@ def create_app() -> Flask:
                 (owner['id'], owner.get('license_key'), default_title, default_active, True, default_version, default_logo),
             )
             template_id = int(cursor.lastrowid)
-            if legacy:
-                cursor.execute("""INSERT INTO questions
-                    (questionnaire_id, question_text, question_type, min_label, max_label,
-                     allow_comment, is_required, question_order, is_active, is_template, template_id)
-                    SELECT %s, question_text, question_type, min_label, max_label,
-                           allow_comment, is_required, question_order, is_active, TRUE, id
-                    FROM questions WHERE questionnaire_id = %s""", (template_id, legacy[0]))
-                cursor.execute("""INSERT INTO question_options (question_id, option_text, is_template)
-                    SELECT new_q.id, old_o.option_text, TRUE
-                    FROM questions new_q
-                    INNER JOIN question_options old_o ON old_o.question_id = new_q.template_id
-                    WHERE new_q.questionnaire_id = %s""", (template_id,))
+            # Give every new client a useful editable starting point. A store
+            # still receives no questionnaire until the admin publishes/syncs
+            # this template, so questionnaire license limits remain enforced.
+            cursor.executemany(
+                """INSERT INTO questions
+                   (questionnaire_id, question_text, question_type, target_scope,
+                    min_label, max_label, allow_comment, is_required,
+                    question_order, is_active, is_template)
+                   VALUES (%s, %s, 'rating', %s, 'Poor', 'Excellent', TRUE,
+                           TRUE, %s, TRUE, TRUE)""",
+                [
+                    (template_id, "How would you rate your overall experience and service?", "overall", 1),
+                    (template_id, "How would you rate the manager's service?", "manager", 2),
+                    (template_id, "How would you rate the staff member who assisted you?", "staff", 3),
+                ],
+            )
+            # Existing tenant questionnaires are preserved and never cleared.
         return {"id": template_id, "title": default_title, "is_active": default_active,
                 "version": default_version, "created_at": None, "is_template": True,
                 "owner_user_id": owner['id'], "license_key": owner.get('license_key'), "logo_url": default_logo}
@@ -1710,7 +1736,7 @@ def create_app() -> Flask:
             cursor = conn.cursor(dictionary=True)
             cursor.execute(
                 """
-                SELECT id, question_text, question_type, min_label, max_label, allow_comment, is_required, question_order
+                SELECT id, question_text, question_type, target_scope, min_label, max_label, allow_comment, is_required, question_order
                 FROM questions
                 WHERE questionnaire_id = %s
                 ORDER BY question_order ASC, id ASC
@@ -1756,6 +1782,7 @@ def create_app() -> Flask:
         min_label: str = "Poor",
         max_label: str = "Excellent",
         allow_comment: bool = False,
+        target_scope: str = "overall",
     ) -> int:
         """Add a template question with validation."""
         # Input validation
@@ -1763,6 +1790,8 @@ def create_app() -> Flask:
             raise ValueError("Question text is required")
         if question_type not in ["rating", "text", "multiple_choice"]:
             raise ValueError("Invalid question type")
+        if target_scope not in ["overall", "staff", "manager"]:
+            raise ValueError("Invalid question target")
         if question_order < 0:
             raise ValueError("Question order must be non-negative")
         
@@ -1771,10 +1800,10 @@ def create_app() -> Flask:
             cursor.execute(
                 """
                 INSERT INTO questions
-                (questionnaire_id, question_text, question_type, min_label, max_label, allow_comment, is_required, question_order, is_template)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (questionnaire_id, question_text, question_type, target_scope, min_label, max_label, allow_comment, is_required, question_order, is_template)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (template_questionnaire_id, question_text.strip(), question_type, min_label, max_label, allow_comment, is_required, question_order, True),
+                (template_questionnaire_id, question_text.strip(), question_type, target_scope, min_label, max_label, allow_comment, is_required, question_order, True),
             )
             return int(cursor.lastrowid)
 
@@ -1785,13 +1814,15 @@ def create_app() -> Flask:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM questions WHERE id = %s AND questionnaire_id = %s AND is_template = TRUE", (template_question_id, template['id']))
 
-    def update_template_question(question_id: int, question_text: str, question_type: str, is_required: bool, min_label: str = "Poor", max_label: str = "Excellent", allow_comment: bool = False) -> None:
+    def update_template_question(question_id: int, question_text: str, question_type: str, is_required: bool, min_label: str = "Poor", max_label: str = "Excellent", allow_comment: bool = False, target_scope: str = "overall") -> None:
         """Update a template question with validation."""
         # Input validation
         if not question_text or not question_text.strip():
             raise ValueError("Question text is required")
         if question_type not in ["rating", "text", "multiple_choice"]:
             raise ValueError("Invalid question type")
+        if target_scope not in ["overall", "staff", "manager"]:
+            raise ValueError("Invalid question target")
         
         template = ensure_template_questionnaire()
         with get_db_connection_with_transaction() as conn:
@@ -1799,10 +1830,10 @@ def create_app() -> Flask:
             cursor.execute(
                 """
                 UPDATE questions
-                SET question_text = %s, question_type = %s, is_required = %s, min_label = %s, max_label = %s, allow_comment = %s
+                SET question_text = %s, question_type = %s, target_scope = %s, is_required = %s, min_label = %s, max_label = %s, allow_comment = %s
                 WHERE id = %s AND questionnaire_id = %s AND is_template = TRUE
                 """,
-                (question_text.strip(), question_type, is_required, min_label, max_label, allow_comment, question_id, template['id']),
+                (question_text.strip(), question_type, target_scope, is_required, min_label, max_label, allow_comment, question_id, template['id']),
             )
 
     def add_template_option(template_question_id: int, option_text: str) -> int:
@@ -1900,13 +1931,14 @@ def create_app() -> Flask:
                     cursor.execute(
                         """
                         INSERT INTO questions
-                        (questionnaire_id, question_text, question_type, min_label, max_label, allow_comment, is_required, question_order, is_template, template_id)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        (questionnaire_id, question_text, question_type, target_scope, min_label, max_label, allow_comment, is_required, question_order, is_template, template_id)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             questionnaire_id,
                             tq["question_text"],
                             tq["question_type"],
+                            tq.get("target_scope", "overall"),
                             tq.get("min_label", "Poor"),
                             tq.get("max_label", "Excellent"),
                             bool(tq.get("allow_comment", False)),
@@ -2102,6 +2134,7 @@ def create_app() -> Flask:
         min_label = request.form.get("min_label", "Poor").strip() or "Poor"
         max_label = request.form.get("max_label", "Excellent").strip() or "Excellent"
         allow_comment = request.form.get("allow_comment") == "on"
+        target_scope = request.form.get("target_scope", "overall").strip()
         try:
             question_order = int(request.form.get("question_order", "0"))
         except ValueError:
@@ -2124,6 +2157,7 @@ def create_app() -> Flask:
             min_label=min_label,
             max_label=max_label,
             allow_comment=allow_comment,
+            target_scope=target_scope,
         )
         
         # Log the question addition
@@ -2170,13 +2204,31 @@ def create_app() -> Flask:
         min_label = request.form.get("min_label", "Poor").strip() or "Poor"
         max_label = request.form.get("max_label", "Excellent").strip() or "Excellent"
         allow_comment = request.form.get("allow_comment") == "on"
+        target_scope = request.form.get("target_scope", "overall").strip()
 
         if not question_text:
             flash("Question text is required.", "danger")
             return redirect(url_for("master_questionnaire"))
 
-        update_template_question(master_question_id, question_text, question_type, is_required, min_label, max_label, allow_comment)
+        update_template_question(master_question_id, question_text, question_type, is_required, min_label, max_label, allow_comment, target_scope)
         flash("Question Updated Successfully", "success")
+        return redirect(url_for("master_questionnaire"))
+
+    @app.route("/admin/questionnaire/questions/<int:master_question_id>/target", methods=["POST"])
+    def master_update_question_target(master_question_id: int):
+        target_scope = request.form.get("target_scope", "overall").strip()
+        if target_scope not in {"overall", "staff", "manager"}:
+            flash("Invalid question target.", "danger")
+            return redirect(url_for("master_questionnaire"))
+        template = ensure_template_questionnaire()
+        with get_db_connection_with_transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """UPDATE questions SET target_scope = %s
+                   WHERE id = %s AND questionnaire_id = %s AND is_template = TRUE""",
+                (target_scope, master_question_id, int(template['id'])),
+            )
+        flash("Question target updated. Publish or sync to apply it to stores.", "success")
         return redirect(url_for("master_questionnaire"))
 
     @app.route("/admin/questionnaire/questions/<int:master_question_id>/options/add", methods=["POST"])
@@ -2400,10 +2452,11 @@ def create_app() -> Flask:
                     for template_question in template_questions:
                         cursor.execute(
                             """
-                            INSERT INTO questions (questionnaire_id, question_text, question_type, min_label, max_label, allow_comment, is_required, question_order, is_template, template_id)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            INSERT INTO questions (questionnaire_id, question_text, question_type, target_scope, min_label, max_label, allow_comment, is_required, question_order, is_template, template_id)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             """,
                             (questionnaire_id, template_question["question_text"], template_question["question_type"],
+                             template_question.get("target_scope", "overall"),
                              template_question["min_label"], template_question["max_label"], template_question["allow_comment"],
                              template_question["is_required"], template_question["question_order"], False, int(template_question["id"])),
                         )
@@ -4735,7 +4788,7 @@ def create_app() -> Flask:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
-            SELECT id, first_name, last_name, position, role
+            SELECT id, first_name, last_name, position, role, photo_url
             FROM staff
             WHERE store_id = %s AND status = 'active'
             ORDER BY role DESC, last_name, first_name
@@ -4753,6 +4806,7 @@ def create_app() -> Flask:
             questions=questions,
             options_by_question_id=options_by_question_id,
             staff_members=staff_members,
+            staff_photo_map={str(member['id']): member.get('photo_url') for member in staff_members if member.get('photo_url')},
         )
 
     @app.route("/s/<int:store_id>/submit", methods=["POST"])
@@ -4798,11 +4852,36 @@ def create_app() -> Flask:
         errors: List[str] = []
         answers_to_save: List[Dict[str, Any]] = []
 
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("""SELECT id, role FROM staff
+                              WHERE store_id = %s AND status = 'active'""", (store_id,))
+            eligible_staff = {int(row['id']): row['role'] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
         for q in questions:
             qid = int(q["id"])
             key = f"q_{qid}"
             q_type = q["question_type"]
             is_required = bool(q["is_required"])
+            target_scope = q.get("target_scope") or "overall"
+            target_staff_id = None
+            if target_scope in ("staff", "manager"):
+                raw_target = request.form.get(f"target_{qid}", "").strip()
+                if raw_target.isdigit():
+                    candidate_id = int(raw_target)
+                    candidate_role = eligible_staff.get(candidate_id)
+                    role_matches = (
+                        candidate_role == "manager" if target_scope == "manager"
+                        else candidate_role in ("staff", "supervisor")
+                    )
+                    if role_matches:
+                        target_staff_id = candidate_id
+                if target_staff_id is None and is_required:
+                    errors.append(f"Select a {target_scope}: {q['question_text']}")
+                    continue
 
             if q_type == "rating":
                 raw = request.form.get(key, "").strip()
@@ -4820,7 +4899,7 @@ def create_app() -> Flask:
                     continue
                 comment = request.form.get(f"{key}_comment", "").strip()
                 answers_to_save.append(
-                    {"question_id": qid, "answer_text": comment if comment else None, "rating_value": rating_value}
+                    {"question_id": qid, "staff_id": target_staff_id, "answer_text": comment if comment else None, "rating_value": rating_value}
                 )
 
             elif q_type == "text":
@@ -4830,7 +4909,7 @@ def create_app() -> Flask:
                     if is_required:
                         errors.append(f"Answer required: {q['question_text']}")
                     continue
-                answers_to_save.append({"question_id": qid, "answer_text": text, "rating_value": None})
+                answers_to_save.append({"question_id": qid, "staff_id": target_staff_id, "answer_text": text, "rating_value": None})
 
             elif q_type == "multiple_choice":
                 raw = request.form.get(key, "").strip()
@@ -4857,7 +4936,7 @@ def create_app() -> Flask:
                     continue
 
                 answers_to_save.append(
-                    {"question_id": qid, "answer_text": selected_text, "rating_value": None}
+                    {"question_id": qid, "staff_id": target_staff_id, "answer_text": selected_text, "rating_value": None}
                 )
             else:
                 errors.append(f"Unsupported question type: {q_type}")
@@ -4885,11 +4964,18 @@ def create_app() -> Flask:
             for a in answers_to_save:
                 cursor.execute(
                     """
-                    INSERT INTO answers (response_id, question_id, answer_text, rating_value)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO answers (response_id, question_id, staff_id, answer_text, rating_value)
+                    VALUES (%s, %s, %s, %s, %s)
                     """,
-                    (response_id, a["question_id"], a["answer_text"], a["rating_value"]),
+                    (response_id, a["question_id"], a.get("staff_id"), a["answer_text"], a["rating_value"]),
                 )
+                if a.get("staff_id") and a.get("rating_value") is not None:
+                    cursor.execute(
+                        """INSERT INTO staff_commendations
+                           (response_id, staff_id, rating, commendation_type, comment)
+                           VALUES (%s, %s, %s, 'excellent_service', %s)""",
+                        (response_id, a["staff_id"], int(a["rating_value"]), a.get("answer_text")),
+                    )
 
             # Handle staff commendation if provided
             staff_commendation = request.form.get("staff_commendation", "").strip()
@@ -5714,6 +5800,21 @@ def create_app() -> Flask:
     # STAFF MANAGEMENT
     # -------------------------
 
+    def _uploaded_staff_photo(field_name: str = "photo") -> Optional[str]:
+        photo = request.files.get(field_name)
+        if not photo or not photo.filename:
+            return None
+        if '.' not in photo.filename or photo.filename.rsplit('.', 1)[1].lower() not in {'png', 'jpg', 'jpeg'}:
+            raise ValueError("Staff photo must be a PNG or JPG image.")
+        photo.seek(0, os.SEEK_END)
+        file_size = photo.tell()
+        photo.seek(0)
+        if file_size > 5 * 1024 * 1024:
+            raise ValueError("Staff photo must be 5MB or smaller.")
+        ext = photo.filename.rsplit('.', 1)[1].lower()
+        mime = "image/jpeg" if ext in ('jpg', 'jpeg') else "image/png"
+        return f"data:{mime};base64,{base64.b64encode(photo.read()).decode('utf-8')}"
+
     @app.route("/admin/stores/<int:store_id>/staff")
     def staff_management(store_id: int):
         conn = get_db_connection()
@@ -5750,6 +5851,9 @@ def create_app() -> Flask:
 
     @app.route("/admin/stores/<int:store_id>/staff/add", methods=["POST"])
     def add_staff(store_id: int):
+        if not can_manage_store(session['user_id'], store_id):
+            flash("You don't have permission to manage staff for this store.", "danger")
+            return redirect(url_for("stores_management"))
         first_name = request.form.get("first_name", "").strip()
         last_name = request.form.get("last_name", "").strip()
         email = request.form.get("email", "").strip() or None
@@ -5757,6 +5861,11 @@ def create_app() -> Flask:
         position = request.form.get("position", "").strip() or None
         role = request.form.get("role", "staff")
         hire_date = request.form.get("hire_date", "").strip() or None
+        try:
+            photo_url = _uploaded_staff_photo()
+        except ValueError as exc:
+            flash(str(exc), "danger")
+            return redirect(url_for("staff_management", store_id=store_id))
         
         conn = get_db_connection()
         try:
@@ -5770,9 +5879,9 @@ def create_app() -> Flask:
             
             # Insert new staff member
             cursor.execute("""
-                INSERT INTO staff (store_id, first_name, last_name, email, phone, position, role, hire_date)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (store_id, first_name, last_name, email, phone, position, role, hire_date))
+                INSERT INTO staff (store_id, first_name, last_name, email, phone, position, photo_url, role, hire_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (store_id, first_name, last_name, email, phone, position, photo_url, role, hire_date))
             
             new_staff_id = cursor.lastrowid
             conn.commit()
@@ -5796,6 +5905,9 @@ def create_app() -> Flask:
 
     @app.route("/admin/stores/<int:store_id>/staff/<int:staff_id>/edit", methods=["POST"])
     def edit_staff(store_id: int, staff_id: int):
+        if not can_manage_store(session['user_id'], store_id):
+            flash("You don't have permission to manage staff for this store.", "danger")
+            return redirect(url_for("stores_management"))
         first_name = request.form.get("first_name", "").strip()
         last_name = request.form.get("last_name", "").strip()
         email = request.form.get("email", "").strip() or None
@@ -5804,6 +5916,11 @@ def create_app() -> Flask:
         role = request.form.get("role", "staff")
         status = request.form.get("status", "active")
         hire_date = request.form.get("hire_date", "").strip() or None
+        try:
+            photo_url = _uploaded_staff_photo()
+        except ValueError as exc:
+            flash(str(exc), "danger")
+            return redirect(url_for("staff_management", store_id=store_id))
         
         conn = get_db_connection()
         try:
@@ -5812,10 +5929,10 @@ def create_app() -> Flask:
             # Update staff member
             cursor.execute("""
                 UPDATE staff 
-                SET first_name = %s, last_name = %s, email = %s, phone = %s, 
-                    position = %s, role = %s, status = %s, hire_date = %s
+                SET first_name = %s, last_name = %s, email = %s, phone = %s,
+                    position = %s, photo_url = COALESCE(%s, photo_url), role = %s, status = %s, hire_date = %s
                 WHERE id = %s AND store_id = %s
-            """, (first_name, last_name, email, phone, position, role, status, hire_date, staff_id, store_id))
+            """, (first_name, last_name, email, phone, position, photo_url, role, status, hire_date, staff_id, store_id))
             
             if cursor.rowcount == 0:
                 flash("Staff member not found", "danger")
@@ -5841,6 +5958,9 @@ def create_app() -> Flask:
 
     @app.route("/admin/stores/<int:store_id>/staff/<int:staff_id>/delete", methods=["POST"])
     def delete_staff(store_id: int, staff_id: int):
+        if not can_manage_store(session['user_id'], store_id):
+            flash("You don't have permission to manage staff for this store.", "danger")
+            return redirect(url_for("stores_management"))
         conn = get_db_connection()
         try:
             cursor = conn.cursor()

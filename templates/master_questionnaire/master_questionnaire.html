@@ -183,6 +183,15 @@ PURPOSE: "Master Questionnaire" editor. Allows admins to build the global templa
                 <option value="multiple_choice">🔘 Multiple Choice</option>
               </select>
             </div>
+            <div>
+              <label class="form-label fw-medium" for="target_scope">Who is this question about?</label>
+              <select class="form-select" id="target_scope" name="target_scope" required>
+                <option value="overall">Overall / Service</option>
+                <option value="staff">Staff Member</option>
+                <option value="manager">Manager</option>
+              </select>
+              <small class="text-muted">Staff and Manager questions will ask the customer to select a person.</small>
+            </div>
             <div id="rating-labels-add">
               <div class="row g-2">
                 <div class="col-6">
@@ -276,6 +285,13 @@ PURPOSE: "Master Questionnaire" editor. Allows admins to build the global templa
                             <i class="bi bi-{% if q.question_type == 'rating' %}star{% elif q.question_type == 'text' %}textarea{% else %}circle{% endif %} me-1"></i>
                             {{ q.question_type.replace('_', ' ').title() }}
                           </span>
+                          <form method="POST" action="{{ url_for('master_update_question_target', master_question_id=q.id) }}" class="d-inline">
+                            <select name="target_scope" class="form-select form-select-sm py-0" style="width:auto;font-size:.75rem;" onchange="this.form.submit()" aria-label="Question target">
+                              <option value="overall" {% if (q.target_scope or 'overall') == 'overall' %}selected{% endif %}>Overall / Service</option>
+                              <option value="staff" {% if q.target_scope == 'staff' %}selected{% endif %}>Staff</option>
+                              <option value="manager" {% if q.target_scope == 'manager' %}selected{% endif %}>Manager</option>
+                            </select>
+                          </form>
                           <span class="badge bg-primary bg-opacity-10 text-primary px-2 py-1" style="font-size:.75rem;">
                             <i class="bi bi-check-circle me-1"></i>Published
                           </span>
