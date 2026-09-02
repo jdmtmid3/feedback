@@ -1574,15 +1574,29 @@ def create_app() -> Flask:
             return existing
         with get_db_connection_with_transaction() as conn:
             cursor = conn.cursor()
-            cursor.execute("""SELECT id, title, is_active, version, logo_url
-                              FROM questionnaires
-                              WHERE is_template = TRUE AND owner_user_id IS NULL
-                              ORDER BY id ASC LIMIT 1""")
-            legacy = cursor.fetchone()
-            default_title = legacy[1] if legacy else "Customer Feedback"
-            default_active = bool(legacy[2]) if legacy else True
-            default_version = int(legacy[3] or 1) if legacy else 1
-            default_logo = legacy[4] if legacy else None
+            # An admin receives a detached snapshot of the Dev/Superadmin
+            # starter questionnaire. The copied rows never point back to the
+            # Dev questionnaire, so client edits stay inside their own license.
+            starter = None
+            if owner.get('role') == 'admin':
+                cursor.execute(
+                    """SELECT q.id, q.title, q.is_active, q.version, q.logo_url
+                       FROM questionnaires q
+                       JOIN users u ON u.id = q.owner_user_id
+                       WHERE q.is_template = TRUE AND u.role = 'superadmin'
+                       ORDER BY q.id ASC LIMIT 1"""
+                )
+                starter = cursor.fetchone()
+            if not starter:
+                cursor.execute("""SELECT id, title, is_active, version, logo_url
+                                  FROM questionnaires
+                                  WHERE is_template = TRUE AND owner_user_id IS NULL
+                                  ORDER BY id ASC LIMIT 1""")
+                starter = cursor.fetchone()
+            default_title = starter[1] if starter else "Customer Feedback"
+            default_active = bool(starter[2]) if starter else True
+            default_version = int(starter[3] or 1) if starter else 1
+            default_logo = starter[4] if starter else None
             cursor.execute(
                 """
                 INSERT INTO questionnaires
@@ -1592,22 +1606,60 @@ def create_app() -> Flask:
                 (owner['id'], owner.get('license_key'), default_title, default_active, True, default_version, default_logo),
             )
             template_id = int(cursor.lastrowid)
-            # Give every new client a useful editable starting point. A store
-            # still receives no questionnaire until the admin publishes/syncs
-            # this template, so questionnaire license limits remain enforced.
-            cursor.executemany(
-                """INSERT INTO questions
-                   (questionnaire_id, question_text, question_type, target_scope,
-                    min_label, max_label, allow_comment, is_required,
-                    question_order, is_active, is_template)
-                   VALUES (%s, %s, 'rating', %s, 'Poor', 'Excellent', TRUE,
-                           TRUE, %s, TRUE, TRUE)""",
-                [
-                    (template_id, "How would you rate your overall experience and service?", "overall", 1),
-                    (template_id, "How would you rate the manager's service?", "manager", 2),
-                    (template_id, "How would you rate the staff member who assisted you?", "staff", 3),
-                ],
-            )
+            copied_count = 0
+            if starter:
+                cursor.execute(
+                    """SELECT id, question_text, question_type, target_scope,
+                              min_label, max_label, allow_comment, is_required,
+                              question_order, is_active
+                       FROM questions
+                       WHERE questionnaire_id = %s AND is_template = TRUE
+                       ORDER BY question_order ASC, id ASC LIMIT 5""",
+                    (int(starter[0]),),
+                )
+                for source_question in cursor.fetchall():
+                    cursor.execute(
+                        """INSERT INTO questions
+                           (questionnaire_id, question_text, question_type, target_scope,
+                            min_label, max_label, allow_comment, is_required,
+                            question_order, is_active, is_template, template_id)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, NULL)""",
+                        (template_id, source_question[1], source_question[2], source_question[3] or 'overall',
+                         source_question[4], source_question[5], source_question[6], source_question[7],
+                         source_question[8], source_question[9]),
+                    )
+                    copied_question_id = int(cursor.lastrowid)
+                    cursor.execute(
+                        "SELECT option_text FROM question_options WHERE question_id = %s ORDER BY id ASC",
+                        (int(source_question[0]),),
+                    )
+                    source_options = cursor.fetchall()
+                    if source_options:
+                        cursor.executemany(
+                            "INSERT INTO question_options (question_id, option_text, is_template) VALUES (%s, %s, TRUE)",
+                            [(copied_question_id, option[0]) for option in source_options],
+                        )
+                    copied_count += 1
+
+            fallback_questions = [
+                ("How would you rate your overall experience and service?", "overall"),
+                ("How would you rate the manager's service?", "manager"),
+                ("How would you rate the staff member who assisted you?", "staff"),
+                ("How satisfied are you with the quality you received?", "overall"),
+                ("How likely are you to recommend this store?", "overall"),
+            ]
+            if copied_count < 5:
+                cursor.executemany(
+                    """INSERT INTO questions
+                       (questionnaire_id, question_text, question_type, target_scope,
+                        min_label, max_label, allow_comment, is_required,
+                        question_order, is_active, is_template, template_id)
+                       VALUES (%s, %s, 'rating', %s, 'Poor', 'Excellent', TRUE,
+                               TRUE, %s, TRUE, TRUE, NULL)""",
+                    [(template_id, text, scope, order)
+                     for order, (text, scope) in enumerate(fallback_questions, 1)
+                     if order > copied_count],
+                )
             # Existing tenant questionnaires are preserved and never cleared.
         return {"id": template_id, "title": default_title, "is_active": default_active,
                 "version": default_version, "created_at": None, "is_template": True,
@@ -2059,7 +2111,7 @@ def create_app() -> Flask:
                 # Get questions with single query
                 cursor.execute(
                     """
-                    SELECT q.id, q.question_text, q.question_type, q.min_label, q.max_label, 
+                    SELECT q.id, q.question_text, q.question_type, q.target_scope, q.min_label, q.max_label,
                            q.allow_comment, q.is_required, q.question_order,
                            qo.id as option_id, qo.option_text
                     FROM questions q
@@ -2083,6 +2135,7 @@ def create_app() -> Flask:
                             "id": qid,
                             "question_text": row["question_text"],
                             "question_type": row["question_type"],
+                            "target_scope": row["target_scope"] or "overall",
                             "min_label": row["min_label"],
                             "max_label": row["max_label"],
                             "allow_comment": bool(row["allow_comment"]),
@@ -6034,6 +6087,7 @@ def create_app() -> Flask:
             try:
                 data = request.get_json()
                 new_order = int(data.get("question_order", 0))
+                template = ensure_template_questionnaire()
                 
                 conn = get_db_connection()
                 try:
@@ -6042,11 +6096,13 @@ def create_app() -> Flask:
                         """
                         UPDATE questions 
                         SET question_order = %s 
-                        WHERE id = %s AND is_template = TRUE
+                        WHERE id = %s AND questionnaire_id = %s AND is_template = TRUE
                         """,
-                        (new_order, question_id),
+                        (new_order, question_id, int(template['id'])),
                     )
                     conn.commit()
+                    if cursor.rowcount == 0:
+                        return {"success": False, "error": "Question does not belong to this license"}, 403
                     return {"success": True, "message": "Question order updated"}
                 finally:
                     conn.close()
