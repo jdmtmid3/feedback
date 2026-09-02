@@ -547,9 +547,10 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
     {% if license_expiry_warning %}
     <script>
       (function () {
+        const marquee = document.querySelector('.license-expiry-marquee');
         const countdown = document.querySelector('.license-expiry-countdown');
         if (!countdown) return;
-        const expiresAt = new Date(countdown.dataset.expiresAt).getTime();
+        let expiresAt = new Date(countdown.dataset.expiresAt).getTime();
         function updateLicenseCountdown() {
           const remaining = Math.max(0, expiresAt - Date.now());
           const totalSeconds = Math.floor(remaining / 1000);
@@ -562,6 +563,35 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         }
         updateLicenseCountdown();
         setInterval(updateLicenseCountdown, 1000);
+
+        async function refreshLicenseStatus() {
+          try {
+            const response = await fetch('/api/license/refresh', {
+              headers: { 'Accept': 'application/json' },
+              cache: 'no-store'
+            });
+            if (!response.ok) return;
+            const data = await response.json();
+            if (data.success && !data.show_warning && !data.expired) {
+              marquee?.remove();
+              return;
+            }
+            if (data.success && data.expires_at) {
+              expiresAt = new Date(data.expires_at).getTime();
+              countdown.dataset.expiresAt = data.expires_at;
+              updateLicenseCountdown();
+            }
+            if (data.expired) window.location.reload();
+          } catch (error) {
+            console.warn('Unable to refresh license status:', error);
+          }
+        }
+
+        // Confirm renewal immediately when the page loads, then periodically
+        // while the warning remains visible. The normal server cache still
+        // protects all other requests from excessive portal calls.
+        refreshLicenseStatus();
+        setInterval(refreshLicenseStatus, 5 * 60 * 1000);
       })();
     </script>
     {% endif %}
