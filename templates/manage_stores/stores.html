@@ -524,11 +524,8 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
               {% endif %}
 
               <!-- Spacer pushes button to bottom -->
-              <div class="mt-auto d-flex gap-2" onclick="event.stopPropagation();">
-                <a href="{{ url_for('store_feedback', store_id=store.id) }}" class="btn btn-sm flex-fill store-feedback-btn">
-                  <i class="bi bi-chat-left-text me-1"></i>View Feedback
-                </a>
-                <a href="{{ url_for('store_details', store_id=store.id) }}" class="btn btn-sm flex-fill store-card-btn">
+              <div class="mt-auto" onclick="event.stopPropagation();">
+                <a href="{{ url_for('store_feedback', store_id=store.id) }}" class="btn btn-sm w-100 store-card-btn">
                   <i class="bi bi-shop me-1"></i>View Store
                 </a>
               </div>
@@ -641,11 +638,8 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   {% endif %}
 
                   <!-- Spacer pushes button to bottom -->
-                  <div class="mt-auto d-flex gap-2" onclick="event.stopPropagation();">
-                    <a href="{{ url_for('store_feedback', store_id=store.id) }}" class="btn btn-sm flex-fill store-feedback-btn">
-                      <i class="bi bi-chat-left-text me-1"></i>View Feedback
-                    </a>
-                    <a href="{{ url_for('store_details', store_id=store.id) }}" class="btn btn-sm flex-fill store-card-btn">
+                  <div class="mt-auto" onclick="event.stopPropagation();">
+                    <a href="{{ url_for('store_feedback', store_id=store.id) }}" class="btn btn-sm w-100 store-card-btn">
                       <i class="bi bi-shop me-1"></i>View Store
                     </a>
                   </div>
