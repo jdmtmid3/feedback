@@ -863,6 +863,31 @@ def create_app() -> Flask:
                     logger.info("Adding 'license_key' column to users table...")
                     cursor.execute("ALTER TABLE users ADD COLUMN license_key VARCHAR(255) NULL AFTER max_stores")
                     conn.commit()
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS review_rewards (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        response_id INT NOT NULL UNIQUE,
+                        store_id INT NOT NULL,
+                        owner_user_id INT NOT NULL,
+                        license_key VARCHAR(255),
+                        customer_email VARCHAR(255) NOT NULL,
+                        claim_token VARCHAR(100) NOT NULL UNIQUE,
+                        reward_code VARCHAR(40) UNIQUE,
+                        reward_type VARCHAR(255) NOT NULL,
+                        status ENUM('pending','issued','used') DEFAULT 'pending',
+                        email_sent BOOLEAN DEFAULT FALSE,
+                        email_error TEXT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        issued_at TIMESTAMP NULL,
+                        used_at TIMESTAMP NULL,
+                        FOREIGN KEY (response_id) REFERENCES responses(id) ON DELETE CASCADE,
+                        FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE,
+                        FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE,
+                        INDEX idx_reward_tenant (owner_user_id, license_key, status)
+                    )
+                """)
+                conn.commit()
                 
                 # Check for questionnaires table columns
                 cursor.execute("SHOW COLUMNS FROM questionnaires LIKE 'is_template'")
@@ -990,7 +1015,9 @@ def create_app() -> Flask:
                     ("access_token", "VARCHAR(100) UNIQUE"),
                     ("subdomain", "VARCHAR(100) UNIQUE"),
                     ("user_id", "INT"),
-                    ("license_key", "VARCHAR(255)")
+                    ("license_key", "VARCHAR(255)"),
+                    ("google_review_url", "VARCHAR(1000) NULL"),
+                    ("reward_type", "VARCHAR(255) DEFAULT 'Store Reward or Discount'")
                 ]
                 
                 for column_name, column_type in store_columns:
@@ -1222,7 +1249,8 @@ def create_app() -> Flask:
                 """
                 SELECT id, store_name, address, city, province, postal_code,
                        contact_number, email, store_manager_name, manager_contact,
-                       store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key
+                       store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key,
+                       google_review_url, reward_type
                 FROM stores
                 WHERE id = %s
                 LIMIT 1
@@ -5132,6 +5160,14 @@ def create_app() -> Flask:
                 flash(e, "danger")
             return redirect(url_for("public_survey", store_id=store_id))
 
+        overall_question_ids = {int(q["id"]) for q in questions
+                                if (q.get("target_scope") or "overall") == "overall"}
+        rating_values = [float(a["rating_value"]) for a in answers_to_save
+                         if a.get("rating_value") is not None
+                         and int(a["question_id"]) in overall_question_ids]
+        average_rating = (sum(rating_values) / len(rating_values)) if rating_values else 0
+        reward_claim_token = None
+
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
@@ -5146,6 +5182,18 @@ def create_app() -> Flask:
                 (int(questionnaire["id"]), store_id, user_email, receipt_number, now_ph),
             )
             response_id = int(cursor.lastrowid)
+
+            if (average_rating >= 4 and user_email and store.get("google_review_url")):
+                reward_claim_token = secrets.token_urlsafe(32)
+                cursor.execute(
+                    """INSERT INTO review_rewards
+                       (response_id, store_id, owner_user_id, license_key,
+                        customer_email, claim_token, reward_type, status)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')""",
+                    (response_id, store_id, int(store["user_id"]), store.get("license_key"),
+                     user_email, reward_claim_token,
+                     store.get("reward_type") or "Store Reward or Discount"),
+                )
 
             for a in answers_to_save:
                 cursor.execute(
@@ -5186,14 +5234,152 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
-        return redirect(url_for("survey_thank_you", store_id=store_id))
+        return redirect(url_for("survey_thank_you", store_id=store_id,
+                                claim=reward_claim_token) if reward_claim_token
+                        else url_for("survey_thank_you", store_id=store_id))
 
     @app.route("/s/<int:store_id>/thanks", methods=["GET"])
     def survey_thank_you(store_id: int):
         store = fetch_store_by_id(store_id=store_id)
         if not store:
             return render_template("layout.html", store=None, error="Page not found"), 404
-        return render_template("master_questionnaire/thank_you.html", store=store)
+        claim_token = request.args.get("claim", "").strip()
+        reward = None
+        if claim_token:
+            conn = get_db_connection()
+            try:
+                cursor = conn.cursor(dictionary=True)
+                cursor.execute(
+                    """SELECT id, status, reward_code, reward_type
+                       FROM review_rewards WHERE store_id = %s AND claim_token = %s""",
+                    (store_id, claim_token),
+                )
+                reward = cursor.fetchone()
+            finally:
+                conn.close()
+        return render_template("master_questionnaire/thank_you.html", store=store,
+                               reward=reward, claim_token=claim_token)
+
+    @app.route("/s/<int:store_id>/review-reward/<claim_token>", methods=["POST"])
+    def claim_review_reward(store_id: int, claim_token: str):
+        """Issue one reward code after the customer confirms their Google review."""
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                """SELECT rr.*, s.store_name
+                   FROM review_rewards rr JOIN stores s ON s.id = rr.store_id
+                   WHERE rr.store_id = %s AND rr.claim_token = %s FOR UPDATE""",
+                (store_id, claim_token),
+            )
+            reward = cursor.fetchone()
+            if not reward:
+                return "Invalid or expired reward claim", 404
+            if reward["status"] == "pending":
+                code = "RWD-" + secrets.token_hex(5).upper()
+                cursor.execute(
+                    """UPDATE review_rewards SET reward_code = %s, status = 'issued',
+                       issued_at = NOW() WHERE id = %s AND status = 'pending'""",
+                    (code, int(reward["id"])),
+                )
+                conn.commit()
+                reward["reward_code"] = code
+                reward["status"] = "issued"
+            else:
+                conn.commit()
+        finally:
+            conn.close()
+
+        if reward["status"] == "issued" and not reward.get("email_sent"):
+            message = (f"Thank you for reviewing {reward['store_name']} on Google. "
+                       f"Your unique reward code is {reward['reward_code']}. "
+                       f"Reward: {reward['reward_type']}. Present this code at the store.")
+            success, email_message = email_config.send_feedback_reply(
+                to_email=reward["customer_email"],
+                customer_name=reward["customer_email"].split("@")[0].replace(".", " ").title(),
+                reply_message=message,
+                store_name=reward["store_name"],
+                feedback_summary="Google Review Reward",
+                template_type="appreciation",
+            )
+            conn = get_db_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE review_rewards SET email_sent = %s, email_error = %s WHERE id = %s",
+                    (bool(success), None if success else str(email_message)[:1000], int(reward["id"])),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return redirect(url_for("survey_thank_you", store_id=store_id, claim=claim_token))
+
+    @app.route("/admin/rewards", methods=["GET"])
+    @role_required('admin', 'superadmin')
+    def admin_rewards():
+        user = get_user_by_id(session["user_id"])
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            if user["role"] == "superadmin":
+                cursor.execute("SELECT * FROM stores ORDER BY store_name")
+                stores = cursor.fetchall()
+                cursor.execute("""SELECT rr.*, s.store_name FROM review_rewards rr
+                                  JOIN stores s ON s.id = rr.store_id
+                                  ORDER BY rr.created_at DESC""")
+            else:
+                cursor.execute("SELECT * FROM stores WHERE user_id = %s ORDER BY store_name", (user["id"],))
+                stores = cursor.fetchall()
+                cursor.execute("""SELECT rr.*, s.store_name FROM review_rewards rr
+                                  JOIN stores s ON s.id = rr.store_id
+                                  WHERE rr.owner_user_id = %s AND rr.license_key <=> %s
+                                  ORDER BY rr.created_at DESC""",
+                               (user["id"], user.get("license_key")))
+            rewards = cursor.fetchall()
+        finally:
+            conn.close()
+        return render_template("admin/rewards.html", stores=stores, rewards=rewards)
+
+    @app.route("/admin/stores/<int:store_id>/reward-settings", methods=["POST"])
+    @role_required('admin', 'superadmin')
+    def save_reward_settings(store_id: int):
+        if not can_manage_store(session["user_id"], store_id):
+            flash("You don't have permission to update this store.", "danger")
+            return redirect(url_for("admin_rewards"))
+        google_review_url = request.form.get("google_review_url", "").strip()
+        reward_type = request.form.get("reward_type", "").strip()
+        if google_review_url and not google_review_url.startswith("https://"):
+            flash("Google Review URL must start with https://", "danger")
+            return redirect(url_for("admin_rewards"))
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE stores SET google_review_url = %s, reward_type = %s WHERE id = %s",
+                           (google_review_url or None, reward_type or "Store Reward or Discount", store_id))
+            conn.commit()
+        finally:
+            conn.close()
+        flash("Google Review reward settings saved.", "success")
+        return redirect(url_for("admin_rewards"))
+
+    @app.route("/admin/rewards/<int:reward_id>/use", methods=["POST"])
+    @role_required('admin', 'superadmin')
+    def use_review_reward(reward_id: int):
+        user = get_user_by_id(session["user_id"])
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            if user["role"] == "superadmin":
+                cursor.execute("UPDATE review_rewards SET status='used', used_at=NOW() WHERE id=%s AND status='issued'", (reward_id,))
+            else:
+                cursor.execute("""UPDATE review_rewards SET status='used', used_at=NOW()
+                                  WHERE id=%s AND owner_user_id=%s AND license_key <=> %s AND status='issued'""",
+                               (reward_id, user["id"], user.get("license_key")))
+            conn.commit()
+        finally:
+            conn.close()
+        flash("Reward code marked as used.", "success")
+        return redirect(url_for("admin_rewards"))
 
     @app.route("/admin/stores/add", methods=["POST"])
     @login_required
