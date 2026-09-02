@@ -468,6 +468,30 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
       .flash-message .btn-close:hover {
         opacity: 1;
       }
+
+      .license-expiry-marquee {
+        flex: 0 0 auto;
+        overflow: hidden;
+        color: #7c2d12;
+        background: linear-gradient(90deg, #ffedd5, #fef3c7, #ffedd5);
+        border-bottom: 1px solid #fdba74;
+        padding: .6rem 0;
+      }
+      .license-expiry-track {
+        display: flex;
+        width: max-content;
+        animation: licenseMarquee 24s linear infinite;
+        white-space: nowrap;
+      }
+      .license-expiry-message { padding-right: 5rem; font-weight: 600; }
+      .license-expiry-countdown { font-variant-numeric: tabular-nums; font-weight: 800; }
+      @keyframes licenseMarquee {
+        from { transform: translateX(100vw); }
+        to { transform: translateX(-100%); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .license-expiry-track { animation: none; width: 100%; justify-content: center; }
+      }
     </style>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
     {% block head %}{% endblock %}
@@ -493,6 +517,19 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
       {% endwith %}
     </div>
 
+    {% if license_expiry_warning %}
+    <div class="license-expiry-marquee" role="alert" aria-live="polite">
+      <div class="license-expiry-track">
+        <span class="license-expiry-message">
+          <i class="bi bi-clock-history me-2"></i>
+          Your license expires on {{ license_expiry_warning.expiry_date }}.
+          Time remaining: <span class="license-expiry-countdown" data-expires-at="{{ license_expiry_warning.expires_at }}">Calculating…</span>
+          <a href="{{ url_for('client_support') }}" class="ms-2 text-danger fw-bold">Renew License</a>
+        </span>
+      </div>
+    </div>
+    {% endif %}
+
     <!-- Main Content Area -->
     <main class="container-fluid px-4 py-3" style="flex:1 1 0; min-height:0; overflow-y:auto;">
       {% block content %}{% endblock %}
@@ -506,6 +543,28 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
     {% block scripts %}{% endblock %}
+
+    {% if license_expiry_warning %}
+    <script>
+      (function () {
+        const countdown = document.querySelector('.license-expiry-countdown');
+        if (!countdown) return;
+        const expiresAt = new Date(countdown.dataset.expiresAt).getTime();
+        function updateLicenseCountdown() {
+          const remaining = Math.max(0, expiresAt - Date.now());
+          const totalSeconds = Math.floor(remaining / 1000);
+          const days = Math.floor(totalSeconds / 86400);
+          const hours = Math.floor((totalSeconds % 86400) / 3600);
+          const minutes = Math.floor((totalSeconds % 3600) / 60);
+          const seconds = totalSeconds % 60;
+          countdown.textContent = `${days}d ${hours}h ${minutes}m ${seconds}s`;
+          if (remaining === 0) window.location.reload();
+        }
+        updateLicenseCountdown();
+        setInterval(updateLicenseCountdown, 1000);
+      })();
+    </script>
+    {% endif %}
 
     <!-- Notification System Script -->
     {% if not hide_header %}

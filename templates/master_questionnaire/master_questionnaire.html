@@ -318,7 +318,7 @@ PURPOSE: "Master Questionnaire" editor. Allows admins to build the global templa
                     </div>
                   </div>
 
-                  <div class="modal fade" id="editQuestionModal{{ q.id }}" tabindex="-1" aria-hidden="true">
+                  <div class="modal fade question-edit-modal" id="editQuestionModal{{ q.id }}" tabindex="-1" aria-hidden="true">
                     <div class="modal-dialog modal-lg">
                       <div class="modal-content text-start">
                         <div class="modal-header">
@@ -525,6 +525,13 @@ function toggleCommentVisibility(selectElement, containerId) {
 
 // Add question form - update order field dynamically
 document.addEventListener('DOMContentLoaded', function() {
+    // Bootstrap modals must live directly under <body>. Question cards are
+    // draggable/transformed, which otherwise causes backdrop and position
+    // flicker when an Edit modal opens.
+    document.querySelectorAll('.question-edit-modal').forEach(modal => {
+        if (modal.parentElement !== document.body) document.body.appendChild(modal);
+    });
+
     const questionOrderField = document.getElementById('question_order');
     const questionsContainer = document.getElementById('questions-container');
     const questionTypeSelect = document.getElementById('question_type');
