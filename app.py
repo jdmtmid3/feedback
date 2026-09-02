@@ -221,6 +221,105 @@ def create_app() -> Flask:
             logger.error(f"Unexpected error validating license: {e}")
             return {"valid": False, "error": str(e)}
 
+    license_status_cache: Dict[str, Dict[str, Any]] = {}
+
+    def _parse_license_expiry(data: Dict[str, Any]) -> datetime | None:
+        raw = (data.get("expiry_date") or data.get("expires_at")
+               or data.get("expiration_date") or data.get("expiry"))
+        if not raw:
+            return None
+        try:
+            value = str(raw).strip()
+            date_only = len(value) == 10
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if date_only:
+                parsed = parsed.replace(hour=23, minute=59, second=59)
+            return parsed.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            logger.warning("Unable to parse license expiry value: %r", raw)
+            return None
+
+    def _license_is_expired(data: Dict[str, Any]) -> bool:
+        expiry = _parse_license_expiry(data)
+        if expiry and expiry <= datetime.now(timezone.utc):
+            return True
+        message = str(data.get("message") or data.get("error") or "").lower()
+        return bool(data.get("expired") or "expired" in message)
+
+    def validate_tenant_license(license_key: str, force: bool = False) -> Dict[str, Any]:
+        """Validate one client license at most once per hour per web worker."""
+        if not license_key:
+            return {"valid": False, "error": "No license configured"}
+        cached = license_status_cache.get(license_key)
+        if cached and not force and time.time() - cached["checked_at"] < 3600:
+            return cached["data"]
+        config = get_license_config()
+        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
+        try:
+            import requests as http_requests
+            response = http_requests.post(
+                f"{portal_url}/api/validate/{license_key}",
+                headers=licensing_api_headers(), timeout=10,
+            )
+            data = response.json() if response.content else {}
+            if response.status_code != 200 and not data:
+                data = {"valid": False, "error": f"License API error: {response.status_code}"}
+            license_status_cache[license_key] = {"checked_at": time.time(), "data": data}
+            return data
+        except Exception as exc:
+            logger.error("Unable to validate tenant license %s: %s", license_key[:8], exc)
+            # A temporary portal/network failure must not lock out a client.
+            return cached["data"] if cached else {"valid": None, "error": "License service unavailable"}
+
+    def _user_license_keys_for_access(user: Dict[str, Any]) -> List[str]:
+        if not user or user.get("role") == "superadmin":
+            return []
+        if user.get("role") == "admin":
+            return [user["license_key"]] if user.get("license_key") else []
+        if user.get("role") != "user":
+            return []
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT DISTINCT owner.license_key
+                   FROM user_stores us
+                   JOIN stores s ON s.id = us.store_id
+                   JOIN users owner ON owner.id = s.user_id
+                   WHERE us.user_id = %s AND owner.license_key IS NOT NULL""",
+                (int(user["id"]),),
+            )
+            return [row[0] for row in cursor.fetchall() if row[0]]
+        finally:
+            conn.close()
+
+    def _expired_license_for_user(user: Dict[str, Any]) -> str | None:
+        for key in _user_license_keys_for_access(user):
+            if _license_is_expired(validate_tenant_license(key)):
+                return key
+        return None
+
+    @app.context_processor
+    def inject_license_expiry_warning():
+        if session.get("role") != "admin" or "user_id" not in session:
+            return {}
+        user = get_user_by_id(session["user_id"])
+        if not user or not user.get("license_key"):
+            return {}
+        status = validate_tenant_license(user["license_key"])
+        expiry = _parse_license_expiry(status)
+        if not expiry:
+            return {}
+        seconds_left = int((expiry - datetime.now(timezone.utc)).total_seconds())
+        if seconds_left <= 0 or seconds_left > 30 * 24 * 60 * 60:
+            return {}
+        return {"license_expiry_warning": {
+            "expires_at": expiry.isoformat(),
+            "expiry_date": expiry.strftime("%B %d, %Y"),
+        }}
+
     def check_store_limit() -> bool:
         """Check if the current store count is within the license limit"""
         config = get_license_config()
@@ -348,6 +447,10 @@ def create_app() -> Flask:
                 flash("Your session is no longer active. Please log in again.", "warning")
                 return redirect(url_for('login'))
             session['role'] = current_user['role']
+            if _expired_license_for_user(current_user):
+                session.clear()
+                flash("License Expired. Please Renew your license.", "danger")
+                return redirect(url_for("login"))
 
         if request.method in ('GET', 'HEAD', 'OPTIONS'):
             return None
@@ -2041,6 +2144,9 @@ def create_app() -> Flask:
                 return redirect(url_for("login"))
             
             if verify_password(password, user['password_hash']):
+                if _expired_license_for_user(user):
+                    flash("License Expired. Please Renew your license.", "danger")
+                    return redirect(url_for("login"))
                 session['user_id'] = user['id']
                 session['username'] = user['username']
                 session['role'] = user['role']
