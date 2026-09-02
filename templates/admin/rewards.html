@@ -1,0 +1,47 @@
+{% extends "layout.html" %}
+{% block title %}Google Review Rewards{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-start mb-4">
+  <div><h2 class="page-title mb-1">Google Review Rewards</h2><p class="text-muted mb-0">Configure store rewards and track every unique code.</p></div>
+</div>
+
+<div class="card border-0 shadow-sm mb-4">
+  <div class="card-header bg-white"><h5 class="mb-0">Store Reward Settings</h5></div>
+  <div class="card-body">
+    <div class="row g-3">
+      {% for store in stores %}
+      <div class="col-lg-6">
+        <form method="POST" action="{{ url_for('save_reward_settings', store_id=store.id) }}" class="border rounded-3 p-3 h-100">
+          <h6>{{ store.store_name }}</h6>
+          <label class="form-label small">Google Review URL</label>
+          <input class="form-control mb-2" type="url" name="google_review_url" value="{{ store.google_review_url or '' }}" placeholder="https://g.page/r/.../review">
+          <label class="form-label small">Reward Type</label>
+          <input class="form-control mb-3" name="reward_type" value="{{ store.reward_type or 'Store Reward or Discount' }}" placeholder="Example: 10% Discount">
+          <button class="btn btn-primary btn-sm" type="submit"><i class="bi bi-check-lg me-1"></i>Save Settings</button>
+        </form>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<div class="card border-0 shadow-sm">
+  <div class="card-header bg-white d-flex justify-content-between"><h5 class="mb-0">Reward Codes</h5><span class="badge bg-dark">{{ rewards|length }}</span></div>
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead class="table-light"><tr><th>Code</th><th>Email</th><th>Store</th><th>Reward Type</th><th>Created</th><th>Used</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+      {% for reward in rewards %}
+        <tr>
+          <td class="fw-bold">{{ reward.reward_code or 'Pending review' }}</td>
+          <td>{{ reward.customer_email }}</td><td>{{ reward.store_name }}</td><td>{{ reward.reward_type }}</td>
+          <td>{{ reward.issued_at or reward.created_at }}</td><td>{{ reward.used_at or '—' }}</td>
+          <td><span class="badge bg-{{ 'success' if reward.status == 'issued' else 'secondary' if reward.status == 'used' else 'warning' }}">{{ reward.status|title }}</span>{% if reward.status == 'issued' and not reward.email_sent %}<div class="small text-danger">Email pending/config needed</div>{% endif %}</td>
+          <td>{% if reward.status == 'issued' %}<form method="POST" action="{{ url_for('use_review_reward', reward_id=reward.id) }}" onsubmit="return confirm('Mark this code as used?');"><button class="btn btn-sm btn-outline-success">Mark Used</button></form>{% endif %}</td>
+        </tr>
+      {% else %}<tr><td colspan="8" class="text-center text-muted py-5">No reward codes yet.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
