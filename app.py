@@ -295,9 +295,9 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
-    def _expired_license_for_user(user: Dict[str, Any]) -> str | None:
+    def _expired_license_for_user(user: Dict[str, Any], force: bool = False) -> str | None:
         for key in _user_license_keys_for_access(user):
-            if _license_is_expired(validate_tenant_license(key)):
+            if _license_is_expired(validate_tenant_license(key, force=force)):
                 return key
         return None
 
@@ -2144,7 +2144,7 @@ def create_app() -> Flask:
                 return redirect(url_for("login"))
             
             if verify_password(password, user['password_hash']):
-                if _expired_license_for_user(user):
+                if _expired_license_for_user(user, force=True):
                     flash("License Expired. Please Renew your license.", "danger")
                     return redirect(url_for("login"))
                 session['user_id'] = user['id']
@@ -2163,6 +2163,24 @@ def create_app() -> Flask:
         session.clear()
         flash("You have been logged out.", "info")
         return redirect(url_for("login"))
+
+    @app.route("/api/license/refresh", methods=["GET"])
+    @login_required
+    def api_refresh_license_status():
+        """Bypass the hourly cache so a completed renewal clears immediately."""
+        user = get_user_by_id(session["user_id"])
+        if not user or user.get("role") != "admin" or not user.get("license_key"):
+            return jsonify({"success": False, "error": "No client license connected"}), 403
+        status = validate_tenant_license(user["license_key"], force=True)
+        expiry = _parse_license_expiry(status)
+        seconds_left = int((expiry - datetime.now(timezone.utc)).total_seconds()) if expiry else None
+        return jsonify({
+            "success": True,
+            "expired": _license_is_expired(status),
+            "show_warning": seconds_left is not None and 0 < seconds_left <= 30 * 24 * 60 * 60,
+            "expires_at": expiry.isoformat() if expiry else None,
+            "expiry_date": expiry.strftime("%B %d, %Y") if expiry else None,
+        })
 
     @app.route("/admin/questionnaire", methods=["GET", "POST"])
     @login_required
