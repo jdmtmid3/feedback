@@ -454,35 +454,21 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                 <div class="flex-grow-1 me-2">
                   <h6 class="mb-0 fw-bold">{{ store.store_name }}</h6>
                 </div>
-                <div class="d-flex align-items-center gap-2" onclick="event.stopPropagation();">
-                  <div class="btn-group" role="group" style="position:static;">
-                    <button type="button" class="btn btn-sm p-0 border-0 bg-transparent text-muted" data-bs-toggle="dropdown" aria-expanded="false" style="line-height:1;">
-                      <i class="bi bi-three-dots-vertical"></i>
-                    </button>
-                    <ul class="dropdown-menu dropdown-menu-end shadow" style="min-width:170px;z-index:1080;">
-                      {% if session.get('role') in ('admin', 'superadmin') %}
-                      <li><a class="dropdown-item py-2" href="#" onclick="editStore({{ store.id }})">
-                        <i class="bi bi-pencil me-2"></i>Edit Store
-                      </a></li>
-                      {% endif %}
-                      <li><a class="dropdown-item py-2" href="#" onclick="copyDashboardLink({{ store.id }}, '{{ store.access_token }}', '{{ store.subdomain }}')">
-                        <i class="bi bi-link-45deg me-2"></i>Copy Dashboard Link
-                      </a></li>
-                      <li><a class="dropdown-item py-2" href="#" onclick="copyFeedbackLink({{ store.id }}); return false;">
-                        <i class="bi bi-chat-square-text me-2"></i>Copy Feedback Link
-                      </a></li>
-                      {% if session.get('role') in ('admin', 'superadmin') %}
-                      <li><a class="dropdown-item py-2" href="#" onclick="openViewersModal({{ store.id }}, '{{ store.store_name|e }}')">
-                        <i class="bi bi-eye me-2"></i>Manage Viewers
-                      </a></li>
-                      {% endif %}
-                      {% if session.get('role') in ('admin', 'superadmin') %}
-                      <li><a class="dropdown-item py-2 text-danger" href="#" onclick="deleteStore({{ store.id }})">
-                        <i class="bi bi-trash me-2"></i>Delete Store
-                      </a></li>
-                      {% endif %}
-                    </ul>
-                  </div>
+                <div class="store-card-actions" onclick="event.stopPropagation();">
+                  <button type="button" class="store-action-icon" onclick="copyFeedbackLink({{ store.id }})" title="Copy feedback link" aria-label="Copy feedback link">
+                    <i class="bi bi-link-45deg"></i>
+                  </button>
+                  {% if session.get('role') in ('admin', 'superadmin') %}
+                  <button type="button" class="store-action-icon store-action-danger" onclick="deleteStore({{ store.id }})" title="Delete store" aria-label="Delete store">
+                    <i class="bi bi-trash3"></i>
+                  </button>
+                  <button type="button" class="store-action-icon" onclick="editStore({{ store.id }})" title="Edit store" aria-label="Edit store">
+                    <i class="bi bi-pencil-square"></i>
+                  </button>
+                  <button type="button" class="store-action-icon" onclick='openViewersModal({{ store.id }}, {{ store.store_name|tojson }})' title="Assign viewer/user" aria-label="Assign viewer or user">
+                    <i class="bi bi-person-plus"></i>
+                  </button>
+                  {% endif %}
                 </div>
               </div>
 
@@ -538,9 +524,12 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
               {% endif %}
 
               <!-- Spacer pushes button to bottom -->
-              <div class="mt-auto" onclick="event.stopPropagation();">
-                <a href="{{ url_for('store_feedback', store_id=store.id) }}" class="btn btn-sm w-100 store-card-btn">
+              <div class="mt-auto d-flex gap-2" onclick="event.stopPropagation();">
+                <a href="{{ url_for('store_feedback', store_id=store.id) }}" class="btn btn-sm flex-fill store-feedback-btn">
                   <i class="bi bi-chat-left-text me-1"></i>View Feedback
+                </a>
+                <a href="{{ url_for('store_details', store_id=store.id) }}" class="btn btn-sm flex-fill store-card-btn">
+                  <i class="bi bi-shop me-1"></i>View Store
                 </a>
               </div>
             </div>
@@ -590,35 +579,13 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                     <div class="flex-grow-1 me-2">
                       <h6 class="mb-0 fw-bold">{{ store.store_name }}</h6>
                     </div>
-                    <div class="d-flex align-items-center gap-2" onclick="event.stopPropagation();">
-                      <div class="btn-group" role="group" style="position:static;">
-                        <button type="button" class="btn btn-sm p-0 border-0 bg-transparent text-muted" data-bs-toggle="dropdown" aria-expanded="false" style="line-height:1;">
-                          <i class="bi bi-three-dots-vertical"></i>
-                        </button>
-                        <ul class="dropdown-menu dropdown-menu-end shadow" style="min-width:170px;z-index:1080;">
-                          {% if session.get('role') in ('admin', 'superadmin') %}
-                          <li><a class="dropdown-item py-2" href="#" onclick="editStore({{ store.id }})">
-                            <i class="bi bi-pencil me-2"></i>Edit Store
-                          </a></li>
-                          {% endif %}
-                          <li><a class="dropdown-item py-2" href="#" onclick="copyDashboardLink({{ store.id }}, '{{ store.access_token }}', '{{ store.subdomain }}')">
-                            <i class="bi bi-link-45deg me-2"></i>Copy Dashboard Link
-                          </a></li>
-                          <li><a class="dropdown-item py-2" href="#" onclick="copyFeedbackLink({{ store.id }}); return false;">
-                            <i class="bi bi-chat-square-text me-2"></i>Copy Feedback Link
-                          </a></li>
-                          {% if session.get('role') in ('admin', 'superadmin') %}
-                          <li><a class="dropdown-item py-2" href="#" onclick="openViewersModal({{ store.id }}, '{{ store.store_name|e }}')">
-                            <i class="bi bi-eye me-2"></i>Manage Viewers
-                          </a></li>
-                          {% endif %}
-                          {% if session.get('role') in ('admin', 'superadmin') %}
-                          <li><a class="dropdown-item py-2 text-danger" href="#" onclick="deleteStore({{ store.id }})">
-                            <i class="bi bi-trash me-2"></i>Delete Store
-                          </a></li>
-                          {% endif %}
-                        </ul>
-                      </div>
+                    <div class="store-card-actions" onclick="event.stopPropagation();">
+                      <button type="button" class="store-action-icon" onclick="copyFeedbackLink({{ store.id }})" title="Copy feedback link" aria-label="Copy feedback link"><i class="bi bi-link-45deg"></i></button>
+                      {% if session.get('role') in ('admin', 'superadmin') %}
+                      <button type="button" class="store-action-icon store-action-danger" onclick="deleteStore({{ store.id }})" title="Delete store" aria-label="Delete store"><i class="bi bi-trash3"></i></button>
+                      <button type="button" class="store-action-icon" onclick="editStore({{ store.id }})" title="Edit store" aria-label="Edit store"><i class="bi bi-pencil-square"></i></button>
+                      <button type="button" class="store-action-icon" onclick='openViewersModal({{ store.id }}, {{ store.store_name|tojson }})' title="Assign viewer/user" aria-label="Assign viewer or user"><i class="bi bi-person-plus"></i></button>
+                      {% endif %}
                     </div>
                   </div>
 
@@ -674,9 +641,12 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   {% endif %}
 
                   <!-- Spacer pushes button to bottom -->
-                  <div class="mt-auto" onclick="event.stopPropagation();">
-                    <a href="{{ url_for('store_feedback', store_id=store.id) }}" class="btn btn-sm w-100 store-card-btn">
+                  <div class="mt-auto d-flex gap-2" onclick="event.stopPropagation();">
+                    <a href="{{ url_for('store_feedback', store_id=store.id) }}" class="btn btn-sm flex-fill store-feedback-btn">
                       <i class="bi bi-chat-left-text me-1"></i>View Feedback
+                    </a>
+                    <a href="{{ url_for('store_details', store_id=store.id) }}" class="btn btn-sm flex-fill store-card-btn">
+                      <i class="bi bi-shop me-1"></i>View Store
                     </a>
                   </div>
                 </div>
@@ -740,6 +710,36 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
       </div>
     </div>
   </div>
+
+  <!-- Store action confirmation / success modals -->
+  <div class="modal fade" id="deleteStoreConfirmModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content border-0 shadow-lg">
+        <div class="modal-body p-4 text-center">
+          <div class="store-modal-icon store-modal-icon-danger mx-auto mb-3"><i class="bi bi-trash3"></i></div>
+          <h5 class="fw-bold">Delete Store?</h5>
+          <p class="text-muted mb-4">Are you sure you want to delete <strong id="deleteStoreName">this store</strong>? All associated store data will also be deleted. This cannot be undone.</p>
+          <div class="d-flex gap-2 justify-content-center">
+            <button type="button" class="btn btn-light px-4" data-bs-dismiss="modal">Cancel</button>
+            <button type="button" class="btn btn-danger px-4" id="confirmDeleteStoreButton"><i class="bi bi-trash3 me-1"></i>Delete</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal fade" id="storeActionSuccessModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-sm">
+      <div class="modal-content border-0 shadow-lg">
+        <div class="modal-body p-4 text-center">
+          <div class="store-modal-icon store-modal-icon-success mx-auto mb-3"><i class="bi bi-check-lg"></i></div>
+          <h5 class="fw-bold" id="storeActionSuccessTitle">Success</h5>
+          <p class="text-muted mb-3" id="storeActionSuccessMessage"></p>
+          <button type="button" class="btn btn-dark px-4" data-bs-dismiss="modal">Done</button>
+        </div>
+      </div>
+    </div>
+  </div>
   {% endif %}
 {% endblock %}
 
@@ -776,8 +776,65 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
     background: linear-gradient(90deg, #FF6B35, #E85A2A);
 }
 
+.store-card-actions {
+    display: flex;
+    align-items: center;
+    gap: .25rem;
+    flex-shrink: 0;
+}
+
+.store-action-icon {
+    width: 34px;
+    height: 34px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 0;
+    border-radius: .5rem;
+    background: transparent;
+    color: #111827;
+    font-size: 1.2rem;
+    transition: background-color .2s ease, color .2s ease, transform .2s ease;
+}
+
+.store-action-icon:hover {
+    background: #f1f3f5;
+    color: #FF6B35;
+    transform: translateY(-1px);
+}
+
+.store-action-danger:hover { background: #fff1f2; color: #dc3545; }
+
+.store-feedback-btn {
+    border: 1px solid #111827;
+    color: #111827;
+    background: #fff;
+    border-radius: .5rem;
+    font-weight: 500;
+}
+
+.store-feedback-btn:hover { background: #f3f4f6; color: #111827; }
+
+.store-modal-icon {
+    width: 58px;
+    height: 58px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    font-size: 1.6rem;
+}
+.store-modal-icon-danger { color: #dc3545; background: #fff1f2; }
+.store-modal-icon-success { color: #198754; background: #eaf8f0; }
+
+@media (max-width: 420px) {
+    .store-card-actions { gap: 0; }
+    .store-action-icon { width: 30px; height: 30px; font-size: 1.05rem; }
+}
+
 .store-card-btn {
-    background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 100%);
+    background: #111111;
     color: #fff;
     border: none;
     border-radius: 0.5rem;
@@ -786,10 +843,10 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
 }
 
 .store-card-btn:hover {
-    background: linear-gradient(135deg, #1e40af 0%, #1e3a8a 100%);
+    background: #000000;
     color: #fff;
     transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(30, 64, 175, 0.4);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
 }
 
 /* Enhanced form controls with white background */
@@ -1196,16 +1253,53 @@ function confirmStoreEdit() {
     return confirm(`Save all changes to "${storeName}"? Please confirm before updating the store.`);
 }
 
+let pendingDeleteStoreId = null;
+
+function showStoreActionSuccess(title, message) {
+    const modalEl = document.getElementById('storeActionSuccessModal');
+    if (!modalEl) {
+        showNotification(message, 'success');
+        return;
+    }
+    document.getElementById('storeActionSuccessTitle').textContent = title;
+    document.getElementById('storeActionSuccessMessage').textContent = message;
+    bootstrap.Modal.getOrCreateInstance(modalEl).show();
+}
+
 function deleteStore(storeId) {
     const store = storesData.find(s => s.id == storeId);
     const storeName = store ? store.store_name : 'this store';
-    if (!confirm(`Are you sure you want to delete "${storeName}"? This action cannot be undone.`)) return;
-    const form = document.createElement('form');
-    form.method = 'POST';
-    form.action = `/admin/stores/${storeId}/delete`;
-    document.body.appendChild(form);
-    form.submit();
+    pendingDeleteStoreId = storeId;
+    document.getElementById('deleteStoreName').textContent = `“${storeName}”`;
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('deleteStoreConfirmModal')).show();
 }
+
+document.getElementById('confirmDeleteStoreButton')?.addEventListener('click', async function () {
+    if (!pendingDeleteStoreId) return;
+    const storeId = pendingDeleteStoreId;
+    const button = this;
+    button.disabled = true;
+    button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Deleting…';
+    try {
+        const response = await fetch(`/admin/stores/${storeId}/delete`, {
+            method: 'POST',
+            headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        });
+        if (!response.ok) throw new Error('Delete request failed');
+        bootstrap.Modal.getInstance(document.getElementById('deleteStoreConfirmModal'))?.hide();
+        document.querySelectorAll(`.store-card[data-store-id="${storeId}"]`).forEach(card => card.closest('[class*="col-"]')?.remove());
+        const index = storesData.findIndex(store => store.id == storeId);
+        if (index !== -1) storesData.splice(index, 1);
+        pendingDeleteStoreId = null;
+        setTimeout(() => showStoreActionSuccess('Deleted Successfully', 'The store and its associated data were deleted successfully.'), 250);
+    } catch (error) {
+        console.error(error);
+        showNotification('Unable to delete the store. Please try again.', 'danger');
+    } finally {
+        button.disabled = false;
+        button.innerHTML = '<i class="bi bi-trash3 me-1"></i>Delete';
+    }
+});
 
 function copyDashboardLink(storeId, accessToken, subdomain) {
     if (subdomain) {
@@ -1234,7 +1328,7 @@ function copyDashboardLink(storeId, accessToken, subdomain) {
 function copyFeedbackLink(storeId) {
     const feedbackUrl = window.location.origin + '/s/' + storeId;
     navigator.clipboard.writeText(feedbackUrl).then(() => {
-        showCustomAlert('Feedback link copied! You can now share it with customers.', 'success');
+        showStoreActionSuccess('Copied to Clipboard', 'The feedback link is ready to share with customers.');
     }).catch(() => {
         window.prompt('Copy this feedback link:', feedbackUrl);
     });
