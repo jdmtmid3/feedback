@@ -1628,7 +1628,7 @@ def create_app() -> Flask:
             conn.close()
 
     def get_questionnaire_license_limit(owner: Dict[str, Any]) -> int:
-        """Return the tenant's questionnaire quota; zero means unlimited."""
+        """Return the tenant's licensed question limit; zero means unlimited."""
         if owner.get('role') != 'admin':
             return 0
         license_key = owner.get('license_key')
@@ -1652,49 +1652,44 @@ def create_app() -> Flask:
             logger.error("Unable to validate questionnaire limit: %s", exc)
             raise ValueError("Unable to validate the questionnaire license limit. Please try again.")
 
-    def enforce_questionnaire_limit(owner: Dict[str, Any], candidate_store_ids: List[int]) -> None:
-        """Block only new store questionnaires; updates never consume another slot."""
+    def enforce_questionnaire_limit(owner: Dict[str, Any], _candidate_store_ids: List[int]) -> None:
+        """Ensure the template does not exceed the licensed question count."""
         max_questionnaires = get_questionnaire_license_limit(owner)
-        if max_questionnaires == 0 or not candidate_store_ids:
+        if max_questionnaires == 0:
+            return
+        template = fetch_template_questionnaire(int(owner['id']), owner.get('license_key'))
+        if not template:
             return
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
             cursor.execute(
-                """SELECT COUNT(*) FROM questionnaires
-                   WHERE is_template = FALSE AND owner_user_id = %s AND license_key <=> %s""",
-                (owner['id'], owner.get('license_key')),
+                """SELECT COUNT(*) FROM questions
+                   WHERE questionnaire_id = %s AND is_template = TRUE""",
+                (int(template['id']),),
             )
             current_count = int(cursor.fetchone()[0])
-            placeholders = ",".join(["%s"] * len(candidate_store_ids))
-            cursor.execute(
-                f"""SELECT COUNT(*) FROM stores s
-                    WHERE s.id IN ({placeholders}) AND s.user_id = %s AND s.license_key <=> %s
-                      AND NOT EXISTS (
-                          SELECT 1 FROM questionnaires q
-                          WHERE q.store_id = s.id AND q.is_template = FALSE
-                      )""",
-                tuple(candidate_store_ids) + (owner['id'], owner.get('license_key')),
-            )
-            new_needed = int(cursor.fetchone()[0])
         finally:
             conn.close()
-        if current_count + new_needed > max_questionnaires:
-            remaining = max(0, max_questionnaires - current_count)
+        if current_count > max_questionnaires:
             raise ValueError(
-                f"Questionnaire license limit reached. Your plan allows {max_questionnaires}; "
-                f"you can publish to only {remaining} additional store(s)."
+                f"Question limit exceeded. Your license allows {max_questionnaires} "
+                f"question(s), but this questionnaire currently has {current_count}."
             )
 
     def questionnaire_quota_status(owner: Dict[str, Any]) -> Dict[str, Any]:
         max_questionnaires = get_questionnaire_license_limit(owner)
+        template = fetch_template_questionnaire(int(owner['id']), owner.get('license_key'))
+        if not template:
+            return {"used": 0, "max": max_questionnaires,
+                    "remaining": None if max_questionnaires == 0 else max_questionnaires}
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
             cursor.execute(
-                """SELECT COUNT(*) FROM questionnaires
-                   WHERE is_template = FALSE AND owner_user_id = %s AND license_key <=> %s""",
-                (owner['id'], owner.get('license_key')),
+                """SELECT COUNT(*) FROM questions
+                   WHERE questionnaire_id = %s AND is_template = TRUE""",
+                (int(template['id']),),
             )
             used = int(cursor.fetchone()[0])
         finally:
@@ -2127,6 +2122,19 @@ def create_app() -> Flask:
     def master_add_question():
         template = ensure_template_questionnaire()
         template_id = int(template["id"])
+
+        try:
+            quota = questionnaire_quota_status(_tenant_owner())
+        except ValueError as exc:
+            flash(str(exc), "danger")
+            return redirect(url_for("master_questionnaire"))
+        if quota["max"] and quota["used"] >= quota["max"]:
+            flash(
+                f"Question limit reached. Your license allows up to {quota['max']} questions. "
+                "Edit or delete an existing question before adding another.",
+                "danger",
+            )
+            return redirect(url_for("master_questionnaire"))
 
         question_text = request.form.get("question_text", "").strip()
         question_type = request.form.get("question_type", "").strip()
