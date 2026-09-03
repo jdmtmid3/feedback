@@ -1883,8 +1883,40 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+    @app.context_processor
+    def inject_tenant_ui_branding():
+        """Apply company colors to every authenticated client/admin page."""
+        defaults = {"primary_color": "#FF6B35", "secondary_color": "#B03A14",
+                    "accent_color": "#2563EB", "text_color": "#212529"}
+        user_id = session.get("user_id")
+        if not user_id:
+            return {"ui_branding": defaults}
+        try:
+            user = get_user_by_id(int(user_id))
+            if not user or user.get("role") == "superadmin":
+                return {"ui_branding": defaults}
+            if user.get("role") == "admin":
+                return {"ui_branding": fetch_tenant_branding(int(user["id"]), user.get("license_key"))}
+            conn = get_db_connection()
+            try:
+                cursor = conn.cursor(dictionary=True)
+                cursor.execute(
+                    """SELECT s.user_id, s.license_key FROM user_stores us
+                       JOIN stores s ON s.id = us.store_id
+                       WHERE us.user_id = %s ORDER BY s.id ASC LIMIT 1""",
+                    (int(user["id"]),),
+                )
+                store_owner = cursor.fetchone()
+            finally:
+                conn.close()
+            if store_owner:
+                return {"ui_branding": fetch_tenant_branding(int(store_owner["user_id"]), store_owner.get("license_key"))}
+        except Exception as exc:
+            logger.warning("Unable to load UI branding: %s", exc)
+        return {"ui_branding": defaults}
+
     def get_questionnaire_license_limit(owner: Dict[str, Any]) -> int:
-        """Return the tenant's licensed question limit; zero means unlimited."""
+        """Return licensed *additional* questions; zero means no extra questions."""
         if owner.get('role') != 'admin':
             return 0
         license_key = owner.get('license_key')
@@ -1909,10 +1941,9 @@ def create_app() -> Flask:
             raise ValueError("Unable to validate the questionnaire license limit. Please try again.")
 
     def enforce_questionnaire_limit(owner: Dict[str, Any], _candidate_store_ids: List[int]) -> None:
-        """Ensure the template does not exceed the licensed question count."""
+        """Keep the five starter questions plus the licensed additional allowance."""
         max_questionnaires = get_questionnaire_license_limit(owner)
-        if max_questionnaires == 0:
-            return
+        allowed_total = 5 + max_questionnaires
         template = fetch_template_questionnaire(int(owner['id']), owner.get('license_key'))
         if not template:
             return
@@ -1927,18 +1958,19 @@ def create_app() -> Flask:
             current_count = int(cursor.fetchone()[0])
         finally:
             conn.close()
-        if current_count > max_questionnaires:
+        if current_count > allowed_total:
             raise ValueError(
-                f"Question limit exceeded. Your license allows {max_questionnaires} "
-                f"question(s), but this questionnaire currently has {current_count}."
+                f"Question limit exceeded. Your plan includes 5 starter questions plus "
+                f"{max_questionnaires} additional question(s) ({allowed_total} total)."
             )
 
     def questionnaire_quota_status(owner: Dict[str, Any]) -> Dict[str, Any]:
-        max_questionnaires = get_questionnaire_license_limit(owner)
+        additional_limit = get_questionnaire_license_limit(owner)
+        allowed_total = 5 + additional_limit
         template = fetch_template_questionnaire(int(owner['id']), owner.get('license_key'))
         if not template:
-            return {"used": 0, "max": max_questionnaires,
-                    "remaining": None if max_questionnaires == 0 else max_questionnaires}
+            return {"used": 0, "max": allowed_total, "base": 5,
+                    "additional": additional_limit, "remaining": allowed_total}
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
@@ -1950,8 +1982,8 @@ def create_app() -> Flask:
             used = int(cursor.fetchone()[0])
         finally:
             conn.close()
-        return {"used": used, "max": max_questionnaires,
-                "remaining": None if max_questionnaires == 0 else max(0, max_questionnaires - used)}
+        return {"used": used, "max": allowed_total, "base": 5,
+                "additional": additional_limit, "remaining": max(0, allowed_total - used)}
 
     def update_template_questionnaire(title: str, is_active: bool, updated_at: str | None = None) -> None:
         """Update template questionnaire with validation."""
@@ -2406,9 +2438,10 @@ def create_app() -> Flask:
         except ValueError as exc:
             flash(str(exc), "danger")
             return redirect(url_for("master_questionnaire"))
-        if quota["max"] and quota["used"] >= quota["max"]:
+        if quota["used"] >= quota["max"]:
             flash(
-                f"Question limit reached. Your license allows up to {quota['max']} questions. "
+                f"Question limit reached. Your plan includes 5 starter questions plus "
+                f"{quota['additional']} additional question(s) ({quota['max']} total). "
                 "Edit or delete an existing question before adding another.",
                 "danger",
             )
@@ -4279,6 +4312,32 @@ def create_app() -> Flask:
         except Exception as e:
             logger.error(f"Error sending message to portal: {e}")
             return jsonify({"error": "Failed to send message"}), 500
+
+    @app.route("/api/messages/unread-count")
+    @login_required
+    def api_message_unread_count():
+        """Return the private message unread total for the signed-in account."""
+        user = get_user_by_id(session["user_id"])
+        portal_url = _get_portal_url()
+        try:
+            import requests as http_requests
+            if user.get("role") == "superadmin":
+                resp = http_requests.get(f"{portal_url}/api/conversations", headers=licensing_api_headers(), timeout=5)
+                conversations = resp.json().get("conversations", []) if resp.status_code == 200 else []
+                return jsonify({"success": True, "count": sum(int(c.get("unread_count") or 0) for c in conversations)})
+
+            license_key = _user_license_key(user)
+            contact_email = user.get("email", "") or user.get("username", "")
+            conv_id = _ensure_portal_conversation(_support_identity(user), license_key, contact_email, user.get("username", ""))
+            if not conv_id:
+                return jsonify({"success": True, "count": 0})
+            resp = http_requests.get(f"{portal_url}/api/conversations/{conv_id}/messages", headers=licensing_api_headers(), timeout=5)
+            messages = resp.json().get("messages", []) if resp.status_code == 200 else []
+            unread = sum(1 for m in messages if m.get("sender_type") == "admin" and not bool(m.get("is_read", m.get("seen", False))))
+            return jsonify({"success": True, "count": unread})
+        except Exception as exc:
+            logger.warning("Unable to fetch message unread count: %s", exc)
+            return jsonify({"success": True, "count": 0})
 
     @app.route("/admin/reset-database", methods=["POST"])
     @role_required('superadmin')
