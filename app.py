@@ -5346,9 +5346,7 @@ def create_app() -> Flask:
     def claim_review_reward(store_id: int, claim_token: str):
         """Issue a reward only after uploaded proof passes OCR text validation."""
         review_file = request.files.get("google_review_proof")
-        receipt_file = request.files.get("receipt_proof")
         review_ocr_text = request.form.get("review_ocr_text", "").strip()[:12000]
-        receipt_ocr_text = request.form.get("receipt_ocr_text", "").strip()[:12000]
 
         def validated_image_data(upload):
             if not upload or not upload.filename:
@@ -5361,9 +5359,8 @@ def create_app() -> Flask:
             return f"data:{upload.mimetype};base64,{base64.b64encode(content).decode('ascii')}"
 
         review_proof = validated_image_data(review_file)
-        receipt_proof = validated_image_data(receipt_file)
-        if not review_proof or not receipt_proof:
-            flash("Upload clear Google Review and receipt screenshots (PNG, JPG, or WEBP; maximum 2 MB each).", "danger")
+        if not review_proof:
+            flash("Upload a clear Google Review screenshot (PNG, JPG, or WEBP; maximum 2 MB).", "danger")
             return redirect(url_for("survey_thank_you", store_id=store_id, claim=claim_token))
 
         conn = get_db_connection()
@@ -5381,25 +5378,21 @@ def create_app() -> Flask:
             if not reward:
                 return "Invalid or expired reward claim", 404
             if reward["status"] == "pending":
-                normalized_receipt_ocr = re.sub(r"\D", "", receipt_ocr_text)
-                receipt_matches = reward["receipt_number"] in normalized_receipt_ocr
                 review_text_lower = review_ocr_text.lower()
                 review_matches = ("review" in review_text_lower and
                                   any(term in review_text_lower for term in ("done", "point", "posted", "contribute", "published")))
-                if not (receipt_matches and review_matches):
+                if not review_matches:
                     conn.rollback()
-                    flash("OCR verification failed. Use a clear full screenshot of the completed Google Review and a receipt clearly showing the matching 8-digit SI#.", "danger")
+                    flash("OCR verification failed. Upload a clear full screenshot showing the completed Google Review.", "danger")
                     return redirect(url_for("survey_thank_you", store_id=store_id, claim=claim_token))
 
                 code = "RWD-" + secrets.token_hex(5).upper()
                 cursor.execute(
                     """UPDATE review_rewards SET reward_code = %s, status = 'issued',
-                       google_review_proof = %s, receipt_proof = %s,
-                       review_ocr_text = %s, receipt_ocr_text = %s,
+                       google_review_proof = %s, review_ocr_text = %s,
                        proof_verified_at = NOW(), issued_at = NOW()
                        WHERE id = %s AND status = 'pending'""",
-                    (code, review_proof, receipt_proof, review_ocr_text,
-                     receipt_ocr_text, int(reward["id"])),
+                    (code, review_proof, review_ocr_text, int(reward["id"])),
                 )
                 conn.commit()
                 reward["reward_code"] = code
