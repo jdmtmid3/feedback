@@ -205,6 +205,15 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                 </div>
               </div>
               
+              <div class="col-12">
+                <label for="google_review_mode" class="form-label fw-medium">Google Review Option</label>
+                <select id="google_review_mode" name="google_review_mode" class="form-select">
+                  <option value="review_only">Google Review only — no reward</option>
+                  <option value="reward" selected>Google Review with reward</option>
+                </select>
+                <div class="form-text">This setting is used only when a Google Review Link is provided.</div>
+              </div>
+              
               <div class="col-md-6">
                 <label for="store_manager_name" class="form-label fw-medium">Store Manager Name</label>
                 <input
@@ -357,6 +366,15 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   <i class="bi bi-info-circle me-1"></i>
                   This link appears in the Google Review reward flow for this store.
                 </div>
+              </div>
+              
+              <div class="col-12">
+                <label for="edit_google_review_mode" class="form-label fw-medium">Google Review Option</label>
+                <select id="edit_google_review_mode" name="google_review_mode" class="form-select">
+                  <option value="review_only">Google Review only — no reward</option>
+                  <option value="reward">Google Review with reward</option>
+                </select>
+                <div class="form-text">This setting is used only when a Google Review Link is provided.</div>
               </div>
               
               <div class="col-md-6">
@@ -1230,6 +1248,7 @@ function editStore(storeId) {
     document.getElementById('edit_store_manager_name').value = store.store_manager_name || '';
     document.getElementById('edit_manager_contact').value = store.manager_contact || '';
     document.getElementById('edit_google_review_url').value = store.google_review_url || '';
+    document.getElementById('edit_google_review_mode').value = store.google_review_mode || 'reward';
     
     // Set form action
     document.getElementById('editStoreForm').action = `/admin/stores/${storeId}/edit`;
