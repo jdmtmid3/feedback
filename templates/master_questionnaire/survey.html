@@ -79,17 +79,17 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
                     id="receipt_number"
                     name="receipt_number"
                     class="form-control bg-white"
-                    placeholder="Enter exactly 10 digits"
+                    placeholder="Enter the 8-digit SI# from your receipt"
                     required
-                    pattern="[0-9]{10}"
-                    minlength="10"
-                    maxlength="10"
+                    pattern="[0-9]{8}"
+                    minlength="8"
+                    maxlength="8"
                     autocomplete="off"
-                    title="Enter exactly 10 digits"
+                    title="Enter exactly 8 digits"
                   />
                   <div class="form-text">
                     <i class="bi bi-info-circle me-1"></i>
-                    Enter all 10 digits to unlock the questionnaire. Each Receipt/Transaction Number can only be used once.
+                    Enter the 8-digit SI# printed beside the receipt date and time. It can only be used once across all branches.
                   </div>
                 </div>
               </div>
@@ -116,7 +116,7 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
           </div>
 
           <div id="transactionLockMessage" class="alert alert-warning">
-            <i class="bi bi-lock-fill me-2"></i>Enter a valid 10-digit transaction number before answering.
+            <i class="bi bi-lock-fill me-2"></i>Enter the valid 8-digit SI# from your receipt before answering.
           </div>
           <fieldset id="questionnaireFields" disabled>
 
@@ -451,8 +451,8 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
     const lockMessage = document.getElementById('transactionLockMessage');
     if (!receipt || !fields) return;
     const updateLock = () => {
-      receipt.value = receipt.value.replace(/\D/g, '').slice(0, 10);
-      const unlocked = /^\d{10}$/.test(receipt.value);
+      receipt.value = receipt.value.replace(/\D/g, '').slice(0, 8);
+      const unlocked = /^\d{8}$/.test(receipt.value);
       fields.disabled = !unlocked;
       lockMessage.classList.toggle('d-none', unlocked);
     };

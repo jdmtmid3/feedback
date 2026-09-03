@@ -606,6 +606,16 @@ def create_app() -> Flask:
                     )
                 """)
 
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS global_receipt_usages (
+                        receipt_number VARCHAR(100) NOT NULL PRIMARY KEY,
+                        store_id INT NOT NULL,
+                        response_id INT NULL,
+                        used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_global_receipt_response (response_id)
+                    )
+                """)
+
                 # 6. Answers Table
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS answers (
@@ -891,6 +901,11 @@ def create_app() -> Flask:
                         status ENUM('pending','issued','used') DEFAULT 'pending',
                         email_sent BOOLEAN DEFAULT FALSE,
                         email_error TEXT NULL,
+                        google_review_proof MEDIUMTEXT NULL,
+                        receipt_proof MEDIUMTEXT NULL,
+                        review_ocr_text TEXT NULL,
+                        receipt_ocr_text TEXT NULL,
+                        proof_verified_at TIMESTAMP NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         issued_at TIMESTAMP NULL,
                         used_at TIMESTAMP NULL,
@@ -900,6 +915,18 @@ def create_app() -> Flask:
                         INDEX idx_reward_tenant (owner_user_id, license_key, status)
                     )
                 """)
+                conn.commit()
+
+                for column_name, column_definition in (
+                    ("google_review_proof", "MEDIUMTEXT NULL"),
+                    ("receipt_proof", "MEDIUMTEXT NULL"),
+                    ("review_ocr_text", "TEXT NULL"),
+                    ("receipt_ocr_text", "TEXT NULL"),
+                    ("proof_verified_at", "TIMESTAMP NULL"),
+                ):
+                    cursor.execute(f"SHOW COLUMNS FROM review_rewards LIKE '{column_name}'")
+                    if not cursor.fetchone():
+                        cursor.execute(f"ALTER TABLE review_rewards ADD COLUMN {column_name} {column_definition}")
                 conn.commit()
                 
                 # Check for questionnaires table columns
@@ -1117,6 +1144,17 @@ def create_app() -> Flask:
                     FROM responses
                     WHERE receipt_number IS NOT NULL AND receipt_number <> ''
                     GROUP BY store_id, receipt_number
+                """)
+                conn.commit()
+
+                # Enforce one-time receipt usage across every branch in the system.
+                cursor.execute("""
+                    INSERT IGNORE INTO global_receipt_usages
+                        (receipt_number, store_id, response_id, used_at)
+                    SELECT receipt_number, MIN(store_id), MIN(id), MIN(submitted_at)
+                    FROM responses
+                    WHERE receipt_number IS NOT NULL AND receipt_number <> ''
+                    GROUP BY receipt_number
                 """)
                 conn.commit()
                 
@@ -5071,9 +5109,9 @@ def create_app() -> Flask:
             flash("Receipt/Transaction number is required.", "danger")
             return redirect(url_for("public_survey", store_id=store_id))
         
-        # A questionnaire cannot be submitted without the exact 10-digit transaction code.
-        if not re.fullmatch(r'\d{10}', receipt_number):
-            flash("Receipt/Transaction number must contain exactly 10 digits.", "danger")
+        # The SI/transaction number printed on the receipt is exactly 8 digits.
+        if not re.fullmatch(r'\d{8}', receipt_number):
+            flash("Receipt/Transaction number must contain exactly 8 digits.", "danger")
             return redirect(url_for("public_survey", store_id=store_id))
 
         # Get and validate email
@@ -5200,14 +5238,14 @@ def create_app() -> Flask:
             now_ph = datetime.now(ph_tz).strftime("%Y-%m-%d %H:%M:%S")
             try:
                 cursor.execute(
-                    """INSERT INTO receipt_usages (store_id, receipt_number, used_at)
+                    """INSERT INTO global_receipt_usages (receipt_number, store_id, used_at)
                        VALUES (%s, %s, %s)""",
-                    (store_id, receipt_number, now_ph),
+                    (receipt_number, store_id, now_ph),
                 )
             except mysql.connector.IntegrityError as exc:
                 conn.rollback()
                 if exc.errno == 1062:
-                    flash("This Receipt/Transaction Number can only be used once and has already been submitted.", "danger")
+                    flash("This Receipt/Transaction Number can only be used once across all branches and has already been submitted.", "danger")
                     return redirect(url_for("public_survey", store_id=store_id))
                 raise
             cursor.execute(
@@ -5219,9 +5257,9 @@ def create_app() -> Flask:
             )
             response_id = int(cursor.lastrowid)
             cursor.execute(
-                """UPDATE receipt_usages SET response_id = %s
-                   WHERE store_id = %s AND receipt_number = %s""",
-                (response_id, store_id, receipt_number),
+                """UPDATE global_receipt_usages SET response_id = %s
+                   WHERE receipt_number = %s""",
+                (response_id, receipt_number),
             )
 
             if (average_rating >= 4 and user_email and store.get("google_review_url")):
@@ -5291,8 +5329,11 @@ def create_app() -> Flask:
             try:
                 cursor = conn.cursor(dictionary=True)
                 cursor.execute(
-                    """SELECT id, status, reward_code, reward_type
-                       FROM review_rewards WHERE store_id = %s AND claim_token = %s""",
+                    """SELECT rr.id, rr.status, rr.reward_code, rr.reward_type,
+                              r.receipt_number
+                       FROM review_rewards rr
+                       JOIN responses r ON r.id = rr.response_id
+                       WHERE rr.store_id = %s AND rr.claim_token = %s""",
                     (store_id, claim_token),
                 )
                 reward = cursor.fetchone()
@@ -5303,13 +5344,36 @@ def create_app() -> Flask:
 
     @app.route("/s/<int:store_id>/review-reward/<claim_token>", methods=["POST"])
     def claim_review_reward(store_id: int, claim_token: str):
-        """Issue one reward code after the customer confirms their Google review."""
+        """Issue a reward only after uploaded proof passes OCR text validation."""
+        review_file = request.files.get("google_review_proof")
+        receipt_file = request.files.get("receipt_proof")
+        review_ocr_text = request.form.get("review_ocr_text", "").strip()[:12000]
+        receipt_ocr_text = request.form.get("receipt_ocr_text", "").strip()[:12000]
+
+        def validated_image_data(upload):
+            if not upload or not upload.filename:
+                return None
+            if upload.mimetype not in {"image/jpeg", "image/png", "image/webp"}:
+                return None
+            content = upload.read(2 * 1024 * 1024 + 1)
+            if not content or len(content) > 2 * 1024 * 1024:
+                return None
+            return f"data:{upload.mimetype};base64,{base64.b64encode(content).decode('ascii')}"
+
+        review_proof = validated_image_data(review_file)
+        receipt_proof = validated_image_data(receipt_file)
+        if not review_proof or not receipt_proof:
+            flash("Upload clear Google Review and receipt screenshots (PNG, JPG, or WEBP; maximum 2 MB each).", "danger")
+            return redirect(url_for("survey_thank_you", store_id=store_id, claim=claim_token))
+
         conn = get_db_connection()
         try:
             cursor = conn.cursor(dictionary=True)
             cursor.execute(
-                """SELECT rr.*, s.store_name
-                   FROM review_rewards rr JOIN stores s ON s.id = rr.store_id
+                """SELECT rr.*, s.store_name, r.receipt_number
+                   FROM review_rewards rr
+                   JOIN stores s ON s.id = rr.store_id
+                   JOIN responses r ON r.id = rr.response_id
                    WHERE rr.store_id = %s AND rr.claim_token = %s FOR UPDATE""",
                 (store_id, claim_token),
             )
@@ -5317,11 +5381,27 @@ def create_app() -> Flask:
             if not reward:
                 return "Invalid or expired reward claim", 404
             if reward["status"] == "pending":
+                normalized_receipt_ocr = re.sub(r"\D", "", receipt_ocr_text)
+                receipt_matches = reward["receipt_number"] in normalized_receipt_ocr
+                has_date = bool(re.search(r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})\b", receipt_ocr_text))
+                has_time = bool(re.search(r"\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?\b", receipt_ocr_text, re.I))
+                review_text_lower = review_ocr_text.lower()
+                review_matches = ("review" in review_text_lower and
+                                  any(term in review_text_lower for term in ("done", "point", "posted", "contribute", "published")))
+                if not (receipt_matches and has_date and has_time and review_matches):
+                    conn.rollback()
+                    flash("OCR verification failed. Use a clear full screenshot of the completed Google Review and a receipt showing the matching 8-digit SI#, date, and time.", "danger")
+                    return redirect(url_for("survey_thank_you", store_id=store_id, claim=claim_token))
+
                 code = "RWD-" + secrets.token_hex(5).upper()
                 cursor.execute(
                     """UPDATE review_rewards SET reward_code = %s, status = 'issued',
-                       issued_at = NOW() WHERE id = %s AND status = 'pending'""",
-                    (code, int(reward["id"])),
+                       google_review_proof = %s, receipt_proof = %s,
+                       review_ocr_text = %s, receipt_ocr_text = %s,
+                       proof_verified_at = NOW(), issued_at = NOW()
+                       WHERE id = %s AND status = 'pending'""",
+                    (code, review_proof, receipt_proof, review_ocr_text,
+                     receipt_ocr_text, int(reward["id"])),
                 )
                 conn.commit()
                 reward["reward_code"] = code
