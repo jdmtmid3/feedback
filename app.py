@@ -5207,7 +5207,7 @@ def create_app() -> Flask:
             except mysql.connector.IntegrityError as exc:
                 conn.rollback()
                 if exc.errno == 1062:
-                    flash("This Receipt/Transaction Number has already been used for this store.", "danger")
+                    flash("This Receipt/Transaction Number can only be used once and has already been submitted.", "danger")
                     return redirect(url_for("public_survey", store_id=store_id))
                 raise
             cursor.execute(
@@ -5334,7 +5334,8 @@ def create_app() -> Flask:
         if reward["status"] == "issued" and not reward.get("email_sent"):
             message = (f"Thank you for reviewing {reward['store_name']} on Google. "
                        f"Your unique reward code is {reward['reward_code']}. "
-                       f"Reward: {reward['reward_type']}. Present this code at the store.")
+                       f"Reward: {reward['reward_type']}. Bring your original receipt and a screenshot "
+                       f"of this code to the store for verification. This code can only be redeemed once.")
             success, email_message = email_config.send_feedback_reply(
                 to_email=reward["customer_email"],
                 customer_name=reward["customer_email"].split("@")[0].replace(".", " ").title(),
@@ -5353,7 +5354,7 @@ def create_app() -> Flask:
                 conn.commit()
             finally:
                 conn.close()
-        return redirect(url_for("survey_thank_you", store_id=store_id, claim=claim_token))
+        return redirect(url_for("survey_thank_you", store_id=store_id, claim=claim_token, issued=1))
 
     @app.route("/admin/rewards", methods=["GET"])
     @role_required('admin', 'superadmin')
