@@ -157,6 +157,12 @@
         <div class="sidebar-header">
             <h2>Messages</h2>
             <p>Conversations from licensing portal</p>
+            <input id="conversation-search" class="form-control form-control-sm mt-3" type="search" placeholder="Search name or email…" aria-label="Search conversations">
+            <select id="conversation-filter" class="form-select form-select-sm mt-2" aria-label="Filter conversations">
+                <option value="all">All conversations</option>
+                <option value="unseen">Unseen only</option>
+                <option value="seen">Seen only</option>
+            </select>
         </div>
         <div class="conversation-list" id="conversation-list">
             {% if conversations %}
@@ -165,6 +171,7 @@
                      data-conversation-id="{{ conv.id }}"
                      data-company-name="{{ conv.company_name }}"
                      data-contact-email="{{ conv.contact_email }}"
+                     data-unread-count="{{ conv.unread_count or 0 }}"
                      onclick="selectConversation({{ conv.id }}, this)">
                     <div class="conversation-top">
                         <span class="conversation-company">{{ conv.company_name or 'Unknown' }}</span>
@@ -223,6 +230,19 @@
 
 <script>
 let currentConversationId = {% if conversations %}{{ conversations[0].id }}{% else %}null{% endif %};
+
+function filterConversations() {
+    const query = (document.getElementById('conversation-search')?.value || '').trim().toLowerCase();
+    const filter = document.getElementById('conversation-filter')?.value || 'all';
+    document.querySelectorAll('.conversation-item').forEach(item => {
+        const haystack = `${item.dataset.companyName || ''} ${item.dataset.contactEmail || ''}`.toLowerCase();
+        const unread = Number(item.dataset.unreadCount || 0) > 0;
+        const statusMatch = filter === 'all' || (filter === 'unseen' && unread) || (filter === 'seen' && !unread);
+        item.classList.toggle('d-none', !haystack.includes(query) || !statusMatch);
+    });
+}
+document.getElementById('conversation-search')?.addEventListener('input', filterConversations);
+document.getElementById('conversation-filter')?.addEventListener('change', filterConversations);
 
 function selectConversation(conversationId, element) {
     currentConversationId = conversationId;
