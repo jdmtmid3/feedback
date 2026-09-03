@@ -257,7 +257,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
         <div class="modal-body">
-          <form method="POST" id="editStoreForm" onsubmit="return confirmStoreEdit();">
+          <form method="POST" id="editStoreForm" enctype="multipart/form-data" onsubmit="return confirmStoreEdit();">
             <div class="row g-3">
               <div class="col-md-6">
                 <label for="edit_store_name" class="form-label fw-medium">Store Name *</label>
@@ -396,6 +396,12 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   class="form-control"
                   placeholder="e.g. (555) 987-6543"
                 />
+              </div>
+
+              <div class="col-12">
+                <label for="edit_logo" class="form-label fw-medium">Replace Store Logo</label>
+                <input type="file" id="edit_logo" name="logo" class="form-control" accept="image/png,image/jpeg" />
+                <div class="form-text">Optional. Leave blank to keep the current logo. PNG/JPG, maximum 5 MB.</div>
               </div>
               
             </div>
