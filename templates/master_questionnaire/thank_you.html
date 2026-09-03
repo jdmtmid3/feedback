@@ -38,7 +38,7 @@ PURPOSE: The "Success Page". Customers see this after submitting the survey.
               <div class="text-start border rounded-3 p-3 mb-2 bg-light">
                 <label class="form-label fw-semibold" for="receiptProof">2. Receipt screenshot</label>
                 <input class="form-control" type="file" id="receiptProof" name="receipt_proof" accept="image/png,image/jpeg,image/webp" required>
-                <div class="form-text" id="receiptStatus">The image must show SI# <strong>{{ reward.receipt_number }}</strong>, including its date and time.</div>
+                <div class="form-text" id="receiptStatus">The image must clearly show SI# <strong>{{ reward.receipt_number }}</strong>.</div>
               </div>
               <input type="hidden" id="reviewOcrText" name="review_ocr_text">
               <input type="hidden" id="receiptOcrText" name="receipt_ocr_text">
@@ -142,10 +142,8 @@ PURPOSE: The "Success Page". Customers see this after submitting the survey.
           receiptOcrText.value = text;
           const digits = text.replace(/\D/g, '');
           const hasReceipt = digits.includes(expectedReceipt);
-          const hasDate = /\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})\b/.test(text);
-          const hasTime = /\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?\b/i.test(text);
-          receiptVerified = hasReceipt && hasDate && hasTime;
-          statusElement.textContent = receiptVerified ? 'Matching SI#, date, and time recognized.' : 'Receipt must clearly show the matching 8-digit SI#, date, and time.';
+          receiptVerified = hasReceipt;
+          statusElement.textContent = receiptVerified ? 'Matching 8-digit SI# recognized.' : 'Receipt must clearly show the matching 8-digit SI#.';
         }
         const okay = kind === 'review' ? reviewVerified : receiptVerified;
         statusElement.className = `form-text ${okay ? 'text-success' : 'text-danger'}`;
