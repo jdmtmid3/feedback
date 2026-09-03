@@ -36,7 +36,12 @@
         {% else %}
         <div class="form-control text-muted mb-3">Add the link under Stores → Edit Store</div>
         {% endif %}
-        <label class="form-label small fw-semibold" for="reward_type_{{ store.id }}">Reward Type</label>
+        <label class="form-label small fw-semibold" for="google_review_mode_{{ store.id }}">Google Review Option</label>
+        <select class="form-select mb-3" id="google_review_mode_{{ store.id }}" name="google_review_mode">
+          <option value="review_only" {{ 'selected' if store.google_review_mode == 'review_only' else '' }}>Google Review only — no reward</option>
+          <option value="reward" {{ 'selected' if store.google_review_mode != 'review_only' else '' }}>Google Review with reward</option>
+        </select>
+        <label class="form-label small fw-semibold" for="reward_type_{{ store.id }}">Reward Type <span class="text-muted fw-normal">(reward mode only)</span></label>
         <input class="form-control mb-3" id="reward_type_{{ store.id }}" name="reward_type" value="{{ store.reward_type or 'Store Reward or Discount' }}" placeholder="Example: 10% Discount">
         <button class="btn btn-primary btn-sm" type="submit"><i class="bi bi-check-lg me-1"></i>Save Reward</button>
       </form>

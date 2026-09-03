@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS stores (
     logo_url VARCHAR(500),
     access_token VARCHAR(100) UNIQUE,
     subdomain VARCHAR(100) UNIQUE,
+    google_review_url VARCHAR(1000) NULL,
+    reward_type VARCHAR(255) DEFAULT 'Store Reward or Discount',
+    google_review_mode ENUM('review_only', 'reward') DEFAULT 'reward',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_stores_user_id (user_id),
     CONSTRAINT fk_stores_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL

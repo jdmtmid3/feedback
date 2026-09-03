@@ -499,6 +499,9 @@ def create_app() -> Flask:
                         logo_url VARCHAR(500),
                         access_token VARCHAR(100) UNIQUE,
                         subdomain VARCHAR(100) UNIQUE,
+                        google_review_url VARCHAR(1000) NULL,
+                        reward_type VARCHAR(255) DEFAULT 'Store Reward or Discount',
+                        google_review_mode ENUM('review_only', 'reward') DEFAULT 'reward',
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -1057,7 +1060,8 @@ def create_app() -> Flask:
                     ("user_id", "INT"),
                     ("license_key", "VARCHAR(255)"),
                     ("google_review_url", "VARCHAR(1000) NULL"),
-                    ("reward_type", "VARCHAR(255) DEFAULT 'Store Reward or Discount'")
+                    ("reward_type", "VARCHAR(255) DEFAULT 'Store Reward or Discount'"),
+                    ("google_review_mode", "ENUM('review_only', 'reward') DEFAULT 'reward'")
                 ]
                 
                 for column_name, column_type in store_columns:
@@ -1264,7 +1268,7 @@ def create_app() -> Flask:
                     SELECT id, store_name, address, city, province, postal_code,
                            contact_number, email, store_manager_name, manager_contact,
                            store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key,
-                           google_review_url, reward_type
+                           google_review_url, reward_type, google_review_mode
                     FROM stores
                     WHERE id IN ({placeholders})
                     ORDER BY id ASC
@@ -1279,7 +1283,7 @@ def create_app() -> Flask:
                     SELECT id, store_name, address, city, province, postal_code,
                            contact_number, email, store_manager_name, manager_contact,
                            store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key,
-                           google_review_url, reward_type
+                           google_review_url, reward_type, google_review_mode
                     FROM stores
                     WHERE user_id = %s
                     ORDER BY id ASC
@@ -1294,7 +1298,7 @@ def create_app() -> Flask:
                     SELECT id, store_name, address, city, province, postal_code,
                            contact_number, email, store_manager_name, manager_contact,
                            store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key,
-                           google_review_url, reward_type
+                           google_review_url, reward_type, google_review_mode
                     FROM stores
                     ORDER BY id ASC
                     """
@@ -1315,7 +1319,7 @@ def create_app() -> Flask:
                 SELECT id, store_name, address, city, province, postal_code,
                        contact_number, email, store_manager_name, manager_contact,
                        store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key,
-                       google_review_url, reward_type
+                       google_review_url, reward_type, google_review_mode
                 FROM stores
                 WHERE id = %s
                 LIMIT 1
@@ -1343,6 +1347,7 @@ def create_app() -> Flask:
         logo_url: str | None = None,
         subdomain: str | None = None,
         google_review_url: str | None = None,
+        google_review_mode: str = "reward",
         user_id: int | None = None,
         license_key: str | None = None
     ) -> int:
@@ -1354,6 +1359,8 @@ def create_app() -> Flask:
             raise ValueError("Invalid status value")
         if email and "@" not in email:
             raise ValueError("Invalid email format")
+        if google_review_mode not in {"review_only", "reward"}:
+            google_review_mode = "reward"
         
         import secrets
         import re
@@ -1371,14 +1378,14 @@ def create_app() -> Flask:
                 INSERT INTO stores (
                     store_name, address, city, province, postal_code,
                     contact_number, email, store_manager_name, manager_contact,
-                    store_type, status, logo_url, access_token, subdomain, google_review_url, user_id, license_key
+                    store_type, status, logo_url, access_token, subdomain, google_review_url, google_review_mode, user_id, license_key
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     store_name.strip(), address, city, province, postal_code,
                     contact_number, email, store_manager_name, manager_contact,
-                    store_type, status, logo_url, access_token, subdomain, google_review_url, user_id, license_key
+                    store_type, status, logo_url, access_token, subdomain, google_review_url, google_review_mode, user_id, license_key
                 ),
             )
             new_store_id = int(cursor.lastrowid)
@@ -5266,7 +5273,8 @@ def create_app() -> Flask:
                 (response_id, receipt_number),
             )
 
-            if (average_rating >= 4 and user_email and store.get("google_review_url")):
+            show_google_review = average_rating >= 4 and bool(store.get("google_review_url"))
+            if (show_google_review and store.get("google_review_mode") == "reward" and user_email):
                 reward_claim_token = secrets.token_urlsafe(32)
                 cursor.execute(
                     """INSERT INTO review_rewards
@@ -5317,9 +5325,11 @@ def create_app() -> Flask:
         finally:
             conn.close()
 
+        if reward_claim_token:
+            return redirect(url_for("survey_thank_you", store_id=store_id,
+                                    claim=reward_claim_token, review=1))
         return redirect(url_for("survey_thank_you", store_id=store_id,
-                                claim=reward_claim_token) if reward_claim_token
-                        else url_for("survey_thank_you", store_id=store_id))
+                                review=1 if show_google_review else None))
 
     @app.route("/s/<int:store_id>/thanks", methods=["GET"])
     def survey_thank_you(store_id: int):
@@ -5343,8 +5353,10 @@ def create_app() -> Flask:
                 reward = cursor.fetchone()
             finally:
                 conn.close()
+        show_google_review = request.args.get("review") == "1" and bool(store.get("google_review_url"))
         return render_template("master_questionnaire/thank_you.html", store=store,
-                               reward=reward, claim_token=claim_token)
+                               reward=reward, claim_token=claim_token,
+                               show_google_review=show_google_review)
 
     @app.route("/s/<int:store_id>/review-reward/<claim_token>", methods=["POST"])
     def claim_review_reward(store_id: int, claim_token: str):
@@ -5510,15 +5522,18 @@ def create_app() -> Flask:
             flash("You don't have permission to update this store.", "danger")
             return redirect(url_for("admin_rewards"))
         reward_type = request.form.get("reward_type", "").strip()
+        google_review_mode = request.form.get("google_review_mode", "reward").strip()
+        if google_review_mode not in {"review_only", "reward"}:
+            google_review_mode = "reward"
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute("UPDATE stores SET reward_type = %s WHERE id = %s",
-                           (reward_type or "Store Reward or Discount", store_id))
+            cursor.execute("UPDATE stores SET reward_type = %s, google_review_mode = %s WHERE id = %s",
+                           (reward_type or "Store Reward or Discount", google_review_mode, store_id))
             conn.commit()
         finally:
             conn.close()
-        flash("Reward type saved.", "success")
+        flash("Google Review option saved.", "success")
         return redirect(url_for("admin_rewards"))
 
     @app.route("/admin/rewards/<int:reward_id>/use", methods=["POST"])
@@ -5555,6 +5570,9 @@ def create_app() -> Flask:
         store_type = request.form.get("store_type", "").strip()
         status = request.form.get("status", "active")
         google_review_url = request.form.get("google_review_url", "").strip()
+        google_review_mode = request.form.get("google_review_mode", "reward").strip()
+        if google_review_mode not in {"review_only", "reward"}:
+            google_review_mode = "reward"
 
         if not store_name:
             flash("Store name is required.", "danger")
@@ -5660,6 +5678,7 @@ def create_app() -> Flask:
             status=status,
             logo_url=logo_url,
             google_review_url=google_review_url or None,
+            google_review_mode=google_review_mode,
             user_id=session.get('user_id'),
             license_key=user.get('license_key')
         )
@@ -5691,7 +5710,8 @@ def create_app() -> Flask:
         manager_contact: str | None,
         status: str,
         logo_url: str | None = None,
-        google_review_url: str | None = None
+        google_review_url: str | None = None,
+        google_review_mode: str = "reward"
     ) -> bool:
         conn = get_db_connection()
         try:
@@ -5702,7 +5722,8 @@ def create_app() -> Flask:
                 SET store_name = %s, store_type = %s, address = %s, city = %s,
                     province = %s, postal_code = %s, contact_number = %s,
                     email = %s, store_manager_name = %s, manager_contact = %s,
-                    status = %s, logo_url = COALESCE(%s, logo_url), google_review_url = %s
+                    status = %s, logo_url = COALESCE(%s, logo_url), google_review_url = %s,
+                    google_review_mode = %s
                 WHERE id = %s
                 """,
                 (
@@ -5719,6 +5740,7 @@ def create_app() -> Flask:
                     status,
                     logo_url,
                     google_review_url,
+                    google_review_mode,
                     store_id,
                 ),
             )
@@ -5793,6 +5815,9 @@ def create_app() -> Flask:
         manager_contact = request.form.get("manager_contact", "").strip() or None
         status = request.form.get("status", "active")
         google_review_url = request.form.get("google_review_url", "").strip()
+        google_review_mode = request.form.get("google_review_mode", "reward").strip()
+        if google_review_mode not in {"review_only", "reward"}:
+            google_review_mode = "reward"
 
         if not store_name:
             flash("Store name is required.", "danger")
@@ -5839,7 +5864,8 @@ def create_app() -> Flask:
             manager_contact=manager_contact,
             status=status,
             logo_url=logo_url,
-            google_review_url=google_review_url or None
+            google_review_url=google_review_url or None,
+            google_review_mode=google_review_mode
         )
 
         if success:
