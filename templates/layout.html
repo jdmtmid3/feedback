@@ -517,7 +517,7 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
       {% endwith %}
     </div>
 
-    {% if license_expiry_warning %}
+    {% if license_expiry_warning and not hide_header %}
     <div class="license-expiry-marquee" role="alert" aria-live="polite">
       <div class="license-expiry-track">
         <span class="license-expiry-message">
@@ -544,7 +544,7 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
     <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
     {% block scripts %}{% endblock %}
 
-    {% if license_expiry_warning %}
+    {% if license_expiry_warning and not hide_header %}
     <script>
       (function () {
         const marquee = document.querySelector('.license-expiry-marquee');
