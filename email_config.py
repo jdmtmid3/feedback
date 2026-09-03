@@ -12,6 +12,7 @@ class EmailConfig:
             self.init_app(app)
     
     def init_app(self, app):
+        self.app = app
         # Email configuration
         # Switch to Gmail SSL (Port 465) as Port 587 is being blocked by Railway
         app.config['MAIL_SERVER'] = os.getenv('MAIL_SERVER', 'smtp.gmail.com')
@@ -37,50 +38,21 @@ class EmailConfig:
     
     def send_feedback_reply(self, to_email, customer_name, reply_message, store_name, feedback_summary, 
                           template_type='standard', cc_emails=None, bcc_emails=None, attachments=None):
-        """Send reply email to customer using SendGrid API (or Resend/SMTP as backup)."""
-        sendgrid_api_key = os.getenv('SENDGRID_API_KEY')
-        resend_api_key = os.getenv('RESEND_API_KEY')
-        
-        if sendgrid_api_key:
-            return self._send_via_sendgrid(sendgrid_api_key, to_email, customer_name, reply_message, store_name, feedback_summary, template_type)
-        elif resend_api_key:
-            return self._send_via_resend(resend_api_key, to_email, customer_name, reply_message, store_name, feedback_summary, template_type)
-        
-        return self._send_via_smtp(to_email, customer_name, reply_message, store_name, feedback_summary, template_type, cc_emails, bcc_emails, attachments)
+        """Send through Resend only when outbound email is explicitly enabled.
 
-    def _send_via_sendgrid(self, api_key, to_email, customer_name, reply_message, store_name, feedback_summary, template_type):
-        """Send email via SendGrid API (HTTPS - bypasses Railway port blocks)"""
-        from sendgrid import SendGridAPIClient
-        from sendgrid.helpers.mail import Mail as SGMail
-        import logging
-        logger = logging.getLogger(__name__)
-        
-        try:
-            html_content = self._get_email_template(template_type, customer_name, store_name, feedback_summary, reply_message)
-            
-            message = SGMail(
-                from_email=os.getenv('MAIL_DEFAULT_SENDER', 'Feedback System <onboarding@resend.dev>'),
-                to_emails=to_email,
-                subject=f"Response to your feedback for {store_name}",
-                html_content=html_content
-            )
-            
-            # Explicitly set Reply-To to encourage engagement and avoid spam filters
-            message.reply_to = os.getenv('MAIL_DEFAULT_SENDER')
-            
-            sg = SendGridAPIClient(api_key)
-            response = sg.send(message)
-            
-            if response.status_code in [200, 201, 202]:
-                logger.info(f"Email sent via SendGrid API to {to_email}")
-                return True, "Email sent successfully via SendGrid API."
-            else:
-                logger.error(f"SendGrid API error: Status {response.status_code}")
-                return False, f"SendGrid API Error: Status {response.status_code}"
-                
-        except Exception as e:
-            logger.error(f"SendGrid API unexpected error: {str(e)}")
-            return False, f"SendGrid API connection failed: {str(e)}"
+        Keep email disabled until a verified sending domain is available. To
+        enable later, set EMAIL_SENDING_ENABLED=true together with a Resend API
+        key and a sender address on that verified domain.
+        """
+        email_enabled = os.getenv('EMAIL_SENDING_ENABLED', 'false').lower() == 'true'
+        if not email_enabled:
+            return False, "Email sending is temporarily disabled until the sending domain is verified."
+
+        resend_api_key = os.getenv('RESEND_API_KEY')
+        if resend_api_key:
+            return self._send_via_resend(resend_api_key, to_email, customer_name, reply_message, store_name, feedback_summary, template_type)
+
+        return False, "Resend is not configured. Add RESEND_API_KEY before enabling email sending."
 
     def _send_via_resend(self, api_key, to_email, customer_name, reply_message, store_name, feedback_summary, template_type):
         """Send email via Resend API (HTTPS - bypasses Railway port blocks)"""

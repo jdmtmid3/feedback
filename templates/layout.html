@@ -22,6 +22,10 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
       :root {
+        --tenant-primary: {{ ui_branding.primary_color|default('#FF6B35') }};
+        --tenant-secondary: {{ ui_branding.secondary_color|default('#B03A14') }};
+        --tenant-accent: {{ ui_branding.accent_color|default('#2563EB') }};
+        --tenant-text: {{ ui_branding.text_color|default('#212529') }};
         /* Primary Colors - Black Theme */
         --primary-50: #f8f9fa;
         --primary-100: #e9ecef;
@@ -40,7 +44,7 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         --accent-200: #FFCC99;
         --accent-300: #FFB366;
         --accent-400: #FF9933;
-        --accent-500: #FF6B35;
+        --accent-500: var(--tenant-primary);
         --accent-600: #E85A2A;
         --accent-700: #CC4A1F;
         --accent-800: #B03A14;
@@ -59,7 +63,7 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         --yellow-900: #942A09;
 
         /* Header Color - Orange */
-        --header-color: #FF6B35;
+        --header-color: var(--tenant-primary);
 
         /* Background Color - Light Grey */
         --bg-color: #F5F5F5;
@@ -81,7 +85,7 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
 
       body {
         background-color: var(--bg-color);
-        color: var(--neutral-900);
+        color: var(--tenant-text);
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
           "Helvetica Neue", Arial, sans-serif;
         font-size: 0.9375rem;
@@ -92,6 +96,12 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         height: 100vh;
         overflow: hidden;
       }
+
+      .btn-primary, .badge-primary { background-color: var(--tenant-primary) !important; border-color: var(--tenant-primary) !important; }
+      .bg-primary { background-color: var(--tenant-primary) !important; }
+      .text-primary { color: var(--tenant-primary) !important; }
+      .btn-outline-primary { color: var(--tenant-primary) !important; border-color: var(--tenant-primary) !important; }
+      .btn-outline-primary:hover { color: #fff !important; background-color: var(--tenant-primary) !important; }
 
       h1 { font-size: 1.5625rem; font-weight: 700; }
       h2 { font-size: 1.3125rem; font-weight: 700; }

@@ -527,7 +527,11 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
         <div class="modal-body">
-          <form method="POST" id="editStoreForm">
+          <form method="POST" id="editStoreForm" enctype="multipart/form-data">
+            <input type="hidden" name="store_manager_name" value="{{ store.store_manager_name or '' }}">
+            <input type="hidden" name="manager_contact" value="{{ store.manager_contact or '' }}">
+            <input type="hidden" name="google_review_url" value="{{ store.google_review_url or '' }}">
+            <input type="hidden" name="google_review_mode" value="{{ store.google_review_mode or 'reward' }}">
             <div class="row g-3">
               <div class="col-md-6">
                 <label for="edit_store_name" class="form-label fw-medium">Store Name *</label>
@@ -554,6 +558,11 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
               <div class="col-md-4">
                 <label for="edit_city" class="form-label fw-medium">City</label>
                 <input type="text" id="edit_city" name="city" class="form-control" value="{{ store.city or '' }}" />
+              </div>
+              <div class="col-12">
+                <label for="edit_logo" class="form-label fw-medium">Replace Store Logo</label>
+                <input type="file" id="edit_logo" name="logo" class="form-control" accept="image/png,image/jpeg">
+                <div class="form-text">Optional. Leave blank to keep the current logo. PNG/JPG, maximum 5 MB.</div>
               </div>
               <div class="col-md-4">
                 <label for="edit_province" class="form-label fw-medium">Province/State</label>

@@ -89,9 +89,9 @@ PURPOSE: "Master Questionnaire" editor. Allows admins to build the global templa
           <div class="border rounded-3 p-3 mt-3 bg-white">
             <div class="d-flex justify-content-between align-items-center">
               <span class="small fw-semibold">Question Limit</span>
-              <span class="badge bg-primary">{{ questionnaire_quota.used }} / {{ questionnaire_quota.max if questionnaire_quota.max else 'Unlimited' }}</span>
+              <span class="badge bg-primary">{{ questionnaire_quota.used }} / {{ questionnaire_quota.max }}</span>
             </div>
-            {% if questionnaire_quota.remaining is not none %}<small class="text-muted">{{ questionnaire_quota.remaining }} question slot(s) remaining.</small>{% endif %}
+            <small class="text-muted">5 starter + {{ questionnaire_quota.additional }} licensed additional. {{ questionnaire_quota.remaining }} slot(s) remaining.</small>
           </div>
           {% elif questionnaire_quota_error %}
           <div class="alert alert-danger py-2 small mt-3 mb-0">{{ questionnaire_quota_error }}</div>

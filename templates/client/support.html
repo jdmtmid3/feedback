@@ -1,16 +1,13 @@
 {% extends "layout.html" %}
-{% block title %}{% if user.role == 'user' %}Messages{% else %}Support{% endif %} · Feedback Admin{% endblock %}
+{% block title %}Messages · Feedback Admin{% endblock %}
 {% block content %}
-<div class="mb-4"><h2 class="page-title mb-1">{% if user.role == 'user' %}Private Messages{% else %}Support Center{% endif %}</h2><p class="page-subtitle mb-0">{% if user.role == 'user' %}Message the support team privately. Other viewers cannot see this conversation.{% else %}Manage your license, tickets, and messages.{% endif %}</p></div>
+<div class="mb-4"><h2 class="page-title mb-1">Messages</h2><p class="page-subtitle mb-0">Private conversation with the support team. Other users cannot see this thread.</p></div>
 <div class="row g-4">
   {% if user.role == 'admin' %}
   <div class="col-12 col-xl-4">
     <div class="card border-0 shadow-sm mb-4"><div class="card-body p-4">
       <h5><i class="bi bi-key-fill me-2 text-warning"></i>License</h5>
-      {% if user.role == 'admin' %}<form method="POST" action="{{ url_for('client_save_license_config') }}" class="mt-3">
-        <label class="form-label" for="license_key">License key</label><input class="form-control" id="license_key" name="license_key" value="{{ license_key }}" required>
-        <button class="btn btn-primary w-100 mt-3" type="submit">Save and Validate</button>
-      </form>{% endif %}
+      <p class="text-muted small mt-3 mb-0">Your license is securely assigned to this account. The key is hidden.</p>
       <div id="license-status" class="alert alert-secondary mt-3 mb-0">Checking license status…</div>
     </div></div>
     <div class="card border-0 shadow-sm"><div class="card-body p-4">
