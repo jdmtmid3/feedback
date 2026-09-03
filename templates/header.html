@@ -1,5 +1,5 @@
 <!-- Top Navigation Header -->
-<header class="border-bottom shadow-sm" style="position: sticky; top: 0; z-index: 1030; background: linear-gradient(135deg, #FF6B35 0%, #B03A14 100%);">
+<header class="border-bottom shadow-sm" style="position: sticky; top: 0; z-index: 1030; background: linear-gradient(135deg, var(--tenant-primary) 0%, var(--tenant-secondary) 100%);">
   <div class="container-fluid px-4">
     <div class="d-flex justify-content-between align-items-center py-3">
       <div class="d-flex align-items-center flex-grow-1 min-width-0">
@@ -39,14 +39,11 @@
           <a href="{{ url_for('admin_users') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'admin_users' %}active{% endif %}">
             <i class="bi bi-people me-2" style="color: white !important;"></i>Users
           </a>
-          <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
-          <a href="{{ url_for('admin_messages') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'admin_messages' %}active{% endif %}">
-            <i class="bi bi-chat-dots me-2" style="color: white !important;"></i>Messages
-          </a>
           {% endif %}
           <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
-          <a href="{{ url_for('client_support') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'client_support' %}active{% endif %}">
-            <i class="bi bi-{% if session.get('role') == 'user' %}chat-dots{% else %}headset{% endif %} me-2" style="color: white !important;"></i>{% if session.get('role') == 'user' %}Messages{% else %}Support{% endif %}
+          <a href="{{ url_for('admin_messages') if session.get('role') == 'superadmin' else url_for('client_support') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap position-relative {% if request.endpoint in ('admin_messages', 'client_support') %}active{% endif %}">
+            <i class="bi bi-chat-dots me-2" style="color: white !important;"></i>Messages
+            <span id="message-count-badge" class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger d-none">0</span>
           </a>
           {% if session.get('username') %}
           <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
@@ -126,3 +123,19 @@
       </div>
     </div>
   </header>
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const badge = document.getElementById('message-count-badge');
+  const refreshMessageCount = async () => {
+    try {
+      const response = await fetch('/api/messages/unread-count', {headers:{Accept:'application/json'}});
+      const data = await response.json();
+      const count = Number(data.count || 0);
+      badge.textContent = count > 99 ? '99+' : count;
+      badge.classList.toggle('d-none', count < 1);
+    } catch (_) { badge.classList.add('d-none'); }
+  };
+  refreshMessageCount();
+  setInterval(refreshMessageCount, 30000);
+});
+</script>
