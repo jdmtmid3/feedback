@@ -5383,14 +5383,12 @@ def create_app() -> Flask:
             if reward["status"] == "pending":
                 normalized_receipt_ocr = re.sub(r"\D", "", receipt_ocr_text)
                 receipt_matches = reward["receipt_number"] in normalized_receipt_ocr
-                has_date = bool(re.search(r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})\b", receipt_ocr_text))
-                has_time = bool(re.search(r"\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?\b", receipt_ocr_text, re.I))
                 review_text_lower = review_ocr_text.lower()
                 review_matches = ("review" in review_text_lower and
                                   any(term in review_text_lower for term in ("done", "point", "posted", "contribute", "published")))
-                if not (receipt_matches and has_date and has_time and review_matches):
+                if not (receipt_matches and review_matches):
                     conn.rollback()
-                    flash("OCR verification failed. Use a clear full screenshot of the completed Google Review and a receipt showing the matching 8-digit SI#, date, and time.", "danger")
+                    flash("OCR verification failed. Use a clear full screenshot of the completed Google Review and a receipt clearly showing the matching 8-digit SI#.", "danger")
                     return redirect(url_for("survey_thank_you", store_id=store_id, claim=claim_token))
 
                 code = "RWD-" + secrets.token_hex(5).upper()
