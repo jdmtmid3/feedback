@@ -593,6 +593,19 @@ def create_app() -> Flask:
                     )
                 """)
 
+                # Track transaction numbers separately so each receipt can only
+                # be used once per store, even across browsers or simultaneous requests.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS receipt_usages (
+                        store_id INT NOT NULL,
+                        receipt_number VARCHAR(100) NOT NULL,
+                        response_id INT NULL,
+                        used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (store_id, receipt_number),
+                        INDEX idx_receipt_usage_response (response_id)
+                    )
+                """)
+
                 # 6. Answers Table
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS answers (
@@ -1095,6 +1108,17 @@ def create_app() -> Flask:
                     logger.info("Adding 'receipt_number' column to responses table...")
                     cursor.execute("ALTER TABLE responses ADD COLUMN receipt_number VARCHAR(100) AFTER user_email")
                     conn.commit()
+
+                # Reserve receipts already used before one-time enforcement was added.
+                cursor.execute("""
+                    INSERT IGNORE INTO receipt_usages
+                        (store_id, receipt_number, response_id, used_at)
+                    SELECT store_id, receipt_number, MIN(id), MIN(submitted_at)
+                    FROM responses
+                    WHERE receipt_number IS NOT NULL AND receipt_number <> ''
+                    GROUP BY store_id, receipt_number
+                """)
+                conn.commit()
                 
                 # Add rating column to staff_commendations if missing
                 cursor.execute("SHOW COLUMNS FROM staff_commendations LIKE 'rating'")
@@ -5174,6 +5198,18 @@ def create_app() -> Flask:
             # Use Philippine time (UTC+08:00)
             ph_tz = timezone(timedelta(hours=8))
             now_ph = datetime.now(ph_tz).strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                cursor.execute(
+                    """INSERT INTO receipt_usages (store_id, receipt_number, used_at)
+                       VALUES (%s, %s, %s)""",
+                    (store_id, receipt_number, now_ph),
+                )
+            except mysql.connector.IntegrityError as exc:
+                conn.rollback()
+                if exc.errno == 1062:
+                    flash("This Receipt/Transaction Number has already been used for this store.", "danger")
+                    return redirect(url_for("public_survey", store_id=store_id))
+                raise
             cursor.execute(
                 """
                 INSERT INTO responses (questionnaire_id, store_id, user_email, receipt_number, submitted_at)
@@ -5182,6 +5218,11 @@ def create_app() -> Flask:
                 (int(questionnaire["id"]), store_id, user_email, receipt_number, now_ph),
             )
             response_id = int(cursor.lastrowid)
+            cursor.execute(
+                """UPDATE receipt_usages SET response_id = %s
+                   WHERE store_id = %s AND receipt_number = %s""",
+                (response_id, store_id, receipt_number),
+            )
 
             if (average_rating >= 4 and user_email and store.get("google_review_url")):
                 reward_claim_token = secrets.token_urlsafe(32)
