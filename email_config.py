@@ -12,6 +12,7 @@ class EmailConfig:
             self.init_app(app)
     
     def init_app(self, app):
+        self.app = app
         # Email configuration
         # Switch to Gmail SSL (Port 465) as Port 587 is being blocked by Railway
         app.config['MAIL_SERVER'] = os.getenv('MAIL_SERVER', 'smtp.gmail.com')
@@ -46,6 +47,9 @@ class EmailConfig:
         elif resend_api_key:
             return self._send_via_resend(resend_api_key, to_email, customer_name, reply_message, store_name, feedback_summary, template_type)
         
+        if not self.app.config.get('MAIL_USERNAME') or not self.app.config.get('MAIL_PASSWORD'):
+            return False, ("Email service is not configured. Add SENDGRID_API_KEY and a verified "
+                           "MAIL_DEFAULT_SENDER in Railway, then redeploy.")
         return self._send_via_smtp(to_email, customer_name, reply_message, store_name, feedback_summary, template_type, cc_emails, bcc_emails, attachments)
 
     def _send_via_sendgrid(self, api_key, to_email, customer_name, reply_message, store_name, feedback_summary, template_type):
@@ -80,7 +84,12 @@ class EmailConfig:
                 
         except Exception as e:
             logger.error(f"SendGrid API unexpected error: {str(e)}")
-            return False, f"SendGrid API connection failed: {str(e)}"
+            status_code = getattr(e, 'status_code', None)
+            if status_code == 403:
+                return False, "SendGrid rejected the sender. Verify the Single Sender email or authenticate your domain."
+            if status_code == 401:
+                return False, "SendGrid API key is invalid or does not have Mail Send permission."
+            return False, "SendGrid could not send the email. Check the verified sender and API key in Railway."
 
     def _send_via_resend(self, api_key, to_email, customer_name, reply_message, store_name, feedback_summary, template_type):
         """Send email via Resend API (HTTPS - bypasses Railway port blocks)"""
