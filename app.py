@@ -1263,7 +1263,8 @@ def create_app() -> Flask:
                     f"""
                     SELECT id, store_name, address, city, province, postal_code,
                            contact_number, email, store_manager_name, manager_contact,
-                           store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key
+                           store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key,
+                           google_review_url, reward_type
                     FROM stores
                     WHERE id IN ({placeholders})
                     ORDER BY id ASC
@@ -1277,7 +1278,8 @@ def create_app() -> Flask:
                     """
                     SELECT id, store_name, address, city, province, postal_code,
                            contact_number, email, store_manager_name, manager_contact,
-                           store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key
+                           store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key,
+                           google_review_url, reward_type
                     FROM stores
                     WHERE user_id = %s
                     ORDER BY id ASC
@@ -1291,7 +1293,8 @@ def create_app() -> Flask:
                     """
                     SELECT id, store_name, address, city, province, postal_code,
                            contact_number, email, store_manager_name, manager_contact,
-                           store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key
+                           store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key,
+                           google_review_url, reward_type
                     FROM stores
                     ORDER BY id ASC
                     """
@@ -1339,6 +1342,7 @@ def create_app() -> Flask:
         status: str = "active",
         logo_url: str | None = None,
         subdomain: str | None = None,
+        google_review_url: str | None = None,
         user_id: int | None = None,
         license_key: str | None = None
     ) -> int:
@@ -1367,14 +1371,14 @@ def create_app() -> Flask:
                 INSERT INTO stores (
                     store_name, address, city, province, postal_code,
                     contact_number, email, store_manager_name, manager_contact,
-                    store_type, status, logo_url, access_token, subdomain, user_id, license_key
+                    store_type, status, logo_url, access_token, subdomain, google_review_url, user_id, license_key
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     store_name.strip(), address, city, province, postal_code,
                     contact_number, email, store_manager_name, manager_contact,
-                    store_type, status, logo_url, access_token, subdomain, user_id, license_key
+                    store_type, status, logo_url, access_token, subdomain, google_review_url, user_id, license_key
                 ),
             )
             new_store_id = int(cursor.lastrowid)
@@ -5431,27 +5435,73 @@ def create_app() -> Flask:
     @role_required('admin', 'superadmin')
     def admin_rewards():
         user = get_user_by_id(session["user_id"])
+        search = request.args.get("search", "").strip()[:100]
+        status_filter = request.args.get("status", "").strip().lower()
+        store_filter = request.args.get("store", "").strip()
+        try:
+            per_page = int(request.args.get("per_page", 20))
+        except (TypeError, ValueError):
+            per_page = 20
+        if per_page not in (20, 50, 100):
+            per_page = 20
+        try:
+            page = max(1, int(request.args.get("page", 1)))
+        except (TypeError, ValueError):
+            page = 1
+
         conn = get_db_connection()
         try:
             cursor = conn.cursor(dictionary=True)
             if user["role"] == "superadmin":
                 cursor.execute("SELECT * FROM stores ORDER BY store_name")
                 stores = cursor.fetchall()
-                cursor.execute("""SELECT rr.*, s.store_name FROM review_rewards rr
-                                  JOIN stores s ON s.id = rr.store_id
-                                  ORDER BY rr.created_at DESC""")
+                scope_sql = "1 = 1"
+                scope_params = []
             else:
                 cursor.execute("SELECT * FROM stores WHERE user_id = %s ORDER BY store_name", (user["id"],))
                 stores = cursor.fetchall()
-                cursor.execute("""SELECT rr.*, s.store_name FROM review_rewards rr
-                                  JOIN stores s ON s.id = rr.store_id
-                                  WHERE rr.owner_user_id = %s AND rr.license_key <=> %s
-                                  ORDER BY rr.created_at DESC""",
-                               (user["id"], user.get("license_key")))
+                scope_sql = "rr.owner_user_id = %s AND rr.license_key <=> %s"
+                scope_params = [user["id"], user.get("license_key")]
+
+            filters = [scope_sql]
+            params = list(scope_params)
+            if search:
+                term = f"%{search}%"
+                filters.append("(rr.reward_code LIKE %s OR rr.customer_email LIKE %s OR s.store_name LIKE %s OR rr.reward_type LIKE %s)")
+                params.extend([term, term, term, term])
+            if status_filter in {"pending", "issued", "used"}:
+                filters.append("rr.status = %s")
+                params.append(status_filter)
+            if store_filter.isdigit():
+                filters.append("rr.store_id = %s")
+                params.append(int(store_filter))
+
+            where_sql = " AND ".join(filters)
+            cursor.execute(f"""SELECT COUNT(*) AS total
+                               FROM review_rewards rr
+                               JOIN stores s ON s.id = rr.store_id
+                               WHERE {where_sql}""", tuple(params))
+            total_rewards = int(cursor.fetchone()["total"])
+            total_pages = max(1, (total_rewards + per_page - 1) // per_page)
+            page = min(page, total_pages)
+            start_page = max(1, page - 2)
+            end_page = min(total_pages, page + 2)
+            offset = (page - 1) * per_page
+            cursor.execute(f"""SELECT rr.*, s.store_name, s.google_review_url
+                               FROM review_rewards rr
+                               JOIN stores s ON s.id = rr.store_id
+                               WHERE {where_sql}
+                               ORDER BY rr.created_at DESC
+                               LIMIT %s OFFSET %s""", tuple(params + [per_page, offset]))
             rewards = cursor.fetchall()
         finally:
             conn.close()
-        return render_template("admin/rewards.html", stores=stores, rewards=rewards)
+        return render_template(
+            "admin/rewards.html", stores=stores, rewards=rewards,
+            search=search, status_filter=status_filter, store_filter=store_filter,
+            per_page=per_page, page=page, total_pages=total_pages,
+            total_rewards=total_rewards, start_page=start_page, end_page=end_page,
+        )
 
     @app.route("/admin/stores/<int:store_id>/reward-settings", methods=["POST"])
     @role_required('admin', 'superadmin')
@@ -5459,20 +5509,16 @@ def create_app() -> Flask:
         if not can_manage_store(session["user_id"], store_id):
             flash("You don't have permission to update this store.", "danger")
             return redirect(url_for("admin_rewards"))
-        google_review_url = request.form.get("google_review_url", "").strip()
         reward_type = request.form.get("reward_type", "").strip()
-        if google_review_url and not google_review_url.startswith("https://"):
-            flash("Google Review URL must start with https://", "danger")
-            return redirect(url_for("admin_rewards"))
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute("UPDATE stores SET google_review_url = %s, reward_type = %s WHERE id = %s",
-                           (google_review_url or None, reward_type or "Store Reward or Discount", store_id))
+            cursor.execute("UPDATE stores SET reward_type = %s WHERE id = %s",
+                           (reward_type or "Store Reward or Discount", store_id))
             conn.commit()
         finally:
             conn.close()
-        flash("Google Review reward settings saved.", "success")
+        flash("Reward type saved.", "success")
         return redirect(url_for("admin_rewards"))
 
     @app.route("/admin/rewards/<int:reward_id>/use", methods=["POST"])
@@ -5508,7 +5554,7 @@ def create_app() -> Flask:
         manager_contact = request.form.get("manager_contact", "").strip()
         store_type = request.form.get("store_type", "").strip()
         status = request.form.get("status", "active")
-        subdomain = request.form.get("subdomain", "").strip()
+        google_review_url = request.form.get("google_review_url", "").strip()
 
         if not store_name:
             flash("Store name is required.", "danger")
@@ -5517,6 +5563,9 @@ def create_app() -> Flask:
         # Basic email validation if provided
         if email and ("@" not in email or "." not in email.split("@")[1]):
             flash("Please enter a valid email address.", "danger")
+            return redirect(url_for("stores_management"))
+        if google_review_url and not google_review_url.startswith("https://"):
+            flash("Google Review Link must start with https://", "danger")
             return redirect(url_for("stores_management"))
 
         # Check store limit based on user role and membership
@@ -5610,7 +5659,7 @@ def create_app() -> Flask:
             store_type=store_type if store_type else None,
             status=status,
             logo_url=logo_url,
-            subdomain=subdomain if subdomain else None,
+            google_review_url=google_review_url or None,
             user_id=session.get('user_id'),
             license_key=user.get('license_key')
         )
@@ -5642,7 +5691,7 @@ def create_app() -> Flask:
         manager_contact: str | None,
         status: str,
         logo_url: str | None = None,
-        subdomain: str | None = None
+        google_review_url: str | None = None
     ) -> bool:
         conn = get_db_connection()
         try:
@@ -5653,7 +5702,7 @@ def create_app() -> Flask:
                 SET store_name = %s, store_type = %s, address = %s, city = %s,
                     province = %s, postal_code = %s, contact_number = %s,
                     email = %s, store_manager_name = %s, manager_contact = %s,
-                    status = %s, logo_url = %s, subdomain = %s
+                    status = %s, logo_url = COALESCE(%s, logo_url), google_review_url = %s
                 WHERE id = %s
                 """,
                 (
@@ -5669,7 +5718,7 @@ def create_app() -> Flask:
                     manager_contact,
                     status,
                     logo_url,
-                    subdomain,
+                    google_review_url,
                     store_id,
                 ),
             )
@@ -5743,10 +5792,13 @@ def create_app() -> Flask:
         store_manager_name = request.form.get("store_manager_name", "").strip() or None
         manager_contact = request.form.get("manager_contact", "").strip() or None
         status = request.form.get("status", "active")
-        subdomain = request.form.get("subdomain", "").strip()
+        google_review_url = request.form.get("google_review_url", "").strip()
 
         if not store_name:
             flash("Store name is required.", "danger")
+            return redirect(url_for("stores_management"))
+        if google_review_url and not google_review_url.startswith("https://"):
+            flash("Google Review Link must start with https://", "danger")
             return redirect(url_for("stores_management"))
 
         # Handle logo upload
@@ -5787,7 +5839,7 @@ def create_app() -> Flask:
             manager_contact=manager_contact,
             status=status,
             logo_url=logo_url,
-            subdomain=subdomain if subdomain else None
+            google_review_url=google_review_url or None
         )
 
         if success:

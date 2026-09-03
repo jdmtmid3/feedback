@@ -191,19 +191,17 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
               </div>
               
               <div class="col-12">
-                <label for="subdomain" class="form-label fw-medium">Subdomain (for store dashboard)</label>
+                <label for="google_review_url" class="form-label fw-medium">Google Review Link</label>
                 <input
-                  type="text"
-                  id="subdomain"
-                  name="subdomain"
+                  type="url"
+                  id="google_review_url"
+                  name="google_review_url"
                   class="form-control"
-                  placeholder="e.g. downtown-branch"
-                  pattern="[a-z0-9-]+"
-                  title="Only lowercase letters, numbers, and hyphens allowed"
+                  placeholder="https://g.page/r/.../review"
                 />
                 <div class="form-text">
                   <i class="bi bi-info-circle me-1"></i>
-                  Dashboard URL: <span id="subdomainPreview">yourdomain.com</span>
+                  This link appears in the Google Review reward flow for this store.
                 </div>
               </div>
               
@@ -347,19 +345,17 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
               </div>
               
               <div class="col-12">
-                <label for="edit_subdomain" class="form-label fw-medium">Subdomain (for store dashboard)</label>
+                <label for="edit_google_review_url" class="form-label fw-medium">Google Review Link</label>
                 <input
-                  type="text"
-                  id="edit_subdomain"
-                  name="subdomain"
+                  type="url"
+                  id="edit_google_review_url"
+                  name="google_review_url"
                   class="form-control"
-                  placeholder="e.g. downtown-branch"
-                  pattern="[a-z0-9-]+"
-                  title="Only lowercase letters, numbers, and hyphens allowed"
+                  placeholder="https://g.page/r/.../review"
                 />
                 <div class="form-text">
                   <i class="bi bi-info-circle me-1"></i>
-                  Dashboard URL: <span id="editSubdomainPreview">yourdomain.com</span>
+                  This link appears in the Google Review reward flow for this store.
                 </div>
               </div>
               
@@ -1233,6 +1229,7 @@ function editStore(storeId) {
     document.getElementById('edit_status').value = store.status || 'active';
     document.getElementById('edit_store_manager_name').value = store.store_manager_name || '';
     document.getElementById('edit_manager_contact').value = store.manager_contact || '';
+    document.getElementById('edit_google_review_url').value = store.google_review_url || '';
     
     // Set form action
     document.getElementById('editStoreForm').action = `/admin/stores/${storeId}/edit`;
