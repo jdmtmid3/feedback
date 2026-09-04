@@ -6053,6 +6053,7 @@ def create_app() -> Flask:
         return redirect(url_for("stores_management"))
 
     @app.route("/admin/history")
+    @role_required('superadmin')
     def history():
         # Run automatic pruning of old logs (90 days retention)
         try:
@@ -6076,6 +6077,7 @@ def create_app() -> Flask:
         return render_template("history.html", logs=logs)
 
     @app.route("/admin/history/clear", methods=["POST"])
+    @role_required('superadmin')
     def clear_history():
         deleted_count = prune_audit_logs(days=0)  # Delete all logs
         flash(f"Cleared {deleted_count} history entries", "success")
