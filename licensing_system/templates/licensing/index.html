@@ -853,7 +853,6 @@
                                     <th>Company</th>
                                     <th>Status</th>
                                     <th>License Key</th>
-                                    <th>API Key</th>
                                     <th>Limits</th>
                                     <th>Expiry</th>
                                     <th style="width: 260px;">Actions</th>
@@ -886,14 +885,6 @@
                                         <div class="key-display">
                                             <code>{{ license.license_key[:32] }}...</code>
                                             <button type="button" class="btn btn-ghost btn-sm" onclick="copyToClipboard('{{ license.license_key }}')" title="Copy">
-                                                <i class="bi bi-clipboard"></i>
-                                            </button>
-                                        </div>
-                                    </td>
-                                    <td>
-                                        <div class="key-display">
-                                            <code>{{ license.api_key[:32] }}...</code>
-                                            <button type="button" class="btn btn-ghost btn-sm" onclick="copyToClipboard('{{ license.api_key }}')" title="Copy">
                                                 <i class="bi bi-clipboard"></i>
                                             </button>
                                         </div>
