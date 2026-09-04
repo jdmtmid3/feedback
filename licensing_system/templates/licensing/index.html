@@ -499,6 +499,31 @@
             background: var(--danger-500);
         }
 
+        /* Renewal queue: explicit contrast, independent of Bootstrap light-theme utilities. */
+        .renewal-panel { margin-bottom: 2rem; background: var(--slate-100); border: 1px solid var(--slate-300); border-radius: 14px; overflow: hidden; }
+        .renewal-panel-head { padding: 1.25rem 1.5rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; border-bottom: 1px solid var(--slate-300); }
+        .renewal-panel-title { margin: 0; color: #f5f9fe !important; font-size: 1.05rem; font-weight: 700; }
+        .renewal-panel-copy { margin: .25rem 0 0; color: #a8aaa9 !important; font-size: .82rem; }
+        .renewal-count { flex-shrink: 0; background: rgba(0,184,248,.16); border: 1px solid rgba(0,184,248,.35); color: #64dcff !important; border-radius: 999px; padding: .35rem .7rem; font-size: .75rem; font-weight: 700; }
+        .renewal-table { width: 100%; border-collapse: collapse; color: #f5f9fe !important; }
+        .renewal-table th { padding: .8rem 1rem; background: #17181a; border-bottom: 1px solid #2a2c2e; color: #a8aaa9 !important; font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
+        .renewal-table td { padding: 1rem; border-bottom: 1px solid #252729; color: #f5f9fe !important; vertical-align: middle; }
+        .renewal-table tbody tr:hover td { background: #17191b; }
+        .renewal-table tbody tr:last-child td { border-bottom: 0; }
+        .renewal-company { color: #ffffff !important; font-weight: 700; }
+        .renewal-email, .renewal-meta { color: #a8aaa9 !important; font-size: .78rem; }
+        .renewal-value { color: #f5f9fe !important; font-weight: 600; }
+        .renewal-status { display: inline-flex; border-radius: 999px; padding: .32rem .62rem; font-size: .7rem; font-weight: 700; white-space: nowrap; }
+        .renewal-status.pending { color: #7de3ff !important; background: rgba(0,184,248,.15); border: 1px solid rgba(0,184,248,.3); }
+        .renewal-status.approved { color: #74f5c5 !important; background: rgba(62,225,163,.14); border: 1px solid rgba(62,225,163,.3); }
+        .renewal-status.rejected, .renewal-status.cancelled { color: #ff9c9c !important; background: rgba(239,68,68,.13); border: 1px solid rgba(239,68,68,.28); }
+        .renewal-actions { min-width: 280px; }
+        .renewal-actions .form-control { color: #f5f9fe !important; -webkit-text-fill-color: #f5f9fe; background: #111214 !important; border-color: #3b3d40 !important; }
+        .renewal-actions .form-control::placeholder { color: #8a8c8e !important; opacity: 1; }
+        .renewal-approved { color: #74f5c5 !important; font-weight: 700; }
+        .renewal-reason { color: #ff9c9c !important; }
+        @media (max-width: 992px) { .renewal-table { min-width: 980px; } .renewal-panel-head { align-items: flex-start; } }
+
         /* Key Display */
         .key-display {
             display: flex;
@@ -701,6 +726,31 @@
             {% endif %}
         {% endwith %}
 
+        <!-- Renewal approvals are intentionally first: these require action. -->
+        <section class="renewal-panel" aria-labelledby="renewalApprovalsTitle">
+          <div class="renewal-panel-head">
+            <div><h2 class="renewal-panel-title" id="renewalApprovalsTitle"><i class="bi bi-shield-check me-2"></i>Renewal Approvals</h2><p class="renewal-panel-copy">Review Admin-confirmed requests, verify payment, then approve or reject.</p></div>
+            <span class="renewal-count">{{ renewal_requests|selectattr('status', 'equalto', 'pending_superadmin_approval')|list|length }} pending</span>
+          </div>
+          {% if renewal_requests %}
+          <div class="table-container"><table class="renewal-table">
+            <thead><tr><th>Client</th><th>Plan & Duration</th><th>Payment</th><th>Status</th><th>Requested</th><th>Decision</th></tr></thead>
+            <tbody>{% for renewal in renewal_requests %}<tr>
+              <td><div class="renewal-company">{{ renewal.company_name }}</div><div class="renewal-email">{{ renewal.contact_email }}</div></td>
+              <td><div class="renewal-value">{{ renewal.requested_plan }}</div><div class="renewal-meta">{{ renewal.requested_days }} days</div></td>
+              <td><div class="renewal-value">{{ renewal.payment_status|title }}</div><div class="renewal-meta">{{ renewal.payment_reference or 'No reference provided' }}</div></td>
+              <td><span class="renewal-status {{ 'approved' if renewal.status == 'approved_renewed' else 'pending' if renewal.status == 'pending_superadmin_approval' else renewal.status }}">{{ renewal.status|replace('_',' ')|title }}</span></td>
+              <td><div class="renewal-value">{{ renewal.created_at.strftime('%b %d, %Y') if renewal.created_at else '—' }}</div><div class="renewal-meta">Admin confirmed</div></td>
+              <td class="renewal-actions">
+                {% if renewal.status == 'pending_superadmin_approval' %}<form method="POST" action="{{ url_for('approve_renewal_request', request_id=renewal.id) }}" class="mb-2" onsubmit="return confirm('Approve this renewal and extend the license?')"><input type="hidden" name="payment_status" value="verified"><button class="btn btn-primary btn-sm w-100" type="submit"><i class="bi bi-check2-circle me-1"></i>Verify & Approve</button></form><form method="POST" action="{{ url_for('reject_renewal_request', request_id=renewal.id) }}" class="d-flex gap-2"><input class="form-control form-control-sm" name="rejection_reason" placeholder="Rejection reason" required><button class="btn btn-danger btn-sm" type="submit">Reject</button></form>
+                {% elif renewal.status == 'approved_renewed' %}<span class="renewal-approved"><i class="bi bi-check-circle me-1"></i>Renewed until {{ renewal.approved_expiry_date }}</span>
+                {% elif renewal.status == 'rejected' %}<span class="renewal-reason">{{ renewal.rejection_reason }}</span>{% else %}<span class="renewal-meta">No action available</span>{% endif %}
+              </td>
+            </tr>{% endfor %}</tbody>
+          </table></div>
+          {% else %}<div class="empty-state"><div class="empty-state-icon"><i class="bi bi-hourglass-split"></i></div><h3>No renewal requests</h3><p>Requests appear after an Admin confirms and submits one.</p></div>{% endif %}
+        </section>
+
         <!-- Stats Grid -->
         <div class="stats-grid">
             <div class="stat-card">
@@ -893,17 +943,6 @@
                 </div>
             </div>
         </div>
-        <div class="container-fluid mt-4 mb-5"><div class="content-card">
-          <div class="card-header d-flex justify-content-between align-items-center"><div><h2 class="card-title mb-1"><i class="bi bi-shield-check me-2"></i>Renewal Approvals</h2><p class="text-muted mb-0">Only Admin-confirmed requests appear here. Approval is the only action that extends a license.</p></div><span class="status-badge pending">{{ renewal_requests|selectattr('status', 'equalto', 'pending_superadmin_approval')|list|length }} pending</span></div>
-          <div class="card-body">{% if renewal_requests %}<div class="row g-3">{% for renewal in renewal_requests %}
-            <div class="col-12 col-xl-6"><div class="p-4 h-100" style="border:1px solid #e5e7eb;border-radius:18px;background:#fff;box-shadow:0 8px 24px rgba(15,23,42,.05)">
-              <div class="d-flex justify-content-between gap-3 mb-3"><div><h5 class="mb-1">{{ renewal.company_name }}</h5><small class="text-muted">{{ renewal.contact_email }}</small></div><span class="status-badge {{ 'active' if renewal.status == 'approved_renewed' else 'pending' if renewal.status == 'pending_superadmin_approval' else 'inactive' }}">{{ renewal.status|replace('_',' ')|title }}</span></div>
-              <div class="row g-2 small mb-3"><div class="col-6"><span class="text-muted d-block">Plan</span><strong>{{ renewal.requested_plan }}</strong></div><div class="col-6"><span class="text-muted d-block">Duration</span><strong>{{ renewal.requested_days }} days</strong></div><div class="col-6"><span class="text-muted d-block">Payment</span><strong>{{ renewal.payment_status|title }}</strong></div><div class="col-6"><span class="text-muted d-block">Reference</span><strong>{{ renewal.payment_reference or 'Not provided' }}</strong></div></div>
-              {% if renewal.status == 'pending_superadmin_approval' %}<div class="alert alert-warning py-2 small">Confirm payment and request details before approval.</div><form method="POST" action="{{ url_for('approve_renewal_request', request_id=renewal.id) }}" class="mb-2" onsubmit="return confirm('Approve this renewal and extend the license?')"><input type="hidden" name="payment_status" value="verified"><button class="btn btn-primary w-100" type="submit"><i class="bi bi-check2-circle me-2"></i>Verify Payment & Approve</button></form><form method="POST" action="{{ url_for('reject_renewal_request', request_id=renewal.id) }}" class="d-flex gap-2"><input class="form-control" name="rejection_reason" placeholder="Reason for rejection" required><button class="btn btn-danger" type="submit">Reject</button></form>
-              {% elif renewal.status == 'approved_renewed' %}<div class="alert alert-success mb-0">Renewed until <strong>{{ renewal.approved_expiry_date }}</strong></div>{% elif renewal.status == 'rejected' %}<div class="alert alert-danger mb-0">Reason: {{ renewal.rejection_reason }}</div>{% endif %}
-            </div></div>
-          {% endfor %}</div>{% else %}<div class="empty-state"><div class="empty-state-icon"><i class="bi bi-hourglass-split"></i></div><h3>No renewal requests</h3><p>Requests appear after an Admin confirms and submits one.</p></div>{% endif %}</div>
-        </div></div>
     </main>
     
     <!-- Renew Modals -->
