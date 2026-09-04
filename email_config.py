@@ -3,6 +3,8 @@ Email configuration for feedback reply system
 """
 
 import os
+import re
+from html import escape
 from flask_mail import Mail, Message
 
 class EmailConfig:
@@ -156,311 +158,114 @@ class EmailConfig:
     
     def _get_standard_template(self, customer_name, store_name, feedback_summary, reply_message):
         """Standard email template"""
-        return f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Response to Your Feedback</title>
-            <style>
-                body {{
-                    font-family: Arial, sans-serif;
-                    line-height: 1.6;
-                    color: #333;
-                    max-width: 600px;
-                    margin: 0 auto;
-                    padding: 20px;
-                }}
-                .header {{
-                    background: #f8f9fa;
-                    padding: 20px;
-                    border-radius: 8px;
-                    margin-bottom: 20px;
-                    border-left: 4px solid #007bff;
-                }}
-                .content {{
-                    background: white;
-                    padding: 20px;
-                    border-radius: 8px;
-                    border: 1px solid #dee2e6;
-                }}
-                .footer {{
-                    margin-top: 20px;
-                    padding: 20px;
-                    background: #f8f9fa;
-                    border-radius: 8px;
-                    text-align: center;
-                    font-size: 14px;
-                    color: #6c757d;
-                }}
-                .signature {{
-                    margin-top: 30px;
-                    border-top: 1px solid #dee2e6;
-                    padding-top: 20px;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h2>Response to Your Feedback</h2>
-                <p>Dear {customer_name},</p>
-                <p>Thank you for taking the time to share your feedback about <strong>{store_name}</strong>.</p>
-            </div>
-            
-            <div class="content">
-                <h3>Your Feedback Summary:</h3>
-                <p><em>"{feedback_summary}"</em></p>
-                
-                <h3>Our Response:</h3>
-                <p>{reply_message}</p>
-                
-                <p>We value your input and are committed to improving our services based on customer feedback like yours.</p>
-            </div>
-            
-            <div class="signature">
-                <p>Best regards,<br>
-                Customer Service Team<br>
-                {store_name}</p>
-            </div>
-            
-            <div class="footer">
-                <p>This is an automated response to your feedback. If you have any questions, please don't hesitate to contact us directly.</p>
-            </div>
-        </body>
-        </html>
-        """
+        return self._build_polished_template(
+            customer_name, store_name, feedback_summary, reply_message,
+            eyebrow="Feedback update", icon="💬", title="We heard you.",
+            intro="Thank you for taking the time to share your experience.",
+            closing="Your input helps us create a better experience for everyone.",
+            signoff="Warm regards",
+        )
     
     def _get_apology_template(self, customer_name, store_name, feedback_summary, reply_message):
         """Apology email template for negative feedback"""
-        return f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Our Sincere Apologies</title>
-            <style>
-                body {{
-                    font-family: Arial, sans-serif;
-                    line-height: 1.6;
-                    color: #333;
-                    max-width: 600px;
-                    margin: 0 auto;
-                    padding: 20px;
-                }}
-                .header {{
-                    background: #fff3cd;
-                    padding: 20px;
-                    border-radius: 8px;
-                    margin-bottom: 20px;
-                    border-left: 4px solid #ffc107;
-                }}
-                .content {{
-                    background: white;
-                    padding: 20px;
-                    border-radius: 8px;
-                    border: 1px solid #dee2e6;
-                }}
-                .footer {{
-                    margin-top: 20px;
-                    padding: 20px;
-                    background: #f8f9fa;
-                    border-radius: 8px;
-                    text-align: center;
-                    font-size: 14px;
-                    color: #6c757d;
-                }}
-                .signature {{
-                    margin-top: 30px;
-                    border-top: 1px solid #dee2e6;
-                    padding-top: 20px;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h2>Our Sincere Apologies</h2>
-                <p>Dear {customer_name},</p>
-                <p>We sincerely apologize for your experience at <strong>{store_name}</strong>.</p>
-            </div>
-            
-            <div class="content">
-                <h3>Your Feedback:</h3>
-                <p><em>"{feedback_summary}"</em></p>
-                
-                <h3>Our Response:</h3>
-                <p>{reply_message}</p>
-                
-                <p>We take your feedback seriously and are taking immediate steps to address the issues you've raised. Your satisfaction is our top priority.</p>
-            </div>
-            
-            <div class="signature">
-                <p>With sincere apologies,<br>
-                Customer Service Team<br>
-                {store_name}</p>
-            </div>
-            
-            <div class="footer">
-                <p>This is an automated response to your feedback. If you have any questions, please don't hesitate to contact us directly.</p>
-            </div>
-        </body>
-        </html>
-        """
+        return self._build_polished_template(
+            customer_name, store_name, feedback_summary, reply_message,
+            eyebrow="A personal response", icon="🤝", title="We’re truly sorry.",
+            intro="Thank you for telling us what happened. Your experience matters to us.",
+            closing="We take your feedback seriously and are committed to making things right.",
+            signoff="With sincere apologies",
+        )
     
     def _get_appreciation_template(self, customer_name, store_name, feedback_summary, reply_message):
         """Appreciation email template for positive feedback"""
-        return f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Thank You for Your Feedback!</title>
-            <style>
-                body {{
-                    font-family: Arial, sans-serif;
-                    line-height: 1.6;
-                    color: #333;
-                    max-width: 600px;
-                    margin: 0 auto;
-                    padding: 20px;
-                }}
-                .header {{
-                    background: #d4edda;
-                    padding: 20px;
-                    border-radius: 8px;
-                    margin-bottom: 20px;
-                    border-left: 4px solid #28a745;
-                }}
-                .content {{
-                    background: white;
-                    padding: 20px;
-                    border-radius: 8px;
-                    border: 1px solid #dee2e6;
-                }}
-                .footer {{
-                    margin-top: 20px;
-                    padding: 20px;
-                    background: #f8f9fa;
-                    border-radius: 8px;
-                    text-align: center;
-                    font-size: 14px;
-                    color: #6c757d;
-                }}
-                .signature {{
-                    margin-top: 30px;
-                    border-top: 1px solid #dee2e6;
-                    padding-top: 20px;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h2>Thank You for Your Feedback!</h2>
-                <p>Dear {customer_name},</p>
-                <p>We're delighted to hear your positive feedback about <strong>{store_name}</strong>!</p>
-            </div>
-            
-            <div class="content">
-                <h3>Your Feedback:</h3>
-                <p><em>"{feedback_summary}"</em></p>
-                
-                <h3>Our Response:</h3>
-                <p>{reply_message}</p>
-                
-                <p>Your kind words mean a lot to us and motivate our team to continue providing excellent service.</p>
-            </div>
-            
-            <div class="signature">
-                <p>With gratitude,<br>
-                Customer Service Team<br>
-                {store_name}</p>
-            </div>
-            
-            <div class="footer">
-                <p>This is an automated response to your feedback. If you have any questions, please don't hesitate to contact us directly.</p>
-            </div>
-        </body>
-        </html>
-        """
+        reward_email = "Google Review Reward" in str(feedback_summary)
+        return self._build_polished_template(
+            customer_name, store_name, feedback_summary, reply_message,
+            eyebrow="A little thank-you", icon="🎁" if reward_email else "✨",
+            title="Your reward is here!" if reward_email else "You made our day!",
+            intro="Your Google Review has been verified. Here are your reward details." if reward_email else "Thank you for sharing such thoughtful feedback with us.",
+            closing="Please keep this email and present the code with your original receipt." if reward_email else "Your kind words inspire our team to keep delivering our best.",
+            signoff="With gratitude",
+            is_reward=reward_email,
+        )
     
     def _get_follow_up_template(self, customer_name, store_name, feedback_summary, reply_message):
         """Follow-up email template"""
-        return f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Follow-up to Your Feedback</title>
-            <style>
-                body {{
-                    font-family: Arial, sans-serif;
-                    line-height: 1.6;
-                    color: #333;
-                    max-width: 600px;
-                    margin: 0 auto;
-                    padding: 20px;
-                }}
-                .header {{
-                    background: #e2e3e5;
-                    padding: 20px;
-                    border-radius: 8px;
-                    margin-bottom: 20px;
-                    border-left: 4px solid #6c757d;
-                }}
-                .content {{
-                    background: white;
-                    padding: 20px;
-                    border-radius: 8px;
-                    border: 1px solid #dee2e6;
-                }}
-                .footer {{
-                    margin-top: 20px;
-                    padding: 20px;
-                    background: #f8f9fa;
-                    border-radius: 8px;
-                    text-align: center;
-                    font-size: 14px;
-                    color: #6c757d;
-                }}
-                .signature {{
-                    margin-top: 30px;
-                    border-top: 1px solid #dee2e6;
-                    padding-top: 20px;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h2>Follow-up to Your Feedback</h2>
-                <p>Dear {customer_name},</p>
-                <p>We're following up on your recent feedback about <strong>{store_name}</strong>.</p>
-            </div>
-            
-            <div class="content">
-                <h3>Your Feedback:</h3>
-                <p><em>"{feedback_summary}"</em></p>
-                
-                <h3>Our Response:</h3>
-                <p>{reply_message}</p>
-                
-                <p>We wanted to ensure your concerns have been properly addressed and that you're satisfied with our response.</p>
-            </div>
-            
-            <div class="signature">
-                <p>Best regards,<br>
-                Customer Service Team<br>
-                {store_name}</p>
-            </div>
-            
-            <div class="footer">
-                <p>This is an automated response to your feedback. If you have any questions, please don't hesitate to contact us directly.</p>
-            </div>
-        </body>
-        </html>
-        """
+        return self._build_polished_template(
+            customer_name, store_name, feedback_summary, reply_message,
+            eyebrow="Following up", icon="👋", title="Checking in with you.",
+            intro="We wanted to follow up on the feedback you recently shared.",
+            closing="We hope our response addresses your concern and leaves you feeling heard.",
+            signoff="Warm regards",
+        )
+
+    def _build_polished_template(self, customer_name, store_name, feedback_summary,
+                                 reply_message, eyebrow, icon, title, intro,
+                                 closing, signoff, is_reward=False):
+        """Build a responsive, email-client-safe branded customer message."""
+        name = escape(str(customer_name or "Valued Customer"))
+        store = escape(str(store_name or "Our Store"))
+        summary = escape(str(feedback_summary or "Feedback submitted"))
+        raw_response = str(reply_message or "Thank you for your feedback.")
+        response = escape(raw_response).replace("\n", "<br>")
+        reward_label = "YOUR REWARD DETAILS" if is_reward else "OUR RESPONSE"
+        if is_reward:
+            code_match = re.search(r"reward code is\s+([A-Z0-9-]+)", raw_response, re.IGNORECASE)
+            type_match = re.search(r"Reward:\s*(.+?)\.", raw_response, re.IGNORECASE)
+            if code_match:
+                code = escape(code_match.group(1).upper())
+                reward_type = escape(type_match.group(1)) if type_match else "Your store reward"
+                response = f"""
+                  <div style="text-align:center;padding:4px 0 2px;">
+                    <div style="font-size:34px;line-height:42px;margin-bottom:5px;">🎁</div>
+                    <div style="font-size:11px;line-height:16px;font-weight:800;letter-spacing:1.2px;color:#d45125;">REWARD UNLOCKED</div>
+                    <div style="margin:8px 0 5px;font-family:Menlo,Monaco,Consolas,monospace;font-size:27px;line-height:35px;font-weight:800;letter-spacing:2px;color:#b83e18;word-break:break-all;">{code}</div>
+                    <div style="font-size:15px;line-height:23px;font-weight:700;color:#39333a;">{reward_type}</div>
+                    <div style="border-top:2px dashed #ffd0bb;margin:18px -21px 15px;"></div>
+                    <div style="font-size:13px;line-height:21px;color:#6b6570;">Bring your original receipt and a screenshot of this email. This code can only be redeemed once.</div>
+                  </div>"""
+        summary_block = "" if is_reward else f"""
+            <tr><td style="padding:0 32px 18px;">
+              <div style="background:#fff7f2;border:1px solid #ffe1d3;border-radius:18px;padding:18px 20px;">
+                <div style="font-size:11px;line-height:16px;font-weight:800;letter-spacing:1.2px;color:#c64b20;margin-bottom:7px;">YOUR FEEDBACK</div>
+                <div style="font-size:15px;line-height:24px;color:#4b5563;font-style:italic;">&ldquo;{summary}&rdquo;</div>
+              </div>
+            </td></tr>"""
+        return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{escape(title)}</title></head>
+<body style="margin:0;padding:0;background:#f4f4f6;color:#202124;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;">
+  <div style="display:none;max-height:0;overflow:hidden;color:transparent;">A message from {store} about your feedback.</div>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f4f4f6;">
+    <tr><td align="center" style="padding:28px 12px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;background:#ffffff;border-radius:28px;overflow:hidden;box-shadow:0 14px 45px rgba(31,41,55,.10);">
+        <tr><td style="height:7px;background:#ff6b35;font-size:0;line-height:0;">&nbsp;</td></tr>
+        <tr><td align="center" style="padding:36px 32px 25px;background:#fff8f4;">
+          <div style="width:64px;height:64px;line-height:64px;border-radius:20px;background:#ffffff;font-size:31px;text-align:center;box-shadow:0 8px 20px rgba(66,36,25,.10);margin-bottom:17px;">{icon}</div>
+          <div style="font-size:11px;line-height:16px;font-weight:800;letter-spacing:1.5px;color:#d45125;text-transform:uppercase;">{escape(eyebrow)}</div>
+          <h1 style="margin:7px 0 9px;font-size:30px;line-height:37px;letter-spacing:-.7px;color:#231f20;">{escape(title)}</h1>
+          <p style="margin:0;font-size:15px;line-height:24px;color:#67616a;">{escape(intro)}</p>
+        </td></tr>
+        <tr><td style="padding:28px 32px 18px;font-size:16px;line-height:26px;color:#343038;">
+          Hi <strong>{name}</strong>,<br><br>Thank you for connecting with <strong>{store}</strong>.
+        </td></tr>
+        {summary_block}
+        <tr><td style="padding:0 32px 20px;">
+          <div style="border:1px solid #e8e7ea;border-radius:20px;padding:21px;background:#ffffff;box-shadow:0 5px 18px rgba(31,41,55,.05);">
+            <div style="font-size:11px;line-height:16px;font-weight:800;letter-spacing:1.2px;color:#d45125;margin-bottom:9px;">{reward_label}</div>
+            <div style="font-size:16px;line-height:26px;color:#29252b;">{response}</div>
+          </div>
+        </td></tr>
+        <tr><td style="padding:0 32px 30px;font-size:15px;line-height:24px;color:#625d65;">{escape(closing)}</td></tr>
+        <tr><td style="padding:24px 32px;background:#242124;color:#ffffff;">
+          <div style="font-size:14px;line-height:22px;color:#d7d3d7;">{escape(signoff)},</div>
+          <div style="font-size:17px;line-height:25px;font-weight:800;color:#ffffff;">Customer Care · {store}</div>
+        </td></tr>
+      </table>
+      <div style="max-width:540px;padding:18px 20px 0;text-align:center;font-size:12px;line-height:18px;color:#8a858d;">This email was sent in response to feedback you submitted to {store}. Please do not share a one-time reward code with others.</div>
+    </td></tr>
+  </table>
+</body></html>"""
     
     def _log_email_sent(self, to_email, store_name, template_type, reply_message):
         """Log email sent for tracking purposes"""
