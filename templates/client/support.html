@@ -9,6 +9,10 @@
       <h5><i class="bi bi-key-fill me-2 text-warning"></i>License</h5>
       <p class="text-muted small mt-3 mb-0">Your license is securely assigned to this account. The key is hidden.</p>
       <div id="license-status" class="alert alert-secondary mt-3 mb-0">Checking license status…</div>
+      <div id="renewal-status" class="mt-3"></div>
+      <button class="btn btn-primary w-100 mt-3" type="button" data-bs-toggle="modal" data-bs-target="#renewalRequestModal">
+        <i class="bi bi-arrow-repeat me-2"></i>Request Renewal
+      </button>
     </div></div>
     <div class="card border-0 shadow-sm"><div class="card-body p-4">
       <h5><i class="bi bi-ticket-detailed me-2 text-warning"></i>New Ticket</h5>
@@ -30,6 +34,26 @@
     {% if user.role == 'admin' %}<div class="card border-0 shadow-sm"><div class="card-body p-4"><h5><i class="bi bi-clock-history me-2 text-warning"></i>Your Tickets</h5><div id="tickets" class="mt-3"><p class="text-muted">Loading tickets…</p></div></div></div>{% endif %}
   </div>
 </div>
+
+<div class="modal fade" id="renewalRequestModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered"><div class="modal-content border-0 shadow" style="border-radius:24px;overflow:hidden">
+    <div class="modal-header border-0 px-4 pt-4"><div><span class="fs-2">🔐</span><h5 class="modal-title mt-2">Confirm License Renewal Request</h5></div><button class="btn-close" type="button" data-bs-dismiss="modal"></button></div>
+    <form method="POST" action="{{ url_for('client_request_renewal') }}">
+      <div class="modal-body px-4">
+        <div class="alert alert-warning border-0 rounded-4"><strong>This is only a request.</strong><br><small>Your license will not be extended until the Superadmin verifies and approves it.</small></div>
+        <label class="form-label fw-semibold">Renewal duration</label>
+        <select class="form-select mb-3" name="requested_days" required><option value="30">30 days</option><option value="90">3 months</option><option value="180">6 months</option><option value="365" selected>1 year</option></select>
+        <label class="form-label fw-semibold">Plan</label><input class="form-control mb-3" name="requested_plan" value="Current plan" maxlength="100" required>
+        <label class="form-label fw-semibold">Payment reference <span class="text-muted fw-normal">(optional)</span></label><input class="form-control mb-3" name="payment_reference" maxlength="255" placeholder="Receipt or transaction reference">
+        <div class="form-check p-3 ps-5 rounded-4" style="background:#fff6f1;border:1px solid #ffe0d1">
+          <input class="form-check-input" type="checkbox" name="admin_confirmed" value="yes" id="adminRenewalConfirmation" required>
+          <label class="form-check-label fw-semibold" for="adminRenewalConfirmation">I confirm that I want to send this renewal request for review.</label>
+        </div>
+      </div>
+      <div class="modal-footer border-0 px-4 pb-4"><button class="btn btn-light" type="button" data-bs-dismiss="modal">Not yet</button><button class="btn btn-primary" type="submit">Confirm & Send Request</button></div>
+    </form>
+  </div></div>
+</div>
 <script>
 const escapeHtml = value => { const node = document.createElement('div'); node.textContent = value ?? ''; return node.innerHTML; };
 async function loadStatus() {
@@ -37,7 +61,9 @@ async function loadStatus() {
   if (!status || !tickets) return;
   try { const response = await fetch('{{ url_for("api_support_status") }}', {headers:{Accept:'application/json'}}), data = await response.json(); if (!response.ok) throw new Error(data.error || 'Unable to load support status');
     status.className = `alert alert-${data.license_status?.valid ? 'success' : 'warning'} mt-3 mb-0`;
-    status.textContent = data.license_status?.valid ? `Active license · ${data.license_status.max_stores || 'Unlimited'} stores` : (data.license_error || 'No active license connected');
+    status.textContent = data.license_status?.valid ? `Active license · ${data.license_status.max_stores || 'Unlimited'} stores${data.license_status.expiry_date ? ` · Expires ${data.license_status.expiry_date}` : ''}` : (data.license_error || 'No active license connected');
+    const renewalBox=document.getElementById('renewal-status'), latest=data.renewals?.[0];
+    if(latest){ const labels={pending_superadmin_approval:'Pending Superadmin Approval',approved_renewed:'Approved / Renewed',rejected:'Rejected',cancelled:'Cancelled'}; const colors={pending_superadmin_approval:'warning',approved_renewed:'success',rejected:'danger',cancelled:'secondary'}; renewalBox.innerHTML=`<div class="border rounded-4 p-3"><div class="d-flex justify-content-between gap-2"><strong>Latest renewal</strong><span class="badge bg-${colors[latest.status]||'secondary'}">${labels[latest.status]||escapeHtml(latest.status)}</span></div><small class="text-muted d-block mt-2">${escapeHtml(latest.requested_plan)} · ${latest.requested_days} days</small>${latest.approved_expiry_date?`<div class="small mt-2 text-success fw-semibold">New expiry: ${escapeHtml(latest.approved_expiry_date)}</div>`:''}${latest.rejection_reason?`<div class="small mt-2 text-danger">Reason: ${escapeHtml(latest.rejection_reason)}</div>`:''}${latest.status==='pending_superadmin_approval'?`<form method="POST" action="/client/support/renew/${latest.id}/cancel" class="mt-2" onsubmit="return confirm('Cancel this renewal request?')"><button class="btn btn-sm btn-outline-secondary" type="submit">Cancel request</button></form>`:''}</div>`;} else {renewalBox.innerHTML='<small class="text-muted">No renewal request submitted.</small>';}
     tickets.innerHTML = data.tickets?.length ? data.tickets.map(t => `<div class="border rounded p-3 mb-2"><div class="d-flex justify-content-between"><strong>${escapeHtml(t.subject)}</strong><span class="badge bg-secondary">${escapeHtml(t.status)}</span></div><small class="text-muted">${escapeHtml(t.ticket_type)} · ${escapeHtml(t.created_at)}</small>${t.admin_reply ? `<div class="alert alert-light mt-2 mb-0"><strong>Reply:</strong> ${escapeHtml(t.admin_reply)}</div>` : ''}</div>`).join('') : '<p class="text-muted">No tickets yet.</p>';
   } catch(error) { status.className='alert alert-danger mt-3 mb-0'; status.textContent=error.message; tickets.innerHTML='<p class="text-danger">Unable to load tickets.</p>'; }
 }

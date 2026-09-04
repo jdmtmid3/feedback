@@ -4037,7 +4037,7 @@ def create_app() -> Flask:
         portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
         license_key = _user_license_key(user)
 
-        result = {"license_status": None, "license_error": None, "tickets": []}
+        result = {"license_status": None, "license_error": None, "tickets": [], "renewals": []}
 
         if not license_key:
             return jsonify(result)
@@ -4062,6 +4062,13 @@ def create_app() -> Flask:
             resp = http_requests.get(f"{portal_url}/api/tickets/{license_key}", headers=licensing_api_headers(), timeout=5)
             if resp.status_code == 200:
                 result["tickets"] = resp.json().get('tickets', [])
+        except Exception:
+            pass
+
+        try:
+            resp = http_requests.get(f"{portal_url}/api/renewals/{license_key}", headers=licensing_api_headers(), timeout=5)
+            if resp.status_code == 200:
+                result["renewals"] = resp.json().get("renewals", [])
         except Exception:
             pass
 
@@ -4107,7 +4114,7 @@ def create_app() -> Flask:
     @app.route("/client/support/renew", methods=["POST"])
     @login_required
     def client_request_renewal():
-        """Submit a renewal request to the licensing portal"""
+        """Create an Admin-confirmed renewal request for Superadmin review."""
         user = get_user_by_id(session['user_id'])
         config = get_license_config()
         portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
@@ -4119,23 +4126,53 @@ def create_app() -> Flask:
             flash("No license key found.", "danger")
             return redirect(url_for("client_support"))
 
+        if request.form.get("admin_confirmed") != "yes":
+            flash("Please confirm that you want to submit a renewal request.", "warning")
+            return redirect(url_for("client_support"))
+
+        requested_plan = request.form.get("requested_plan", "Current plan").strip()
+        payment_reference = request.form.get("payment_reference", "").strip()
+        try:
+            requested_days = int(request.form.get("requested_days", "365"))
+        except ValueError:
+            requested_days = 365
+
         try:
             import requests as http_requests
-            resp = http_requests.post(f"{portal_url}/api/tickets/create", json={
+            resp = http_requests.post(f"{portal_url}/api/renewals", json={
                 "license_key": license_key,
                 "contact_email": contact_email,
-                "subject": f"License Renewal Request - {user.get('username', 'Client')}",
-                "message": f"Requesting license renewal for account: {user.get('username', 'N/A')}.",
-                "ticket_type": "renewal"
+                "requested_plan": requested_plan,
+                "requested_days": requested_days,
+                "payment_reference": payment_reference,
+                "admin_confirmed": True,
             }, headers=licensing_api_headers(), timeout=10)
             if resp.status_code in (200, 201):
-                flash("Renewal request submitted. Our team will process it shortly.", "success")
+                flash("Renewal request confirmed and sent for Superadmin approval. Your license has not been extended yet.", "success")
+            elif resp.status_code == 409:
+                flash("You already have a renewal request waiting for Superadmin approval.", "warning")
             else:
                 flash("Failed to submit renewal request.", "danger")
         except Exception as e:
             logger.error(f"Error submitting renewal request: {e}")
             flash("Unable to reach support. Please try again later.", "danger")
 
+        return redirect(url_for("client_support"))
+
+    @app.route("/client/support/renew/<int:request_id>/cancel", methods=["POST"])
+    @login_required
+    def client_cancel_renewal(request_id):
+        user = get_user_by_id(session['user_id'])
+        license_key = _user_license_key(user) or ""
+        try:
+            import requests as http_requests
+            resp = http_requests.post(f"{_get_portal_url()}/api/renewals/{request_id}/cancel",
+                json={"license_key": license_key}, headers=licensing_api_headers(), timeout=10)
+            flash("Renewal request cancelled." if resp.status_code == 200 else "This request can no longer be cancelled.",
+                  "success" if resp.status_code == 200 else "warning")
+        except Exception as exc:
+            logger.error("Unable to cancel renewal: %s", exc)
+            flash("Unable to cancel the renewal request.", "danger")
         return redirect(url_for("client_support"))
 
     # ── Client Messaging System (proxies to licensing portal) ────────

@@ -161,6 +161,32 @@ def create_app() -> Flask:
                     )
                 """)
 
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS renewal_requests (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        license_id INT NOT NULL,
+                        license_key VARCHAR(255) NOT NULL,
+                        company_name VARCHAR(255) NOT NULL,
+                        contact_email VARCHAR(255) NOT NULL,
+                        requested_plan VARCHAR(100) NOT NULL DEFAULT 'Current plan',
+                        requested_days INT NOT NULL DEFAULT 365,
+                        payment_reference VARCHAR(255) NULL,
+                        payment_status VARCHAR(40) NOT NULL DEFAULT 'unverified',
+                        status VARCHAR(50) NOT NULL DEFAULT 'pending_superadmin_approval',
+                        admin_confirmed_at TIMESTAMP NULL,
+                        reviewed_at TIMESTAMP NULL,
+                        reviewed_by VARCHAR(255) NULL,
+                        rejection_reason TEXT NULL,
+                        previous_expiry_date DATE NULL,
+                        approved_expiry_date DATE NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        INDEX idx_renewal_license (license_key, created_at),
+                        INDEX idx_renewal_status (status, created_at),
+                        FOREIGN KEY (license_id) REFERENCES licenses(id) ON DELETE CASCADE
+                    )
+                """)
+
                 # Create client_conversations table for messaging system
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS client_conversations (
@@ -407,7 +433,15 @@ def create_app() -> Flask:
     def index():
         licenses = get_all_licenses()
         users = fetch_users_from_main_app()
-        return render_template("licensing/index.html", licenses=licenses, users=users)
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT * FROM renewal_requests ORDER BY FIELD(status, 'pending_superadmin_approval', 'approved_renewed', 'rejected', 'cancelled'), created_at DESC")
+            renewal_requests = cursor.fetchall()
+        finally:
+            conn.close()
+        return render_template("licensing/index.html", licenses=licenses, users=users,
+                               renewal_requests=renewal_requests)
     
     @app.route("/license/add", methods=["POST"])
     @login_required
@@ -532,39 +566,124 @@ def create_app() -> Flask:
     @app.route("/license/<int:license_id>/renew", methods=["POST"])
     @login_required
     def renew_license_route(license_id):
-        """Renew a license with a custom expiry date"""
-        try:
-            new_expiry_str = request.form.get("new_expiry_date", "").strip()
-            
-            if not new_expiry_str:
-                flash("Please provide an expiry date", "danger")
-                return redirect(url_for("index"))
-            
-            # Parse the new expiry date
-            try:
-                new_expiry = datetime.strptime(new_expiry_str, "%Y-%m-%d").date()
-            except ValueError:
-                flash("Invalid expiry date format", "danger")
-                return redirect(url_for("index"))
-            
-            with get_db_connection_with_transaction() as conn:
-                cursor = conn.cursor()
-                
-                # Update the license with the new expiry date
-                cursor.execute(
-                    "UPDATE licenses SET expiry_date = %s, is_active = TRUE WHERE id = %s",
-                    (new_expiry, license_id)
-                )
-            
-            flash(f"License renewed successfully. New expiry: {new_expiry}", "success")
-        except mysql.connector.Error as e:
-            logger.error(f"Database error renewing license: {e}")
-            flash("Failed to renew license", "danger")
-        except Exception as e:
-            logger.error(f"Unexpected error renewing license: {e}")
-            flash("Failed to renew license", "danger")
-        
+        flash("Direct renewal is disabled. The Admin must submit and confirm a renewal request first.", "warning")
         return redirect(url_for("index"))
+
+    @app.route("/renewal/<int:request_id>/approve", methods=["POST"])
+    @login_required
+    def approve_renewal_request(request_id):
+        payment_status = request.form.get("payment_status", "verified")
+        if payment_status != "verified":
+            flash("Verify the payment before approving this renewal.", "danger")
+            return redirect(url_for("index"))
+        try:
+            with get_db_connection_with_transaction() as conn:
+                cursor = conn.cursor(dictionary=True)
+                cursor.execute("SELECT * FROM renewal_requests WHERE id = %s FOR UPDATE", (request_id,))
+                renewal = cursor.fetchone()
+                if not renewal or renewal["status"] != "pending_superadmin_approval":
+                    flash("This renewal request is no longer pending.", "warning")
+                    return redirect(url_for("index"))
+                cursor.execute("SELECT expiry_date FROM licenses WHERE id = %s FOR UPDATE", (renewal["license_id"],))
+                license_row = cursor.fetchone()
+                if not license_row:
+                    raise ValueError("License not found")
+                today = datetime.now().date()
+                current_expiry = license_row.get("expiry_date")
+                base_date = current_expiry if current_expiry and current_expiry > today else today
+                from datetime import timedelta
+                new_expiry = base_date + timedelta(days=int(renewal["requested_days"]))
+                cursor.execute("UPDATE licenses SET expiry_date=%s, is_active=TRUE WHERE id=%s", (new_expiry, renewal["license_id"]))
+                cursor.execute("""UPDATE renewal_requests SET status='approved_renewed', payment_status='verified',
+                                  reviewed_at=NOW(), reviewed_by=%s, previous_expiry_date=%s,
+                                  approved_expiry_date=%s WHERE id=%s""",
+                               (portal_admin_username, current_expiry, new_expiry, request_id))
+            flash(f"Renewal approved. License extended to {new_expiry}.", "success")
+        except Exception as exc:
+            logger.error("Unable to approve renewal %s: %s", request_id, exc)
+            flash("Unable to approve the renewal request.", "danger")
+        return redirect(url_for("index"))
+
+    @app.route("/renewal/<int:request_id>/reject", methods=["POST"])
+    @login_required
+    def reject_renewal_request(request_id):
+        reason = request.form.get("rejection_reason", "").strip()
+        if not reason:
+            flash("Please provide a rejection reason.", "danger")
+            return redirect(url_for("index"))
+        with get_db_connection_with_transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""UPDATE renewal_requests SET status='rejected', rejection_reason=%s,
+                              reviewed_at=NOW(), reviewed_by=%s
+                              WHERE id=%s AND status='pending_superadmin_approval'""",
+                           (reason, portal_admin_username, request_id))
+        flash("Renewal request rejected. The Admin can see the reason.", "success")
+        return redirect(url_for("index"))
+
+    @app.route("/api/renewals", methods=["POST"])
+    @api_key_required
+    def api_create_renewal():
+        data = request.get_json(silent=True) or {}
+        license_key = (data.get("license_key") or "").strip()
+        confirmation = bool(data.get("admin_confirmed"))
+        if not license_key or not confirmation:
+            return jsonify({"error": "Admin confirmation and license key are required"}), 400
+        try:
+            days = int(data.get("requested_days") or 365)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid renewal duration"}), 400
+        if days not in (30, 90, 180, 365):
+            return jsonify({"error": "Renewal duration must be 30, 90, 180, or 365 days"}), 400
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT * FROM licenses WHERE license_key=%s", (license_key,))
+            lic = cursor.fetchone()
+            if not lic:
+                return jsonify({"error": "License not found"}), 404
+            cursor.execute("SELECT * FROM renewal_requests WHERE license_key=%s AND status='pending_superadmin_approval' LIMIT 1", (license_key,))
+            existing = cursor.fetchone()
+            if existing:
+                return jsonify({"renewal": existing, "message": "A renewal request is already pending"}), 409
+            cursor.execute("""INSERT INTO renewal_requests
+                (license_id, license_key, company_name, contact_email, requested_plan,
+                 requested_days, payment_reference, status, admin_confirmed_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_superadmin_approval',NOW())""",
+                (lic["id"], license_key, lic["company_name"], data.get("contact_email") or lic.get("contact_email") or "unknown",
+                 (data.get("requested_plan") or "Current plan")[:100], days,
+                 (data.get("payment_reference") or "")[:255] or None))
+            request_id = cursor.lastrowid
+            conn.commit()
+            return jsonify({"success": True, "request_id": request_id, "status": "pending_superadmin_approval"}), 201
+        finally:
+            conn.close()
+
+    @app.route("/api/renewals/<license_key>", methods=["GET"])
+    @api_key_required
+    def api_get_renewals(license_key):
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT * FROM renewal_requests WHERE license_key=%s ORDER BY created_at DESC LIMIT 10", (license_key,))
+            rows = cursor.fetchall()
+            for row in rows:
+                for key, value in list(row.items()):
+                    if hasattr(value, "isoformat"):
+                        row[key] = value.isoformat()
+            return jsonify({"renewals": rows})
+        finally:
+            conn.close()
+
+    @app.route("/api/renewals/<int:request_id>/cancel", methods=["POST"])
+    @api_key_required
+    def api_cancel_renewal(request_id):
+        data = request.get_json(silent=True) or {}
+        license_key = (data.get("license_key") or "").strip()
+        with get_db_connection_with_transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE renewal_requests SET status='cancelled' WHERE id=%s AND license_key=%s AND status='pending_superadmin_approval'", (request_id, license_key))
+            changed = cursor.rowcount
+        return jsonify({"success": bool(changed)}), (200 if changed else 409)
     
     # ── Ticket helpers ──────────────────────────────────────────────
     def get_all_tickets():

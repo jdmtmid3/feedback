@@ -867,9 +867,7 @@
                                                 </button>
                                             </form>
                                             {% if license.expiry_date %}
-                                            <button type="button" class="btn btn-ghost btn-sm" data-bs-toggle="modal" data-bs-target="#renewModal{{ license.id }}" title="Renew">
-                                                <i class="bi bi-arrow-clockwise"></i>
-                                            </button>
+                                            <span class="btn btn-ghost btn-sm disabled" title="Renewal requires an Admin request"><i class="bi bi-lock"></i></span>
                                             {% endif %}
                                             <form method="POST" action="{{ url_for('delete_license_route', license_id=license.id) }}" onsubmit="return confirm('Delete this license? This action cannot be undone.')" style="display: inline;">
                                                 <button type="submit" class="btn btn-danger btn-sm" title="Delete">
@@ -895,6 +893,17 @@
                 </div>
             </div>
         </div>
+        <div class="container-fluid mt-4 mb-5"><div class="content-card">
+          <div class="card-header d-flex justify-content-between align-items-center"><div><h2 class="card-title mb-1"><i class="bi bi-shield-check me-2"></i>Renewal Approvals</h2><p class="text-muted mb-0">Only Admin-confirmed requests appear here. Approval is the only action that extends a license.</p></div><span class="status-badge pending">{{ renewal_requests|selectattr('status', 'equalto', 'pending_superadmin_approval')|list|length }} pending</span></div>
+          <div class="card-body">{% if renewal_requests %}<div class="row g-3">{% for renewal in renewal_requests %}
+            <div class="col-12 col-xl-6"><div class="p-4 h-100" style="border:1px solid #e5e7eb;border-radius:18px;background:#fff;box-shadow:0 8px 24px rgba(15,23,42,.05)">
+              <div class="d-flex justify-content-between gap-3 mb-3"><div><h5 class="mb-1">{{ renewal.company_name }}</h5><small class="text-muted">{{ renewal.contact_email }}</small></div><span class="status-badge {{ 'active' if renewal.status == 'approved_renewed' else 'pending' if renewal.status == 'pending_superadmin_approval' else 'inactive' }}">{{ renewal.status|replace('_',' ')|title }}</span></div>
+              <div class="row g-2 small mb-3"><div class="col-6"><span class="text-muted d-block">Plan</span><strong>{{ renewal.requested_plan }}</strong></div><div class="col-6"><span class="text-muted d-block">Duration</span><strong>{{ renewal.requested_days }} days</strong></div><div class="col-6"><span class="text-muted d-block">Payment</span><strong>{{ renewal.payment_status|title }}</strong></div><div class="col-6"><span class="text-muted d-block">Reference</span><strong>{{ renewal.payment_reference or 'Not provided' }}</strong></div></div>
+              {% if renewal.status == 'pending_superadmin_approval' %}<div class="alert alert-warning py-2 small">Confirm payment and request details before approval.</div><form method="POST" action="{{ url_for('approve_renewal_request', request_id=renewal.id) }}" class="mb-2" onsubmit="return confirm('Approve this renewal and extend the license?')"><input type="hidden" name="payment_status" value="verified"><button class="btn btn-primary w-100" type="submit"><i class="bi bi-check2-circle me-2"></i>Verify Payment & Approve</button></form><form method="POST" action="{{ url_for('reject_renewal_request', request_id=renewal.id) }}" class="d-flex gap-2"><input class="form-control" name="rejection_reason" placeholder="Reason for rejection" required><button class="btn btn-danger" type="submit">Reject</button></form>
+              {% elif renewal.status == 'approved_renewed' %}<div class="alert alert-success mb-0">Renewed until <strong>{{ renewal.approved_expiry_date }}</strong></div>{% elif renewal.status == 'rejected' %}<div class="alert alert-danger mb-0">Reason: {{ renewal.rejection_reason }}</div>{% endif %}
+            </div></div>
+          {% endfor %}</div>{% else %}<div class="empty-state"><div class="empty-state-icon"><i class="bi bi-hourglass-split"></i></div><h3>No renewal requests</h3><p>Requests appear after an Admin confirms and submits one.</p></div>{% endif %}</div>
+        </div></div>
     </main>
     
     <!-- Renew Modals -->
