@@ -144,6 +144,23 @@
             gap: 1rem;
         }
 
+        .stat-card-button {
+            width: 100%;
+            color: inherit;
+            font: inherit;
+            text-align: left;
+            cursor: pointer;
+            transition: border-color .18s ease, transform .18s ease, box-shadow .18s ease;
+        }
+
+        .stat-card-button:hover {
+            border-color: var(--primary-600);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 26px rgba(50, 240, 140, .08);
+        }
+
+        .stat-card-button:focus-visible { outline: 2px solid var(--primary-500); outline-offset: 3px; }
+
         .stat-icon {
             width: 44px;
             height: 44px;
@@ -515,7 +532,9 @@
         .renewal-approved { color: #74f5c5 !important; font-weight: 700; }
         .renewal-reason { color: #ff9c9c !important; }
         .renew-btn { position: relative; white-space: nowrap; }
-        .renew-btn .pending-dot { width: 7px; height: 7px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 3px rgba(255,255,255,.16); }
+        .renew-btn .pending-number { min-width: 19px; height: 19px; padding: 0 5px; display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; background: #fff; color: #12875f; font-size: .68rem; font-weight: 800; line-height: 1; }
+        .pending-license-list { display: grid; gap: .75rem; }
+        .pending-license-item { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem; background: #17191b; border: 1px solid #2a2c2e; border-radius: 12px; }
         .renewal-summary { background: #17191b; border: 1px solid #2a2c2e; border-radius: 12px; padding: 1rem; }
         .renewal-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .85rem; }
         .history-list { display: grid; gap: .75rem; }
@@ -725,6 +744,7 @@
             {% endif %}
         {% endwith %}
 
+        {% set pending_renewal_requests = renewal_requests|selectattr('status', 'equalto', 'pending_superadmin_approval')|list %}
         <!-- Stats Grid -->
         <div class="stats-grid">
             <div class="stat-card">
@@ -763,6 +783,14 @@
                     <div class="stat-label">Inactive</div>
                 </div>
             </div>
+            <button type="button" class="stat-card stat-card-button" data-bs-toggle="modal" data-bs-target="#pendingRenewalsModal" aria-label="View pending renewals">
+                <div class="stat-icon primary"><i class="bi bi-arrow-repeat"></i></div>
+                <div class="stat-content">
+                    <div class="stat-value">{{ pending_renewal_requests|length }}</div>
+                    <div class="stat-label">Renewals</div>
+                </div>
+                <i class="bi bi-chevron-right" style="color: var(--slate-700);"></i>
+            </button>
         </div>
 
         <!-- Content Grid -->
@@ -893,7 +921,7 @@
                                                 </button>
                                             </form>
                                             <button type="button" class="btn btn-primary btn-sm renew-btn" data-bs-toggle="modal" data-bs-target="#renewModal{{ license.id }}" title="Review renewal">
-                                                {% if pending_renewals %}<span class="pending-dot"></span>{% else %}<i class="bi bi-arrow-repeat"></i>{% endif %} Renew
+                                                {% if pending_renewals %}<span class="pending-number">{{ pending_renewals|length }}</span>{% else %}<i class="bi bi-arrow-repeat"></i>{% endif %} Renew
                                             </button>
                                             <button type="button" class="btn btn-ghost btn-sm" data-bs-toggle="modal" data-bs-target="#renewalHistoryModal{{ license.id }}" title="Renewal history" aria-label="Open renewal history"><i class="bi bi-three-dots"></i></button>
                                             <form method="POST" action="{{ url_for('delete_license_route', license_id=license.id) }}" onsubmit="return confirm('Delete this license? This action cannot be undone.')" style="display: inline;">
@@ -921,6 +949,28 @@
             </div>
         </div>
     </main>
+
+    <div class="modal fade" id="pendingRenewalsModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <div><h5 class="modal-title"><i class="bi bi-arrow-repeat" style="color: var(--primary-500);"></i> Pending Renewals</h5><div class="renewal-meta mt-1">{{ pending_renewal_requests|length }} license{{ '' if pending_renewal_requests|length == 1 else 's' }} waiting for review</div></div>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    {% if pending_renewal_requests %}<div class="pending-license-list">
+                    {% for renewal in pending_renewal_requests %}
+                    {% set matched_licenses = licenses|selectattr('license_key', 'equalto', renewal.license_key)|list %}
+                    <article class="pending-license-item">
+                        <div><div class="renewal-value">{{ renewal.company_name }}</div><div class="renewal-meta">{{ renewal.contact_email }} · {{ renewal.requested_plan }} · {{ renewal.requested_days }} days</div><div class="license-key-caption mt-1">{{ renewal.license_key[:28] }}...</div></div>
+                        {% if matched_licenses %}<button type="button" class="btn btn-primary btn-sm" onclick="openLicenseRenewal({{ matched_licenses[0].id }})"><i class="bi bi-eye"></i> Review</button>{% endif %}
+                    </article>
+                    {% endfor %}
+                    </div>{% else %}<div class="empty-state py-4"><div class="empty-state-icon"><i class="bi bi-check2-circle"></i></div><h3>All caught up</h3><p>There are no Admin-confirmed renewal requests waiting for approval.</p></div>{% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
     
     <!-- Per-license renewal and history modals -->
     {% for license in licenses %}
@@ -982,6 +1032,15 @@
     }
     refreshPortalMessageCount();
     setInterval(refreshPortalMessageCount, 15000);
+
+    function openLicenseRenewal(licenseId) {
+        const listModalElement = document.getElementById('pendingRenewalsModal');
+        const target = document.getElementById(`renewModal${licenseId}`);
+        if (!target) return;
+        const listModal = bootstrap.Modal.getInstance(listModalElement);
+        if (listModal) listModal.hide();
+        setTimeout(() => bootstrap.Modal.getOrCreateInstance(target).show(), 220);
+    }
 
     function copyToClipboard(text) {
         navigator.clipboard.writeText(text).then(() => {
