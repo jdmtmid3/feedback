@@ -96,6 +96,9 @@
             align-items: center;
             gap: 1rem;
         }
+        .nav-message-link { position: relative; }
+        .nav-unread-badge { position: absolute; top: -7px; right: -8px; min-width: 20px; height: 20px; padding: 0 5px; display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; background: #ef4444; border: 2px solid var(--slate-100); color: #fff !important; font-size: .66rem; font-weight: 800; line-height: 1; }
+        .nav-unread-badge.is-empty { display: none; }
 
         /* Main Layout */
         .main-container {
@@ -701,7 +704,7 @@
         </a>
         <div class="nav-actions" style="display: flex; align-items: center; gap: .5rem;">
             <a href="/" style="color: var(--slate-900); text-decoration: none; font-size: .85rem; font-weight: 500; padding: .5rem .75rem; border-radius: 8px; background: var(--slate-300);">Dashboard</a>
-            <a href="/messages" style="color: var(--slate-700); text-decoration: none; font-size: .85rem; font-weight: 500; padding: .5rem .75rem; border-radius: 8px; transition: all .15s;">Messages</a>
+            <a href="/messages" class="nav-message-link" style="color: var(--slate-700); text-decoration: none; font-size: .85rem; font-weight: 500; padding: .5rem .75rem; border-radius: 8px; transition: all .15s;">Messages<span class="nav-unread-badge is-empty" id="portal-message-count">0</span></a>
             <a href="/logout" style="color: var(--slate-700); text-decoration: none; font-size: .85rem; font-weight: 500; padding: .5rem .75rem; border-radius: 8px;">Log out</a>
         </div>
     </nav>
@@ -988,6 +991,14 @@
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
+    async function refreshPortalMessageCount() {
+        const badge = document.getElementById('portal-message-count');
+        if (!badge) return;
+        try { const response = await fetch('/api/messages/unread-count', {headers:{Accept:'application/json'}}); const data = await response.json(); const count = Number(data.count || 0); badge.textContent = count > 99 ? '99+' : count; badge.classList.toggle('is-empty', count < 1); } catch (_) { badge.classList.add('is-empty'); }
+    }
+    refreshPortalMessageCount();
+    setInterval(refreshPortalMessageCount, 15000);
+
     function copyToClipboard(text) {
         navigator.clipboard.writeText(text).then(() => {
             // Show toast notification

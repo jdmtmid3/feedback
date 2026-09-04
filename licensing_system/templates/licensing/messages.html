@@ -65,6 +65,9 @@
             font-weight: 500; padding: .5rem .75rem; border-radius: 8px; transition: all .15s;
         }
         .nav-links a:hover, .nav-links a.active { background: var(--slate-300); color: var(--slate-900); }
+        .nav-message-link { position: relative; }
+        .nav-unread-badge { position: absolute; top: -7px; right: -8px; min-width: 20px; height: 20px; padding: 0 5px; display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; background: #ef4444; border: 2px solid var(--slate-100); color: #fff !important; font-size: .66rem; font-weight: 800; line-height: 1; }
+        .nav-unread-badge.is-empty { display: none; }
         .main-container {
             height: calc(100vh - 64px);
             display: flex;
@@ -231,7 +234,7 @@
         </a>
         <div class="nav-links">
             <a href="/">Dashboard</a>
-            <a href="/messages" class="active">Messages</a>
+            <a href="/messages" class="active nav-message-link">Messages<span class="nav-unread-badge is-empty" id="portal-message-count">0</span></a>
         </div>
     </nav>
 
@@ -304,6 +307,14 @@
 
     <script>
     let currentConversationId = {% if conversations %}{{ conversations[0].id }}{% else %}null{% endif %};
+
+    async function refreshPortalMessageCount() {
+        const badge = document.getElementById('portal-message-count');
+        if (!badge) return;
+        try { const response = await fetch('/api/messages/unread-count', {headers:{Accept:'application/json'}}); const data = await response.json(); const count = Number(data.count || 0); badge.textContent = count > 99 ? '99+' : count; badge.classList.toggle('is-empty', count < 1); } catch (_) { badge.classList.add('is-empty'); }
+    }
+    refreshPortalMessageCount();
+    setInterval(refreshPortalMessageCount, 15000);
 
     function selectConversation(conversationId, element) {
         currentConversationId = conversationId;

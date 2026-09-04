@@ -878,18 +878,14 @@ def create_app() -> Flask:
         conn = get_db_connection()
         try:
             cursor = conn.cursor(dictionary=True)
-            # Mark messages as read
-            cursor.execute(
-                "UPDATE messages SET is_read = TRUE WHERE conversation_id = %s AND sender_type = 'client'",
-                (conversation_id,)
-            )
-            conn.commit()
-            # Update unread count
-            cursor.execute(
-                "UPDATE client_conversations SET unread_count = 0 WHERE id = %s",
-                (conversation_id,)
-            )
-            conn.commit()
+            viewer = request.args.get("viewer", "admin").lower()
+            if viewer == "admin":
+                cursor.execute("UPDATE messages SET is_read=TRUE WHERE conversation_id=%s AND sender_type='client'", (conversation_id,))
+                cursor.execute("UPDATE client_conversations SET unread_count=0 WHERE id=%s", (conversation_id,))
+                conn.commit()
+            elif viewer == "client":
+                cursor.execute("UPDATE messages SET is_read=TRUE WHERE conversation_id=%s AND sender_type='admin'", (conversation_id,))
+                conn.commit()
 
             cursor.execute(
                 "SELECT * FROM messages WHERE conversation_id = %s ORDER BY created_at ASC",
@@ -902,6 +898,18 @@ def create_app() -> Flask:
                     if hasattr(v, 'isoformat'):
                         msg[k] = v.isoformat()
             return jsonify({"messages": messages})
+        finally:
+            conn.close()
+
+    @app.route("/api/messages/unread-count")
+    @login_required
+    def portal_unread_message_count():
+        """Unread client messages for the Superadmin navigation badge."""
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COALESCE(SUM(unread_count), 0) FROM client_conversations")
+            return jsonify({"count": int(cursor.fetchone()[0] or 0)})
         finally:
             conn.close()
 

@@ -4224,7 +4224,7 @@ def create_app() -> Flask:
         portal_url = _get_portal_url()
         try:
             import requests as http_requests
-            resp = http_requests.get(f"{portal_url}/api/conversations/{conv_id}/messages", headers=licensing_api_headers(), timeout=10)
+            resp = http_requests.get(f"{portal_url}/api/conversations/{conv_id}/messages?viewer=client", headers=licensing_api_headers(), timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 return jsonify({"messages": data.get('messages', []), "conversation_id": conv_id})
@@ -4368,7 +4368,7 @@ def create_app() -> Flask:
             conv_id = _ensure_portal_conversation(_support_identity(user), license_key, contact_email, user.get("username", ""))
             if not conv_id:
                 return jsonify({"success": True, "count": 0})
-            resp = http_requests.get(f"{portal_url}/api/conversations/{conv_id}/messages", headers=licensing_api_headers(), timeout=5)
+            resp = http_requests.get(f"{portal_url}/api/conversations/{conv_id}/messages?viewer=count", headers=licensing_api_headers(), timeout=5)
             messages = resp.json().get("messages", []) if resp.status_code == 200 else []
             unread = sum(1 for m in messages if m.get("sender_type") == "admin" and not bool(m.get("is_read", m.get("seen", False))))
             return jsonify({"success": True, "count": unread})
