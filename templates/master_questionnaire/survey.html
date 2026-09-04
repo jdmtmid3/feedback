@@ -9,11 +9,11 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
 -->
 
 {% block title %}{{ questionnaire.title }}{% endblock %} {% block content %}
-<div class="row justify-content-center">
-  <div class="col-12 col-md-10 col-lg-8">
-    <div class="card border-0 shadow-lg">
+<div class="feedback-app-shell">
+  <div class="feedback-app-frame">
+    <div class="card border-0 feedback-app-card">
       <div class="card-body p-4 p-md-5">
-        <div class="text-center mb-4">
+        <div class="text-center mb-4 feedback-hero">
           {% if store.logo_url %}
           <img src="{{ store.logo_url }}" alt="{{ store.store_name }} Logo" class="mb-3" style="max-height: 80px; max-width: 200px; object-fit: contain;">
           {% elif master_logo %}
@@ -55,7 +55,7 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
           action="{{ url_for('submit_survey', store_id=store.id) }}"
           class="space-y-4"
         >
-          <div class="mb-4 p-4 bg-light rounded-3">
+          <div class="mb-4 p-4 bg-light rounded-3 feedback-section-card">
             <div class="d-flex align-items-center mb-3">
               <div class="rounded-circle bg-white shadow-sm p-2 me-3">
                 <i class="bi bi-receipt text-primary"></i>
@@ -115,14 +115,14 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
             </div>
           </div>
 
-          <div id="transactionLockMessage" class="alert alert-warning">
+          <div id="transactionLockMessage" class="alert alert-warning feedback-lock-card">
             <i class="bi bi-lock-fill me-2"></i>Enter the valid 8-digit SI# from your receipt before answering.
           </div>
           <fieldset id="questionnaireFields" disabled>
 
           <!-- Staff Commendation Section -->
           {% if false %}
-          <div class="mb-4 p-4 bg-light rounded-3">
+          <div class="mb-4 p-4 bg-light rounded-3 feedback-section-card">
             <div class="d-flex align-items-center mb-3">
               <div class="rounded-circle bg-white shadow-sm p-2 me-3">
                 <i class="bi bi-award text-primary"></i>
@@ -178,7 +178,7 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
           {% endif %}
 
           {% for q in questions %}
-          <div class="mb-4 p-4 bg-light rounded-3">
+          <div class="mb-4 p-4 bg-light rounded-3 feedback-section-card">
             <div
               class="d-flex align-items-start justify-content-between gap-3 mb-3"
             >
@@ -382,6 +382,47 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
   .text-primary { color: var(--tenant-primary) !important; }
   .form-control:focus, .form-select:focus { border-color: var(--tenant-accent); box-shadow: 0 0 0 .25rem color-mix(in srgb, var(--tenant-accent) 25%, transparent); }
   #questionnaireFields:disabled { opacity: .48; }
+  body {
+    background:
+      radial-gradient(circle at 10% 0%, color-mix(in srgb, var(--tenant-primary) 14%, transparent), transparent 34rem),
+      #f7f7f9;
+  }
+  .feedback-app-shell { width: 100%; padding: clamp(.25rem, 2vw, 1.5rem) 0 3rem; }
+  .feedback-app-frame { width: min(100%, 760px); margin: 0 auto; }
+  .feedback-app-card {
+    border-radius: 30px;
+    overflow: hidden;
+    box-shadow: 0 24px 70px rgba(17,24,39,.12), 0 2px 10px rgba(17,24,39,.05);
+  }
+  .feedback-hero {
+    margin: -1.5rem -1.5rem 1.5rem !important;
+    padding: 2rem 1.5rem 1.65rem;
+    background: linear-gradient(160deg, color-mix(in srgb, var(--tenant-primary) 13%, white), #fff 70%);
+    border-bottom: 1px solid color-mix(in srgb, var(--tenant-primary) 13%, #e5e7eb);
+  }
+  .feedback-section-card {
+    background: #fff !important;
+    border: 1px solid #e8e9ee;
+    border-radius: 22px !important;
+    box-shadow: 0 8px 24px rgba(17,24,39,.055);
+  }
+  .feedback-section-card .rounded-circle.bg-white {
+    color: var(--tenant-primary);
+    background: color-mix(in srgb, var(--tenant-primary) 11%, white) !important;
+  }
+  .feedback-section-card .form-control,
+  .feedback-section-card .form-select {
+    min-height: 52px;
+    border-radius: 14px;
+    border-color: #dfe1e7;
+    color: #111827 !important;
+    -webkit-text-fill-color: #111827;
+  }
+  .feedback-section-card .form-control::placeholder { color: #8b909b; opacity: 1; }
+  .feedback-lock-card { border: 0; border-radius: 16px; background: #fff4e8; color: #7c3a12; }
+  #submitBtn { min-height: 56px; border: 0; border-radius: 17px; box-shadow: 0 12px 26px color-mix(in srgb, var(--tenant-primary) 28%, transparent); }
+  .form-check.bg-white { border-radius: 14px !important; transition: border-color .2s, transform .2s; }
+  .form-check.bg-white:has(.form-check-input:checked) { border-color: var(--tenant-primary) !important; background: color-mix(in srgb, var(--tenant-primary) 7%, white) !important; transform: translateY(-1px); }
   /* Star rating styling */
   .rating-container {
     display: flex;
@@ -413,6 +454,11 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
 
   /* Mobile-specific adjustments */
   @media (max-width: 768px) {
+    .feedback-app-shell { padding-top: 0; }
+    .feedback-app-card { border-radius: 0 0 28px 28px; box-shadow: 0 12px 35px rgba(17,24,39,.10); }
+    .feedback-app-card > .card-body { padding: 1.15rem !important; }
+    .feedback-hero { margin: -1.15rem -1.15rem 1.25rem !important; }
+    .feedback-section-card { padding: 1.15rem !important; }
     .star-btn {
       font-size: 2rem;
       padding: 0.3rem;

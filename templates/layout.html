@@ -100,6 +100,19 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
       .btn-primary, .badge-primary { background-color: var(--tenant-primary) !important; border-color: var(--tenant-primary) !important; }
       .bg-primary { background-color: var(--tenant-primary) !important; }
       .text-primary { color: var(--tenant-primary) !important; }
+      /* Bootstrap's opacity helper cannot tint a custom solid background.
+         Give subtle brand badges a light surface and readable brand text. */
+      .bg-primary.bg-opacity-10,
+      .badge.bg-primary.bg-opacity-10 {
+        background-color: color-mix(in srgb, var(--tenant-primary) 12%, white) !important;
+        border-color: color-mix(in srgb, var(--tenant-primary) 22%, white) !important;
+        color: color-mix(in srgb, var(--tenant-primary) 82%, #111827) !important;
+      }
+      .bg-primary.bg-opacity-10.text-primary,
+      .badge.bg-primary.bg-opacity-10.text-primary {
+        color: color-mix(in srgb, var(--tenant-primary) 82%, #111827) !important;
+        -webkit-text-fill-color: currentColor;
+      }
       .btn-outline-primary { color: var(--tenant-primary) !important; border-color: var(--tenant-primary) !important; }
       .btn-outline-primary:hover { color: #fff !important; background-color: var(--tenant-primary) !important; }
 

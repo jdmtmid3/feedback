@@ -12,18 +12,21 @@ PURPOSE: The "Success Page". Customers see this after submitting the survey.
 {% block title %}Thank you{% endblock %}
 
 {% block content %}
-  <div class="row justify-content-center">
-    <div class="col-12 col-md-8 col-lg-6">
-      <div class="card">
+  <div class="reward-app-shell">
+    <div class="reward-app-frame">
+      <div class="card reward-app-card border-0">
         <div class="card-body p-4 p-md-5 text-center">
+          <div class="success-orb mx-auto mb-3">✓</div>
           <h1 class="h4 mb-2">Thank you!</h1>
           <p class="text-muted mb-4">Your feedback has been submitted successfully.</p>
           
           {% if show_google_review %}
           {% if reward %}
-          <div class="alert alert-success text-start mb-4">
-            <strong>Your rating qualifies for a reward!</strong><br>
+          <div class="reward-intro text-start mb-4">
+            <div class="gift-emoji" aria-hidden="true">🎁</div>
+            <div><strong>Your rating qualifies for a reward!</strong><br>
             <small>Post your Google Review first, then upload a screenshot of the completed review. Automatic verification is required before your unique code is generated and emailed.</small>
+            </div>
           </div>
           {% else %}
           <div class="alert alert-primary text-start mb-4">
@@ -37,13 +40,13 @@ PURPOSE: The "Success Page". Customers see this after submitting the survey.
             </a>
             {% if reward and reward.status == 'pending' %}
             <form method="POST" enctype="multipart/form-data" action="{{ url_for('claim_review_reward', store_id=store.id, claim_token=claim_token) }}" id="rewardProofForm">
-              <div class="text-start border rounded-3 p-3 mb-2 bg-light">
+              <div class="proof-card text-start p-3 mb-2">
                 <label class="form-label fw-semibold" for="googleReviewProof">Completed Google Review screenshot</label>
                 <input class="form-control" type="file" id="googleReviewProof" name="google_review_proof" accept="image/png,image/jpeg,image/webp" required>
                 <div class="form-text" id="googleReviewStatus">Upload a clear screenshot showing that your Google Review was completed.</div>
               </div>
               <input type="hidden" id="reviewOcrText" name="review_ocr_text">
-              <div class="form-check text-start border rounded-3 p-3 ps-5 mb-2 bg-light">
+              <div class="proof-card form-check text-start p-3 ps-5 mb-2">
                 <input class="form-check-input" type="checkbox" id="reviewCompletedConfirmation" disabled>
                 <label class="form-check-label" for="reviewCompletedConfirmation">
                   Google Review automatically verified.
@@ -54,11 +57,17 @@ PURPOSE: The "Success Page". Customers see this after submitting the survey.
               </button>
             </form>
             {% elif reward %}
-            <div class="border rounded-3 p-3 bg-light">
-              <small class="text-muted d-block">Your unique reward code</small>
-              <div class="fs-4 fw-bold text-success">{{ reward.reward_code }}</div>
-              <small>{{ reward.reward_type }}</small>
-              <p class="small text-muted mb-0 mt-2">The code was also sent to your feedback email. Bring your original receipt and a screenshot of this code to the store. The code can only be redeemed once.</p>
+            <div class="reward-ticket">
+              <div class="reward-ticket-top">
+                <span class="reward-ticket-gift" aria-hidden="true">🎁</span>
+                <span class="reward-unlocked">Reward unlocked</span>
+              </div>
+              <small class="reward-eyebrow d-block">Your unique reward code</small>
+              <div class="reward-code" id="rewardCodeInline">{{ reward.reward_code }}</div>
+              <div class="reward-type">{{ reward.reward_type }}</div>
+              <button type="button" class="copy-code-btn" data-copy-target="rewardCodeInline"><i class="bi bi-copy me-2"></i>Copy code</button>
+              <div class="ticket-divider"></div>
+              <p class="small mb-0">The code was also sent to your feedback email. Bring your original receipt and a screenshot of this code to the store. One-time use only.</p>
             </div>
             {% endif %}
           </div>
@@ -75,15 +84,17 @@ PURPOSE: The "Success Page". Customers see this after submitting the survey.
   {% if reward and reward.status != 'pending' and request.args.get('issued') == '1' %}
   <div class="modal fade" id="rewardCodeModal" tabindex="-1" aria-labelledby="rewardCodeModalLabel" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered">
-      <div class="modal-content border-0 shadow">
+      <div class="modal-content reward-modal border-0 shadow">
         <div class="modal-header">
           <h2 class="modal-title fs-5" id="rewardCodeModalLabel">Your Reward Code</h2>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
         <div class="modal-body text-center p-4">
           <p class="text-muted">Your unique code has been generated and sent to your feedback email.</p>
-          <div class="display-6 fw-bold text-success mb-2">{{ reward.reward_code }}</div>
+          <div class="modal-gift mb-2" aria-hidden="true">🎁</div>
+          <div class="reward-code mb-2" id="rewardCodeModalValue">{{ reward.reward_code }}</div>
           <div class="fw-semibold mb-3">{{ reward.reward_type }}</div>
+          <button type="button" class="copy-code-btn mb-3" data-copy-target="rewardCodeModalValue"><i class="bi bi-copy me-2"></i>Copy code</button>
           <div class="alert alert-warning text-start mb-0">
             Bring your <strong>original receipt</strong> and a <strong>screenshot of this code</strong> to the store for verification. This code can only be redeemed once.
           </div>
@@ -99,6 +110,38 @@ PURPOSE: The "Success Page". Customers see this after submitting the survey.
 
 {% block scripts %}
   {{ super() }}
+  <style>
+    body {
+      background: radial-gradient(circle at 50% -10%, color-mix(in srgb, var(--tenant-primary) 18%, transparent), transparent 34rem), #f7f7f9;
+    }
+    .reward-app-shell { width: 100%; padding: clamp(.25rem, 3vw, 2rem) 0 3rem; }
+    .reward-app-frame { width: min(100%, 620px); margin: 0 auto; }
+    .reward-app-card { border-radius: 32px; overflow: hidden; box-shadow: 0 28px 80px rgba(17,24,39,.13), 0 2px 9px rgba(17,24,39,.05); }
+    .success-orb { width: 68px; height: 68px; display: grid; place-items: center; border-radius: 22px; color: #fff; font-size: 2rem; font-weight: 800; background: var(--tenant-primary); box-shadow: 0 14px 30px color-mix(in srgb, var(--tenant-primary) 32%, transparent); transform: rotate(-4deg); }
+    .reward-intro { display: flex; align-items: center; gap: 1rem; padding: 1rem; border-radius: 20px; background: color-mix(in srgb, var(--tenant-primary) 9%, white); color: #25212a; border: 1px solid color-mix(in srgb, var(--tenant-primary) 18%, white); }
+    .gift-emoji { width: 52px; height: 52px; flex: 0 0 52px; display: grid; place-items: center; border-radius: 17px; font-size: 1.75rem; background: #fff; box-shadow: 0 7px 18px rgba(17,24,39,.08); }
+    .proof-card { border: 1px solid #e2e4ea; border-radius: 18px; background: #fff; }
+    .proof-card .form-control { min-height: 50px; border-radius: 13px; color: #111827 !important; }
+    .reward-ticket { position: relative; overflow: hidden; text-align: center; padding: 1.35rem; border-radius: 26px; color: #241d1a; background: linear-gradient(145deg, color-mix(in srgb, var(--tenant-primary) 16%, white), #fff 72%); border: 1px solid color-mix(in srgb, var(--tenant-primary) 24%, white); box-shadow: 0 18px 42px rgba(17,24,39,.10); }
+    .reward-ticket::after { content: ''; position: absolute; width: 130px; height: 130px; border-radius: 50%; right: -54px; top: -60px; background: color-mix(in srgb, var(--tenant-primary) 14%, transparent); }
+    .reward-ticket-top { display: flex; align-items: center; justify-content: center; gap: .65rem; margin-bottom: .9rem; }
+    .reward-ticket-gift, .modal-gift { font-size: 2.5rem; filter: drop-shadow(0 7px 8px rgba(17,24,39,.12)); }
+    .reward-unlocked { padding: .4rem .7rem; border-radius: 999px; color: color-mix(in srgb, var(--tenant-primary) 80%, #111827); background: #fff; border: 1px solid color-mix(in srgb, var(--tenant-primary) 22%, white); font-size: .74rem; font-weight: 800; letter-spacing: .03em; text-transform: uppercase; }
+    .reward-eyebrow { color: #68626f; font-weight: 600; }
+    .reward-code { margin: .35rem 0; color: color-mix(in srgb, var(--tenant-primary) 78%, #111827); font: 800 clamp(1.65rem, 7vw, 2.4rem)/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; letter-spacing: .09em; overflow-wrap: anywhere; }
+    .reward-type { font-weight: 750; color: #37313c; }
+    .copy-code-btn { margin-top: .85rem; border: 1px solid color-mix(in srgb, var(--tenant-primary) 24%, white); border-radius: 13px; padding: .65rem 1rem; font-weight: 700; color: color-mix(in srgb, var(--tenant-primary) 78%, #111827); background: #fff; transition: transform .2s, box-shadow .2s; }
+    .copy-code-btn:hover { transform: translateY(-1px); box-shadow: 0 7px 16px rgba(17,24,39,.09); }
+    .ticket-divider { margin: 1.15rem -1.35rem 1rem; border-top: 2px dashed color-mix(in srgb, var(--tenant-primary) 25%, white); }
+    .reward-ticket p { color: #625c67; }
+    .reward-modal { border-radius: 28px; overflow: hidden; }
+    .reward-modal .modal-header, .reward-modal .modal-footer { border-color: #ececf0; }
+    @media (max-width: 576px) {
+      .reward-app-shell { padding-top: 0; }
+      .reward-app-card { border-radius: 0 0 28px 28px; }
+      .reward-app-card > .card-body { padding: 1.35rem !important; }
+    }
+  </style>
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <script>
     const reviewConfirmation = document.getElementById('reviewCompletedConfirmation');
@@ -145,5 +188,20 @@ PURPOSE: The "Success Page". Customers see this after submitting the survey.
 
     const rewardModalElement = document.getElementById('rewardCodeModal');
     if (rewardModalElement) bootstrap.Modal.getOrCreateInstance(rewardModalElement).show();
+
+    document.querySelectorAll('[data-copy-target]').forEach(button => {
+      button.addEventListener('click', async () => {
+        const code = document.getElementById(button.dataset.copyTarget)?.textContent.trim();
+        if (!code) return;
+        try {
+          await navigator.clipboard.writeText(code);
+          const original = button.innerHTML;
+          button.innerHTML = '<i class="bi bi-check2 me-2"></i>Copied';
+          setTimeout(() => { button.innerHTML = original; }, 1600);
+        } catch (_) {
+          window.prompt('Copy your reward code:', code);
+        }
+      });
+    });
   </script>
 {% endblock %}
