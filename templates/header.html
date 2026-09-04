@@ -1,7 +1,7 @@
 <!-- Top Navigation Header -->
 <header class="border-bottom shadow-sm" style="position: sticky; top: 0; z-index: 1030; background: linear-gradient(135deg, var(--tenant-primary) 0%, var(--tenant-secondary) 100%);">
   <div class="container-fluid px-4">
-    <div class="d-flex justify-content-between align-items-center py-3">
+    <div class="d-flex justify-content-between align-items-center py-3 position-relative">
       <div class="d-flex align-items-center flex-grow-1 min-width-0">
         <div class="me-4 flex-shrink-0">
           <div class="d-flex align-items-center">
@@ -12,7 +12,7 @@
             </div>
           </div>
         </div>
-        <nav class="d-none d-lg-flex flex-nowrap overflow-hidden">
+        <nav class="header-primary-nav d-none d-lg-flex flex-nowrap overflow-hidden">
           <a href="{{ url_for('admin_dashboard') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'admin_dashboard' %}active{% endif %}">
             <i class="bi bi-speedometer2 me-2" style="color: white !important;"></i>Dashboard
           </a>
@@ -24,12 +24,6 @@
           <a href="{{ url_for('master_questionnaire') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'master_questionnaire' %}active{% endif %}">
             <i class="bi bi-question-square me-2" style="color: white !important;"></i>Survey
           </a>
-          {% if session.get('role') == 'superadmin' %}
-            <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
-            <a href="{{ url_for('history') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'history' %}active{% endif %}">
-              <i class="bi bi-clock-history me-2" style="color: white !important;"></i>History
-            </a>
-          {% endif %}
           {% if session.get('role') in ('admin', 'superadmin') %}
           <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
           <a href="{{ url_for('admin_rewards') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'admin_rewards' %}active{% endif %}">
@@ -107,6 +101,13 @@
                 <i class="bi bi-person-gear me-2"></i>Account
               </a>
             </li>
+            {% if session.get('role') == 'superadmin' %}
+            <li>
+              <a href="{{ url_for('history') }}" class="dropdown-item">
+                <i class="bi bi-clock-history me-2"></i>History
+              </a>
+            </li>
+            {% endif %}
             <li><hr class="dropdown-divider"></li>
             <li>
               <a href="{{ url_for('logout') }}" class="dropdown-item text-danger">
