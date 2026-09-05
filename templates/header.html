@@ -14,29 +14,24 @@
         </div>
         <nav class="header-primary-nav d-none d-lg-flex flex-nowrap overflow-hidden">
           <a href="{{ url_for('admin_dashboard') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'admin_dashboard' %}active{% endif %}">
-            <i class="bi bi-speedometer2 me-2" style="color: #FFC109 !important;"></i>Dashboard
+            <i class="bi bi-speedometer2 me-2"></i>Dashboard
           </a>
-          <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
           <a href="{{ url_for('stores_management') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'stores_management' or 'store' in request.endpoint %}active{% endif %}">
-            <i class="bi bi-shop me-2" style="color: #FFC109 !important;"></i>Stores
+            <i class="bi bi-shop me-2"></i>Stores
           </a>
-          <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
           <a href="{{ url_for('assigned_store_survey') if session.get('role') == 'user' else url_for('master_questionnaire') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint in ('master_questionnaire', 'assigned_store_survey') %}active{% endif %}" {% if session.get('role') == 'user' %}target="_blank" rel="noopener"{% endif %}>
-            <i class="bi bi-question-square me-2" style="color: #FFC109 !important;"></i>Survey
+            <i class="bi bi-question-square me-2"></i>Survey
           </a>
-          <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
           <a href="{{ url_for('admin_rewards') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'admin_rewards' %}active{% endif %}">
-            <i class="bi bi-gift me-2" style="color: #FFC109 !important;"></i>Rewards
+            <i class="bi bi-gift me-2"></i>Rewards
           </a>
           {% if session.get('role') == 'superadmin' %}
-          <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
           <a href="{{ url_for('admin_users') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'admin_users' %}active{% endif %}">
-            <i class="bi bi-people me-2" style="color: #FFC109 !important;"></i>Users
+            <i class="bi bi-people me-2"></i>Users
           </a>
           {% endif %}
-          <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
           <a href="{{ url_for('admin_messages') if session.get('role') == 'superadmin' else url_for('client_support') }}" class="text-decoration-none topnav-link message-nav-link px-3 py-2 rounded-2 text-nowrap position-relative {% if request.endpoint in ('admin_messages', 'client_support') %}active{% endif %}">
-            <i class="bi bi-chat-dots me-2" style="color: #FFC109 !important;"></i>Messages
+            <i class="bi bi-chat-dots me-2"></i>Messages
             <span id="message-count-badge" class="message-nav-badge" aria-label="0 unread messages">0</span>
           </a>
         </nav>

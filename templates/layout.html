@@ -329,7 +329,7 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
       }
 
       .topnav-link:hover {
-        background: rgba(255, 255, 255, 0.15);
+        background: rgba(255, 193, 9, 0.18);
         backdrop-filter: blur(8px);
         -webkit-backdrop-filter: blur(8px);
         color: white;
@@ -346,15 +346,15 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
       }
 
       .topnav-link.active {
-        background: rgba(255, 255, 255, 0.15);
+        background: var(--ui-highlight);
         backdrop-filter: blur(8px);
         -webkit-backdrop-filter: blur(8px);
-        color: white !important;
+        color: var(--tenant-primary) !important;
         font-weight: 600;
       }
 
       .topnav-link.active i {
-        color: var(--ui-highlight) !important;
+        color: var(--tenant-primary) !important;
       }
 
       .mobile-menu-toggle {

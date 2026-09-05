@@ -467,7 +467,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
     <div class="row g-3 mb-3">
       {% for store in stores %}
         <div class="col-md-6 col-lg-4">
-          <div class="card store-card h-100 border-0 shadow-sm" data-store-id="{{ store.id }}">
+          <div class="card store-card h-100 border-0 shadow-sm" data-store-id="{{ store.id }}" data-store-url="{{ url_for('store_feedback', store_id=store.id) }}" role="link" tabindex="0" aria-label="View {{ store.store_name }}">
             <!-- Status accent bar -->
             <div class="store-card-accent bg-{{ 'success' if store.status == 'active' else 'secondary' if store.status == 'inactive' else 'warning' }}"></div>
             <div class="card-body p-3 d-flex flex-column">
@@ -545,12 +545,6 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
               </div>
               {% endif %}
 
-              <!-- Spacer pushes button to bottom -->
-              <div class="mt-auto" onclick="event.stopPropagation();">
-                <a href="{{ url_for('store_feedback', store_id=store.id) }}" class="btn btn-sm w-100 store-card-btn">
-                  <i class="bi bi-shop me-1"></i>View Store
-                </a>
-              </div>
             </div>
           </div>
         </div>
@@ -589,7 +583,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
         <div class="row g-3">
           {% for store in store_list %}
             <div class="col-md-6 col-lg-4">
-              <div class="card store-card h-100 border-0 shadow-sm" data-store-id="{{ store.id }}">
+              <div class="card store-card h-100 border-0 shadow-sm" data-store-id="{{ store.id }}" data-store-url="{{ url_for('store_feedback', store_id=store.id) }}" role="link" tabindex="0" aria-label="View {{ store.store_name }}">
                 <!-- Status accent bar -->
                 <div class="store-card-accent bg-{{ 'success' if store.status == 'active' else 'secondary' if store.status == 'inactive' else 'warning' }}"></div>
                 <div class="card-body p-3 d-flex flex-column">
@@ -659,12 +653,6 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   </div>
                   {% endif %}
 
-                  <!-- Spacer pushes button to bottom -->
-                  <div class="mt-auto" onclick="event.stopPropagation();">
-                    <a href="{{ url_for('store_feedback', store_id=store.id) }}" class="btn btn-sm w-100 store-card-btn">
-                      <i class="bi bi-shop me-1"></i>View Store
-                    </a>
-                  </div>
                 </div>
               </div>
             </div>
@@ -780,6 +768,12 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
     border-radius: 0.75rem !important;
     overflow: visible;
     position: relative;
+    cursor: pointer;
+}
+
+.store-card:focus-visible {
+    outline: 3px solid #FFC109;
+    outline-offset: 3px;
 }
 
 .store-card:hover {
@@ -850,21 +844,6 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
     .store-action-icon { width: 30px; height: 30px; font-size: 1.05rem; }
 }
 
-.store-card-btn {
-    background: #111111;
-    color: #fff;
-    border: none;
-    border-radius: 0.5rem;
-    font-weight: 500;
-    transition: all 0.2s ease;
-}
-
-.store-card-btn:hover {
-    background: #000000;
-    color: #fff;
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
-}
 
 /* Enhanced form controls with white background */
 .form-control {
@@ -990,6 +969,18 @@ const storesData = {{ all_stores | tojson | safe }};
 let selectedStores = new Set();
 
 document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('.store-card[data-store-url]').forEach(card => {
+        card.addEventListener('click', function(event) {
+            if (event.target.closest('button, a, input, select, textarea, .store-card-actions')) return;
+            window.location.href = this.dataset.storeUrl;
+        });
+        card.addEventListener('keydown', function(event) {
+            if (event.target !== this || !['Enter', ' '].includes(event.key)) return;
+            event.preventDefault();
+            window.location.href = this.dataset.storeUrl;
+        });
+    });
+
     // Clear filters button
     const clearFilters = document.getElementById('clearFilters');
     if (clearFilters) {
