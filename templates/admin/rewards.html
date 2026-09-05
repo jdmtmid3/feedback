@@ -165,6 +165,11 @@
       <div class="modal-footer border-0 pt-0">
         <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button>
         <form method="POST" id="markUsedConfirmForm">
+          <input type="hidden" name="search" value="{{ search }}">
+          <input type="hidden" name="status" value="{{ status_filter }}">
+          <input type="hidden" name="store" value="{{ store_filter }}">
+          <input type="hidden" name="per_page" value="{{ per_page }}">
+          <input type="hidden" name="page" value="{{ page }}">
           <button type="submit" class="btn btn-success"><i class="bi bi-check-circle me-1"></i>Yes, Mark Used</button>
         </form>
       </div>
@@ -203,9 +208,20 @@
         document.querySelectorAll('#rewardCodesModal .filtered-codes-empty').forEach(emptyState => emptyState.classList.toggle('d-none', matchingCodes > 0));
         const storeFilter = document.getElementById('rewardStore');
         if (storeFilter) storeFilter.value = storeId;
+        const returnStore = document.querySelector('#markUsedConfirmForm input[name="store"]');
+        if (returnStore) returnStore.value = storeId;
         codesModal?.show();
       });
     });
+
+    const reopenCodesModal = {{ 'true' if search or status_filter or store_filter else 'false' }};
+    if (reopenCodesModal && codesModal) {
+      const selectedStore = document.getElementById('rewardStore')?.selectedOptions?.[0];
+      if (selectedStore?.value) {
+        document.getElementById('rewardCodesTitle').textContent = `Reward Codes · ${selectedStore.textContent}`;
+      }
+      codesModal.show();
+    }
 
     const modal = document.getElementById('markUsedConfirmModal');
     const form = document.getElementById('markUsedConfirmForm');

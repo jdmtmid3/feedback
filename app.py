@@ -1,7922 +1,1997 @@
-import os
-import csv
-import base64
-import io
-import urllib.parse
-import logging
-import sys
-import time
-import traceback
-import socket
-import json
-import re
-import secrets
-import mysql.connector
-from mysql.connector import MySQLConnection, Error
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, session, send_file
-from flask_mail import Mail, Message
-import qrcode
-from email_config import EmailConfig
-from collections import defaultdict
-from typing import List, Dict, Any, Optional
-from fpdf import FPDF
-from dotenv import load_dotenv
-from datetime import date, datetime, timedelta, timezone
-import bcrypt
-from functools import wraps
-
-
-load_dotenv()
-
-
-# Default licensing portal URL when not configured in DB or env
-DEFAULT_PORTAL_URL = os.getenv(
-    "LICENSING_PORTAL_URL",
-    "https://feedbacklicensing-production-c938.up.railway.app",
-).rstrip("/")
-LEGACY_PORTAL_URLS = {
-    "https://feedbacklicensing-production.up.railway.app",
-    "https://feedbacklicensing-production.up.railway.app/",
-}
-
-
-def create_app() -> Flask:
-    app = Flask(__name__)
-
-    # --- LOGGING SEUP ---
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        handlers=[logging.StreamHandler(sys.stdout)]
-    )
-    logger = logging.getLogger(__name__)
-
-    logger.info(f"AVAILABLE ENV VARS: {list(os.environ.keys())}")
-
-    # --- ENVIRONMENT CONFIG ---
-    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY") or secrets.token_hex(32)
-    app.config.update(
-        SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE="Lax",
-        SESSION_COOKIE_SECURE=os.getenv("RAILWAY_ENVIRONMENT") is not None,
-    )
-
-    # Database configuration handling
-    # PRIORITY: 1. Railway individual variables (Most reliable)
-    #           2. MYSQL_URL connection string
-    #           3. Local environment / Defaults
-    
-    if os.getenv("MYSQLHOST"):
-        logger.info("Railway individual variables detected, using them for DB config.")
-        app.config["DB_CONFIG"] = {
-            "host": os.getenv("MYSQLHOST"),
-            "user": os.getenv("MYSQLUSER"),
-            "password": os.getenv("MYSQLPASSWORD"),
-            "database": os.getenv("MYSQLDATABASE"),
-            "port": int(os.getenv("MYSQLPORT", 3306)),
-        }
-    elif os.getenv("MYSQL_URL"):
-        mysql_url = os.getenv("MYSQL_URL")
-        logger.info("MYSQL_URL detected, parsing connection string...")
-        try:
-            # Clean up the URL
-            mysql_url = mysql_url.strip()
-            parsed = urllib.parse.urlparse(mysql_url)
-            app.config["DB_CONFIG"] = {
-                "host": parsed.hostname,
-                "user": parsed.username,
-                "password": parsed.password,
-                "database": parsed.path.lstrip('/'),
-                "port": parsed.port or 3306,
-            }
-        except Exception as e:
-            logger.error(f"CRITICAL: Failed to parse MYSQL_URL: {e}")
-            app.config["DB_CONFIG"] = {"host": "localhost", "port": 3306}
-    else:
-        logger.info("No production variables found, falling back to local .env or defaults.")
-        app.config["DB_CONFIG"] = {
-            "host": os.getenv("DB_HOST", "localhost"),
-            "user": os.getenv("DB_USER", "root"),
-            "password": os.getenv("DB_PASSWORD", ""),
-            "database": os.getenv("DB_NAME", "feedback_system"),
-            "port": int(os.getenv("DB_PORT", "3306")),
-        }
-
-    db_host = app.config["DB_CONFIG"].get("host")
-    db_port = app.config["DB_CONFIG"].get("port")
-    db_name = app.config["DB_CONFIG"].get("database")
-    logger.info(f"DB CONFIG FINALIZED: host={db_host}, port={db_port}, database={db_name}")
-
-    # FORCE FAIL if host is still localhost on Railway
-    if os.getenv("RAILWAY_ENVIRONMENT") and db_host == "localhost":
-        logger.critical("FATAL: App is running on Railway but host is still 'localhost'. Check variables!")
-
-    def get_db_connection() -> MySQLConnection:
-        try:
-            return mysql.connector.connect(**app.config["DB_CONFIG"])
-        except Exception as e:
-            logger.error(f"Failed to connect to database: {e}")
-            raise
-
-    def normalize_portal_url(value: Optional[str]) -> str:
-        candidate = (value or "").strip()
-        if not candidate or candidate in LEGACY_PORTAL_URLS:
-            candidate = DEFAULT_PORTAL_URL
-        return candidate.rstrip("/")
-
-    def licensing_api_headers() -> Dict[str, str]:
-        return {"X-Licensing-API-Key": os.getenv("LICENSING_API_KEY", "")}
-
-    from contextlib import contextmanager
-
-    @contextmanager
-    def get_db_connection_with_transaction():
-        """Context manager for database connections with automatic rollback on error."""
-        conn = get_db_connection()
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    def log_audit(entity_type: str, entity_id: int, action: str, old_values: str = None, new_values: str = None, user_id: str = None) -> None:
-        """Log an audit entry for tracking changes"""
-        with get_db_connection_with_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO audit_logs (entity_type, entity_id, action, old_values, new_values, user_id)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (entity_type, entity_id, action, old_values, new_values, user_id),
-            )
-
-    def prune_audit_logs(days: int = 90) -> int:
-        """Delete audit logs older than specified days"""
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                DELETE FROM audit_logs
-                WHERE created_at < DATE_SUB(NOW(), INTERVAL %s DAY)
-                """,
-                (days,),
-            )
-            deleted_count = cursor.rowcount
-            conn.commit()
-            return deleted_count
-        finally:
-            conn.close()
-
-    # License validation functions
-    def get_license_config() -> Optional[Dict[str, Any]]:
-        """Get license configuration from database"""
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            # Create table if it doesn't exist
-            cursor.execute("CREATE TABLE IF NOT EXISTS license_config (id INT AUTO_INCREMENT PRIMARY KEY, license_key VARCHAR(255) NOT NULL, api_key VARCHAR(255) NOT NULL, licensing_portal_url VARCHAR(255) DEFAULT 'https://feedbacklicensing-production-c938.up.railway.app', main_system_url VARCHAR(255) NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)")
-            # Check if main_system_url column exists
-            cursor.execute("SHOW COLUMNS FROM license_config LIKE 'main_system_url'")
-            if not cursor.fetchone():
-                cursor.execute("ALTER TABLE license_config ADD COLUMN main_system_url VARCHAR(255) NULL AFTER licensing_portal_url")
-                conn.commit()
-            cursor.execute("SELECT * FROM license_config ORDER BY id DESC LIMIT 1")
-            return cursor.fetchone()
-        finally:
-            conn.close()
-
-    def validate_license_from_portal() -> Dict[str, Any]:
-        """Validate license by calling the licensing portal API"""
-        import requests
-        from requests.exceptions import RequestException, Timeout
-        
-        config = get_license_config()
-        if not config:
-            return {"valid": False, "error": "No license configured"}
-        
-        try:
-            portal_url = normalize_portal_url(config.get("licensing_portal_url"))
-            response = requests.post(
-                f"{portal_url}/api/validate/{config['license_key']}",
-                headers=licensing_api_headers(), timeout=10
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.error(f"License validation failed: {response.status_code}")
-                return {"valid": False, "error": "License validation failed"}
-        except Timeout:
-            logger.error("License validation request timed out")
-            return {"valid": False, "error": "Request timed out"}
-        except RequestException as e:
-            logger.error(f"License validation network error: {e}")
-            return {"valid": False, "error": "Network error"}
-        except Exception as e:
-            logger.error(f"Unexpected error validating license: {e}")
-            return {"valid": False, "error": str(e)}
-
-    license_status_cache: Dict[str, Dict[str, Any]] = {}
-
-    def _parse_license_expiry(data: Dict[str, Any]) -> datetime | None:
-        raw = (data.get("expiry_date") or data.get("expires_at")
-               or data.get("expiration_date") or data.get("expiry"))
-        if not raw:
-            return None
-        try:
-            value = str(raw).strip()
-            date_only = len(value) == 10
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            if date_only:
-                parsed = parsed.replace(hour=23, minute=59, second=59)
-            return parsed.astimezone(timezone.utc)
-        except (TypeError, ValueError):
-            logger.warning("Unable to parse license expiry value: %r", raw)
-            return None
-
-    def _license_is_expired(data: Dict[str, Any]) -> bool:
-        expiry = _parse_license_expiry(data)
-        if expiry and expiry <= datetime.now(timezone.utc):
-            return True
-        message = str(data.get("message") or data.get("error") or "").lower()
-        return bool(data.get("expired") or "expired" in message)
-
-    def validate_tenant_license(license_key: str, force: bool = False) -> Dict[str, Any]:
-        """Validate one client license at most once per hour per web worker."""
-        if not license_key:
-            return {"valid": False, "error": "No license configured"}
-        cached = license_status_cache.get(license_key)
-        if cached and not force and time.time() - cached["checked_at"] < 3600:
-            return cached["data"]
-        config = get_license_config()
-        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-        try:
-            import requests as http_requests
-            response = http_requests.post(
-                f"{portal_url}/api/validate/{license_key}",
-                headers=licensing_api_headers(), timeout=10,
-            )
-            data = response.json() if response.content else {}
-            if response.status_code != 200 and not data:
-                data = {"valid": False, "error": f"License API error: {response.status_code}"}
-            license_status_cache[license_key] = {"checked_at": time.time(), "data": data}
-            return data
-        except Exception as exc:
-            logger.error("Unable to validate tenant license %s: %s", license_key[:8], exc)
-            # A temporary portal/network failure must not lock out a client.
-            return cached["data"] if cached else {"valid": None, "error": "License service unavailable"}
-
-    def _user_license_keys_for_access(user: Dict[str, Any]) -> List[str]:
-        if not user or user.get("role") == "superadmin":
-            return []
-        if user.get("role") == "admin":
-            return [user["license_key"]] if user.get("license_key") else []
-        if user.get("role") != "user":
-            return []
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                """SELECT DISTINCT owner.license_key
-                   FROM user_stores us
-                   JOIN stores s ON s.id = us.store_id
-                   JOIN users owner ON owner.id = s.user_id
-                   WHERE us.user_id = %s AND owner.license_key IS NOT NULL""",
-                (int(user["id"]),),
-            )
-            return [row[0] for row in cursor.fetchall() if row[0]]
-        finally:
-            conn.close()
-
-    def _expired_license_for_user(user: Dict[str, Any], force: bool = False) -> str | None:
-        for key in _user_license_keys_for_access(user):
-            if _license_is_expired(validate_tenant_license(key, force=force)):
-                return key
-        return None
-
-    @app.context_processor
-    def inject_license_expiry_warning():
-        if session.get("role") != "admin" or "user_id" not in session:
-            return {}
-        user = get_user_by_id(session["user_id"])
-        if not user or not user.get("license_key"):
-            return {}
-        status = validate_tenant_license(user["license_key"])
-        expiry = _parse_license_expiry(status)
-        if not expiry:
-            return {}
-        seconds_left = int((expiry - datetime.now(timezone.utc)).total_seconds())
-        if seconds_left <= 0 or seconds_left > 30 * 24 * 60 * 60:
-            return {}
-        return {"license_expiry_warning": {
-            "expires_at": expiry.isoformat(),
-            "expiry_date": expiry.strftime("%B %d, %Y"),
-        }}
-
-    def check_store_limit() -> bool:
-        """Check if the current store count is within the license limit"""
-        config = get_license_config()
-        
-        # If no license is configured, block store creation
-        if not config or not config.get("license_key"):
-            return False
-        
-        license_status = validate_license_from_portal()
-        
-        # If license validation fails (invalid key, etc.), block store creation
-        if not license_status.get("valid"):
-            return False
-        
-        max_stores = license_status.get("max_stores", 0)
-        if max_stores == 0:
-            return True  # 0 means unlimited
-        
-        # Count current stores
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM stores")
-            current_count = cursor.fetchone()[0]
-            return current_count < max_stores
-        finally:
-            conn.close()
-
-    # Authentication helper functions
-    def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
-        """Get user by username"""
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT * FROM users WHERE username = %s", (username,))
-            return cursor.fetchone()
-        finally:
-            conn.close()
-
-    def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
-        """Get user by ID"""
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-            return cursor.fetchone()
-        finally:
-            conn.close()
-
-    def verify_password(password: str, password_hash: str) -> bool:
-        """Verify a password against its hash"""
-        return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
-
-    def hash_password(password: str) -> str:
-        """Hash a password"""
-        return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-    def login_required(f):
-        """Decorator to require login"""
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            if 'user_id' not in session:
-                flash("Please log in to access this page.", "warning")
-                return redirect(url_for('login'))
-            return f(*args, **kwargs)
-        return decorated_function
-
-    def role_required(*allowed_roles):
-        """Decorator to require specific role"""
-        def decorator(f):
-            @wraps(f)
-            def decorated_function(*args, **kwargs):
-                if 'user_id' not in session:
-                    flash("Please log in to access this page.", "warning")
-                    return redirect(url_for('login'))
-                
-                user = get_user_by_id(session['user_id'])
-                if not user or not user['is_active']:
-                    session.clear()
-                    flash("Your account has been deactivated.", "danger")
-                    return redirect(url_for('login'))
-                
-                if user['role'] not in allowed_roles:
-                    flash("You don't have permission to access this page.", "danger")
-                    return redirect(url_for('admin_dashboard'))
-                
-                return f(*args, **kwargs)
-            return decorated_function
-        return decorator
-
-    # â”€â”€ Global write-block for view-only users â”€â”€
-    # 'user' role is read-only. Block any non-GET requests, except a small
-    # whitelist of safe self-service endpoints (logout, password change).
-    READONLY_USER_WHITELIST = {
-        'logout',
-        'login',
-        'account_change_password',
-        # Assigned branch viewers act as area managers for staff records only.
-        'add_staff',
-        'import_staff',
-        'edit_staff',
-        'delete_staff',
-        # Assigned branch managers may redeem codes issued by their store.
-        'use_review_reward',
-        # Viewers remain read-only for business data, but may participate in
-        # their own private support conversation.
-        'api_send_client_message',
-    }
-
-    @app.before_request
-    def _enforce_view_only_user():
-        # Central guard for legacy routes that predate per-route decorators.
-        # Public survey/store pages remain accessible; all admin and internal
-        # JSON endpoints require an active application session.
-        protected_path = (
-            request.path.startswith("/admin/")
-            or request.path.startswith("/api/")
-            or request.path == "/dashboard/staff-overall"
-        )
-        api_exempt = request.path == "/api/licensing/users"  # shared-key auth
-        if protected_path and not api_exempt and 'user_id' not in session:
-            if request.path.startswith("/api/") or request.is_json:
-                return jsonify({"success": False, "error": "Authentication required"}), 401
-            flash("Please log in to access this page.", "warning")
-            return redirect(url_for('login', next=request.full_path))
-        if protected_path and not api_exempt and 'user_id' in session:
-            current_user = get_user_by_id(session['user_id'])
-            if not current_user or not current_user.get('is_active'):
-                session.clear()
-                if request.path.startswith("/api/") or request.is_json:
-                    return jsonify({"success": False, "error": "Session is no longer active"}), 401
-                flash("Your session is no longer active. Please log in again.", "warning")
-                return redirect(url_for('login'))
-            session['role'] = current_user['role']
-            if _expired_license_for_user(current_user):
-                session.clear()
-                flash("License Expired. Please Renew your license.", "danger")
-                return redirect(url_for("login"))
-
-        if request.method in ('GET', 'HEAD', 'OPTIONS'):
-            return None
-        if session.get('role') != 'user':
-            return None
-        endpoint = request.endpoint or ''
-        if endpoint in READONLY_USER_WHITELIST:
-            return None
-        # Reject everything else for view-only accounts
-        if request.is_json or request.headers.get('Accept', '').startswith('application/json'):
-            return jsonify({"success": False, "error": "Read-only account"}), 403
-        flash("Your account is read-only and cannot make changes.", "warning")
-        # Redirect back to referrer if available, else dashboard
-        return redirect(request.referrer or url_for('admin_dashboard'))
-
-    # Initialize SMTP email configuration
-    email_config = EmailConfig()
-    email_config.init_app(app)
-
-    def init_master_schema() -> None:
-        retries = 3
-        while retries > 0:
-            try:
-                logger.info(f"Attempting schema initialization... ({retries} retries left)")
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                
-                # --- CREATE TABLES IF NOT EXIST ---
-                
-                # 1. Stores Table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS stores (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        store_name VARCHAR(255) NOT NULL,
-                        address TEXT,
-                        city VARCHAR(100),
-                        province VARCHAR(100),
-                        postal_code VARCHAR(20),
-                        contact_number VARCHAR(20),
-                        email VARCHAR(255),
-                        store_manager_name VARCHAR(255),
-                        manager_contact VARCHAR(20),
-                        store_type VARCHAR(100),
-                        operating_hours VARCHAR(255),
-                        status ENUM('active', 'inactive', 'pending') DEFAULT 'active',
-                        logo_url VARCHAR(500),
-                        access_token VARCHAR(100) UNIQUE,
-                        subdomain VARCHAR(100) UNIQUE,
-                        google_review_url VARCHAR(1000) NULL,
-                        reward_type VARCHAR(255) DEFAULT 'Store Reward or Discount',
-                        google_review_mode ENUM('review_only', 'reward') DEFAULT 'reward',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-
-                # 2. Staff Table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS staff (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        store_id INT NOT NULL,
-                        first_name VARCHAR(100) NOT NULL,
-                        last_name VARCHAR(100) NOT NULL,
-                        email VARCHAR(255),
-                        phone VARCHAR(20),
-                        position VARCHAR(100),
-                        photo_url LONGTEXT,
-                        role ENUM('staff', 'manager', 'supervisor') DEFAULT 'staff',
-                        hire_date DATE,
-                        status ENUM('active', 'inactive') DEFAULT 'active',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
-                    )
-                """)
-
-                # 3. Staff Commendations Table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS staff_commendations (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        response_id INT NOT NULL,
-                        staff_id INT NOT NULL,
-                        rating INT DEFAULT 5,
-                        commendation_type ENUM('excellent_service', 'friendly_attitude', 'professional', 'helpful', 'knowledgeable') DEFAULT 'excellent_service',
-                        comment TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (response_id) REFERENCES responses(id) ON DELETE CASCADE,
-                        FOREIGN KEY (staff_id) REFERENCES staff(id) ON DELETE CASCADE
-                    )
-                """)
-
-                # 4. Questionnaires Table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS questionnaires (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        store_id INT NULL,
-                        title VARCHAR(255) NOT NULL,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        is_template BOOLEAN DEFAULT FALSE,
-                        template_id INT NULL,
-                        version INT DEFAULT 1,
-                        logo_url VARCHAR(500),
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-
-                # 3. Questions Table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS questions (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        questionnaire_id INT NOT NULL,
-                        question_text TEXT NOT NULL,
-                        question_type ENUM('rating', 'text', 'multiple_choice') NOT NULL,
-                        target_scope ENUM('overall', 'staff', 'manager') DEFAULT 'overall',
-                        min_label VARCHAR(255) DEFAULT 'Poor',
-                        max_label VARCHAR(255) DEFAULT 'Excellent',
-                        allow_comment BOOLEAN DEFAULT FALSE,
-                        is_required BOOLEAN DEFAULT TRUE,
-                        question_order INT DEFAULT 0,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        is_template BOOLEAN DEFAULT FALSE,
-                        template_id INT NULL
-                    )
-                """)
-
-                # 4. Question Options Table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS question_options (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        question_id INT NOT NULL,
-                        option_text VARCHAR(255) NOT NULL
-                    )
-                """)
-
-                # 5. Responses Table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS responses (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        questionnaire_id INT NOT NULL,
-                        store_id INT NOT NULL,
-                        user_email VARCHAR(255),
-                        receipt_number VARCHAR(100),
-                        submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        status ENUM('unresolved', 'resolved') DEFAULT 'unresolved'
-                    )
-                """)
-
-                # Track transaction numbers separately so each receipt can only
-                # be used once per store, even across browsers or simultaneous requests.
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS receipt_usages (
-                        store_id INT NOT NULL,
-                        receipt_number VARCHAR(100) NOT NULL,
-                        response_id INT NULL,
-                        used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        PRIMARY KEY (store_id, receipt_number),
-                        INDEX idx_receipt_usage_response (response_id)
-                    )
-                """)
-
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS global_receipt_usages (
-                        receipt_number VARCHAR(100) NOT NULL PRIMARY KEY,
-                        store_id INT NOT NULL,
-                        response_id INT NULL,
-                        used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        INDEX idx_global_receipt_response (response_id)
-                    )
-                """)
-
-                # 6. Answers Table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS answers (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        response_id INT NOT NULL,
-                        question_id INT NOT NULL,
-                        staff_id INT NULL,
-                        answer_text TEXT,
-                        rating_value DECIMAL(3,1)
-                    )
-                """)
-
-                conn.commit()
-
-                # --- UPDATE EXISTING TABLES (MIGRATIONS) ---
-                
-                # Ensure question_options table exists (fixing crash in master_questionnaire)
-                cursor.execute("SHOW TABLES LIKE 'question_options'")
-                if not cursor.fetchone():
-                    logger.info("Table 'question_options' missing. Creating it now...")
-                    cursor.execute("""
-                        CREATE TABLE question_options (
-                            id INT AUTO_INCREMENT PRIMARY KEY,
-                            question_id INT NOT NULL,
-                            option_text VARCHAR(255) NOT NULL
-                        )
-                    """)
-                    conn.commit()
-                
-                # Ensure responses table exists
-                cursor.execute("SHOW TABLES LIKE 'responses'")
-                if not cursor.fetchone():
-                    logger.info("Table 'responses' missing. Creating it now...")
-                    cursor.execute("""
-                        CREATE TABLE responses (
-                            id INT AUTO_INCREMENT PRIMARY KEY,
-                            questionnaire_id INT NOT NULL,
-                            store_id INT NOT NULL,
-                            user_email VARCHAR(255),
-                            submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            status ENUM('unresolved', 'resolved') DEFAULT 'unresolved'
-                        )
-                    """)
-                    conn.commit()
-
-                # Ensure answers table exists
-                cursor.execute("SHOW TABLES LIKE 'answers'")
-                if not cursor.fetchone():
-                    logger.info("Table 'answers' missing. Creating it now...")
-                    cursor.execute("""
-                        CREATE TABLE answers (
-                            id INT AUTO_INCREMENT PRIMARY KEY,
-                            response_id INT NOT NULL,
-                            question_id INT NOT NULL,
-                            answer_text TEXT,
-                            rating_value DECIMAL(3,1)
-                        )
-                    """)
-                    conn.commit()
-                
-                # Check for responses table columns
-                cursor.execute("SHOW COLUMNS FROM responses LIKE 'user_email'")
-                if not cursor.fetchone():
-                    cursor.execute("ALTER TABLE responses ADD COLUMN user_email VARCHAR(255) AFTER submitted_at")
-                
-                cursor.execute("SHOW COLUMNS FROM responses LIKE 'status'")
-                if not cursor.fetchone():
-                    cursor.execute("ALTER TABLE responses ADD COLUMN status ENUM('unresolved', 'resolved') DEFAULT 'unresolved' AFTER user_email")
-                
-                cursor.execute("SHOW COLUMNS FROM responses LIKE 'is_read'")
-                if not cursor.fetchone():
-                    cursor.execute("ALTER TABLE responses ADD COLUMN is_read BOOLEAN DEFAULT FALSE AFTER status")
-                
-                # Ensure system_notifications table exists
-                cursor.execute("SHOW TABLES LIKE 'system_notifications'")
-                if not cursor.fetchone():
-                    logger.info("Table 'system_notifications' missing. Creating it now...")
-                    cursor.execute("""
-                        CREATE TABLE system_notifications (
-                            id INT AUTO_INCREMENT PRIMARY KEY,
-                            message TEXT NOT NULL,
-                            type VARCHAR(50) DEFAULT 'info',
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            is_read BOOLEAN DEFAULT FALSE
-                        )
-                    """)
-                    conn.commit()
-                
-                # Create audit log table
-                cursor.execute("SHOW TABLES LIKE 'audit_logs'")
-                if not cursor.fetchone():
-                    logger.info("Creating audit_logs table...")
-                    cursor.execute("""
-                        CREATE TABLE audit_logs (
-                            id INT AUTO_INCREMENT PRIMARY KEY,
-                            entity_type VARCHAR(50) NOT NULL,
-                            entity_id INT NOT NULL,
-                            action VARCHAR(50) NOT NULL,
-                            old_values TEXT,
-                            new_values TEXT,
-                            user_id VARCHAR(255),
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                    """)
-                    conn.commit()
-
-                # Create client_conversations table for messaging system
-                cursor.execute("SHOW TABLES LIKE 'client_conversations'")
-                if not cursor.fetchone():
-                    logger.info("Creating client_conversations table...")
-                    cursor.execute("""
-                        CREATE TABLE client_conversations (
-                            id INT AUTO_INCREMENT PRIMARY KEY,
-                            client_identifier VARCHAR(255) NOT NULL UNIQUE,
-                            company_name VARCHAR(255),
-                            license_key VARCHAR(255),
-                            contact_email VARCHAR(255),
-                            portal_conversation_id INT NULL,
-                            last_message_at TIMESTAMP NULL,
-                            last_message_preview TEXT NULL,
-                            unread_count INT DEFAULT 0,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                            INDEX idx_client_identifier (client_identifier),
-                            INDEX idx_last_message_at (last_message_at)
-                        )
-                    """)
-                    conn.commit()
-                else:
-                    # Check if portal_conversation_id column exists, add if missing
-                    cursor.execute("SHOW COLUMNS FROM client_conversations LIKE 'portal_conversation_id'")
-                    if not cursor.fetchone():
-                        logger.info("Adding 'portal_conversation_id' column to client_conversations table...")
-                        cursor.execute("ALTER TABLE client_conversations ADD COLUMN portal_conversation_id INT NULL AFTER contact_email")
-                        conn.commit()
-
-                # Create messages table for individual messages in conversations
-                cursor.execute("SHOW TABLES LIKE 'client_messages'")
-                if not cursor.fetchone():
-                    logger.info("Creating client_messages table...")
-                    cursor.execute("""
-                        CREATE TABLE client_messages (
-                            id INT AUTO_INCREMENT PRIMARY KEY,
-                            conversation_id INT NOT NULL,
-                            sender_type ENUM('client', 'admin') NOT NULL,
-                            sender_name VARCHAR(255),
-                            message TEXT NOT NULL,
-                            is_read BOOLEAN DEFAULT FALSE,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            FOREIGN KEY (conversation_id) REFERENCES client_conversations(id) ON DELETE CASCADE,
-                            INDEX idx_conversation_created (conversation_id, created_at)
-                        )
-                    """)
-                    conn.commit()
-                
-                # Create users table
-                cursor.execute("SHOW TABLES LIKE 'users'")
-                if not cursor.fetchone():
-                    logger.info("Creating users table...")
-                    cursor.execute("""
-                        CREATE TABLE users (
-                            id INT AUTO_INCREMENT PRIMARY KEY,
-                            username VARCHAR(100) NOT NULL UNIQUE,
-                            email VARCHAR(255) NOT NULL UNIQUE,
-                            password_hash VARCHAR(255) NOT NULL,
-                            role ENUM('superadmin', 'admin', 'user') DEFAULT 'admin',
-                            is_active BOOLEAN DEFAULT TRUE,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                        )
-                    """)
-                    conn.commit()
-                    
-                    # Create license_config table
-                    cursor.execute("SHOW TABLES LIKE 'license_config'")
-                    if not cursor.fetchone():
-                        logger.info("Creating license_config table...")
-                        cursor.execute("""
-                            CREATE TABLE license_config (
-                                id INT AUTO_INCREMENT PRIMARY KEY,
-                                license_key VARCHAR(255) NOT NULL,
-                                api_key VARCHAR(255) NOT NULL,
-                                licensing_portal_url VARCHAR(255) DEFAULT 'https://feedbacklicensing-production-c938.up.railway.app',
-                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                            )
-                        """)
-                        conn.commit()
-                    
-                    # Optional one-time bootstrap. Never ship a default password.
-                    bootstrap_username = os.getenv("BOOTSTRAP_ADMIN_USERNAME")
-                    bootstrap_email = os.getenv("BOOTSTRAP_ADMIN_EMAIL")
-                    bootstrap_password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD")
-                    if bootstrap_username and bootstrap_email and bootstrap_password:
-                        password_hash = bcrypt.hashpw(bootstrap_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-                        cursor.execute(
-                            "INSERT INTO users (username, email, password_hash, role) VALUES (%s, %s, %s, %s)",
-                            (bootstrap_username, bootstrap_email, password_hash, "superadmin")
-                        )
-                        conn.commit()
-                        logger.info("Created bootstrap superadmin user from environment")
-                    else:
-                        logger.warning("Users table created without a bootstrap admin; configure BOOTSTRAP_ADMIN_* variables if this is a new installation")
-                
-                # ----------------------------------------------------------------
-                # Role hierarchy migration (legacy -> new):
-                #   dev   -> superadmin    (internal/full access)
-                #   admin -> superadmin    (legacy admin had full access too)
-                #   user  -> admin         ('admin' is now the client role)
-                #   user  (new)            view-only (no rows yet)
-                # ----------------------------------------------------------------
-                try:
-                    cursor.execute("SHOW COLUMNS FROM users LIKE 'role'")
-                    role_col = cursor.fetchone()
-                    role_type = (role_col[1] if role_col else '') or ''
-                    needs_migration = 'dev' in role_type.lower()
-                    if needs_migration:
-                        logger.info("Migrating user roles to new hierarchy (superadmin/admin/user)...")
-                        cursor.execute(
-                            "ALTER TABLE users MODIFY COLUMN role "
-                            "ENUM('dev','superadmin','admin','user') DEFAULT 'user'"
-                        )
-                        cursor.execute("UPDATE users SET role='superadmin' WHERE role IN ('dev','admin')")
-                        cursor.execute("UPDATE users SET role='admin' WHERE role='user'")
-                        cursor.execute(
-                            "ALTER TABLE users MODIFY COLUMN role "
-                            "ENUM('superadmin','admin','user') DEFAULT 'admin'"
-                        )
-                        conn.commit()
-                        logger.info("Role migration complete.")
-                    else:
-                        # Defensive: even if ENUM is up-to-date, fix any stragglers with role='dev'
-                        cursor.execute("SELECT COUNT(*) FROM users WHERE role='dev'")
-                        leftover = cursor.fetchone()[0]
-                        if leftover:
-                            logger.warning(f"Found {leftover} legacy 'dev' user(s); promoting to superadmin.")
-                            cursor.execute("UPDATE users SET role='superadmin' WHERE role='dev'")
-                            conn.commit()
-                except Exception as e:
-                    logger.error(f"Role migration error: {e}")
-
-                # Create user_stores link table for per-store view-only assignments
-                cursor.execute("SHOW TABLES LIKE 'user_stores'")
-                if not cursor.fetchone():
-                    logger.info("Creating user_stores table for per-store view-only access...")
-                    cursor.execute("""
-                        CREATE TABLE user_stores (
-                            id INT AUTO_INCREMENT PRIMARY KEY,
-                            user_id INT NOT NULL,
-                            store_id INT NOT NULL,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            UNIQUE KEY uniq_user_store (user_id, store_id),
-                            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                            FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
-                        )
-                    """)
-                    conn.commit()
-
-                # Check for users table columns - add max_stores and license_key for client licensing
-                cursor.execute("SHOW COLUMNS FROM users LIKE 'max_stores'")
-                if not cursor.fetchone():
-                    logger.info("Adding 'max_stores' column to users table...")
-                    cursor.execute("ALTER TABLE users ADD COLUMN max_stores INT DEFAULT 0 AFTER role")
-                    conn.commit()
-                
-                cursor.execute("SHOW COLUMNS FROM users LIKE 'license_key'")
-                if not cursor.fetchone():
-                    logger.info("Adding 'license_key' column to users table...")
-                    cursor.execute("ALTER TABLE users ADD COLUMN license_key VARCHAR(255) NULL AFTER max_stores")
-                    conn.commit()
-
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS review_rewards (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        response_id INT NOT NULL UNIQUE,
-                        store_id INT NOT NULL,
-                        owner_user_id INT NOT NULL,
-                        license_key VARCHAR(255),
-                        customer_email VARCHAR(255) NOT NULL,
-                        claim_token VARCHAR(100) NOT NULL UNIQUE,
-                        reward_code VARCHAR(40) UNIQUE,
-                        reward_type VARCHAR(255) NOT NULL,
-                        status ENUM('pending','issued','used') DEFAULT 'pending',
-                        email_sent BOOLEAN DEFAULT FALSE,
-                        email_error TEXT NULL,
-                        google_review_proof MEDIUMTEXT NULL,
-                        receipt_proof MEDIUMTEXT NULL,
-                        review_ocr_text TEXT NULL,
-                        receipt_ocr_text TEXT NULL,
-                        proof_verified_at TIMESTAMP NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        issued_at TIMESTAMP NULL,
-                        used_at TIMESTAMP NULL,
-                        FOREIGN KEY (response_id) REFERENCES responses(id) ON DELETE CASCADE,
-                        FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE,
-                        FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE,
-                        INDEX idx_reward_tenant (owner_user_id, license_key, status)
-                    )
-                """)
-                conn.commit()
-
-                for column_name, column_definition in (
-                    ("google_review_proof", "MEDIUMTEXT NULL"),
-                    ("receipt_proof", "MEDIUMTEXT NULL"),
-                    ("review_ocr_text", "TEXT NULL"),
-                    ("receipt_ocr_text", "TEXT NULL"),
-                    ("proof_verified_at", "TIMESTAMP NULL"),
-                ):
-                    cursor.execute(f"SHOW COLUMNS FROM review_rewards LIKE '{column_name}'")
-                    if not cursor.fetchone():
-                        cursor.execute(f"ALTER TABLE review_rewards ADD COLUMN {column_name} {column_definition}")
-                conn.commit()
-                
-                # Check for questionnaires table columns
-                cursor.execute("SHOW COLUMNS FROM questionnaires LIKE 'is_template'")
-                if not cursor.fetchone():
-                    logger.info("Adding 'is_template' column to questionnaires table...")
-                    cursor.execute("ALTER TABLE questionnaires ADD COLUMN is_template BOOLEAN DEFAULT FALSE AFTER is_active")
-                    conn.commit()
-                
-                cursor.execute("SHOW COLUMNS FROM questionnaires LIKE 'template_id'")
-                if not cursor.fetchone():
-                    logger.info("Adding 'template_id' column to questionnaires table...")
-                    cursor.execute("ALTER TABLE questionnaires ADD COLUMN template_id INT NULL AFTER is_template")
-                    conn.commit()
-                
-                cursor.execute("SHOW COLUMNS FROM questionnaires LIKE 'version'")
-                if not cursor.fetchone():
-                    logger.info("Adding 'version' column to questionnaires table...")
-                    cursor.execute("ALTER TABLE questionnaires ADD COLUMN version INT DEFAULT 1 AFTER template_id")
-                    conn.commit()
-
-                cursor.execute("SHOW COLUMNS FROM questionnaires LIKE 'logo_url'")
-                if not cursor.fetchone():
-                    logger.info("Adding 'logo_url' column to questionnaires table...")
-                    cursor.execute("ALTER TABLE questionnaires ADD COLUMN logo_url LONGTEXT AFTER version")
-                    conn.commit()
-                else:
-                    # Always try to update to LONGTEXT to ensure it can handle base64 data
-                    try:
-                        logger.info("Ensuring 'logo_url' column is LONGTEXT for base64 storage...")
-                        cursor.execute("ALTER TABLE questionnaires MODIFY COLUMN logo_url LONGTEXT")
-                        conn.commit()
-                        logger.info("'logo_url' column updated to LONGTEXT")
-                    except Exception as e:
-                        logger.info(f"Column may already be LONGTEXT: {e}")
-
-                cursor.execute("SHOW COLUMNS FROM questionnaires LIKE 'owner_user_id'")
-                if not cursor.fetchone():
-                    logger.info("Adding tenant owner to questionnaires...")
-                    cursor.execute("ALTER TABLE questionnaires ADD COLUMN owner_user_id INT NULL AFTER store_id")
-                    conn.commit()
-
-                cursor.execute("SHOW COLUMNS FROM questionnaires LIKE 'license_key'")
-                if not cursor.fetchone():
-                    logger.info("Adding license scope to questionnaires...")
-                    cursor.execute("ALTER TABLE questionnaires ADD COLUMN license_key VARCHAR(255) NULL AFTER owner_user_id")
-                    conn.commit()
-
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS tenant_branding (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        owner_user_id INT NOT NULL,
-                        scope_key VARCHAR(255) NOT NULL UNIQUE,
-                        license_key VARCHAR(255) NULL,
-                        primary_color VARCHAR(7) NOT NULL DEFAULT '#1B1E76',
-                        secondary_color VARCHAR(7) NOT NULL DEFAULT '#FC8C12',
-                        accent_color VARCHAR(7) NOT NULL DEFAULT '#FC8C12',
-                        text_color VARCHAR(7) NOT NULL DEFAULT '#212529',
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                        FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
-                    )
-                """)
-                conn.commit()
-
-                # Check for questions table columns
-                cursor.execute("SHOW COLUMNS FROM questions LIKE 'is_active'")
-                if not cursor.fetchone():
-                    cursor.execute("ALTER TABLE questions ADD COLUMN is_active BOOLEAN DEFAULT TRUE AFTER question_order")
-                
-                cursor.execute("SHOW COLUMNS FROM questions LIKE 'is_template'")
-                if not cursor.fetchone():
-                    logger.info("Adding 'is_template' column to questions table...")
-                    cursor.execute("ALTER TABLE questions ADD COLUMN is_template BOOLEAN DEFAULT FALSE AFTER is_active")
-                    conn.commit()
-
-                cursor.execute("SHOW COLUMNS FROM questions LIKE 'template_id'")
-                if not cursor.fetchone():
-                    logger.info("Adding 'template_id' column to questions table...")
-                    cursor.execute("ALTER TABLE questions ADD COLUMN template_id INT NULL AFTER is_template")
-                    conn.commit()
-                
-                cursor.execute("SHOW COLUMNS FROM questions LIKE 'min_label'")
-                if not cursor.fetchone():
-                    logger.info("Adding 'min_label' column to questions table...")
-                    cursor.execute("ALTER TABLE questions ADD COLUMN min_label VARCHAR(255) DEFAULT 'Poor' AFTER question_type")
-                    conn.commit()
-
-                cursor.execute("SHOW COLUMNS FROM questions LIKE 'max_label'")
-                if not cursor.fetchone():
-                    logger.info("Adding 'max_label' column to questions table...")
-                    cursor.execute("ALTER TABLE questions ADD COLUMN max_label VARCHAR(255) DEFAULT 'Excellent' AFTER min_label")
-                    conn.commit()
-
-                cursor.execute("SHOW COLUMNS FROM questions LIKE 'allow_comment'")
-                if not cursor.fetchone():
-                    logger.info("Adding 'allow_comment' column to questions table...")
-                    cursor.execute("ALTER TABLE questions ADD COLUMN allow_comment BOOLEAN DEFAULT FALSE AFTER max_label")
-                    conn.commit()
-
-                cursor.execute("SHOW COLUMNS FROM questions LIKE 'target_scope'")
-                if not cursor.fetchone():
-                    logger.info("Adding question target scope...")
-                    cursor.execute("ALTER TABLE questions ADD COLUMN target_scope ENUM('overall', 'staff', 'manager') DEFAULT 'overall' AFTER question_type")
-                    conn.commit()
-
-                cursor.execute("SHOW COLUMNS FROM staff LIKE 'photo_url'")
-                if not cursor.fetchone():
-                    logger.info("Adding staff profile photo...")
-                    cursor.execute("ALTER TABLE staff ADD COLUMN photo_url LONGTEXT AFTER position")
-                    conn.commit()
-
-                cursor.execute("SHOW COLUMNS FROM answers LIKE 'staff_id'")
-                if not cursor.fetchone():
-                    logger.info("Adding selected staff to questionnaire answers...")
-                    cursor.execute("ALTER TABLE answers ADD COLUMN staff_id INT NULL AFTER question_id")
-                    conn.commit()
-                
-                # Check for stores table columns
-                store_columns = [
-                    ("store_manager_name", "VARCHAR(255)"),
-                    ("manager_contact", "VARCHAR(20)"),
-                    ("store_type", "VARCHAR(100)"),
-                    ("operating_hours", "VARCHAR(255)"),
-                    ("status", "ENUM('active', 'inactive', 'pending') DEFAULT 'active'"),
-                    ("logo_url", "VARCHAR(500)"),
-                    ("access_token", "VARCHAR(100) UNIQUE"),
-                    ("subdomain", "VARCHAR(100) UNIQUE"),
-                    ("user_id", "INT"),
-                    ("license_key", "VARCHAR(255)"),
-                    ("google_review_url", "VARCHAR(1000) NULL"),
-                    ("reward_type", "VARCHAR(255) DEFAULT 'Store Reward or Discount'"),
-                    ("google_review_mode", "ENUM('review_only', 'reward') DEFAULT 'reward'")
-                ]
-                
-                for column_name, column_type in store_columns:
-                    cursor.execute(f"SHOW COLUMNS FROM stores LIKE '{column_name}'")
-                    if not cursor.fetchone():
-                        logger.info(f"Adding column {column_name} to stores table...")
-                        cursor.execute(f"ALTER TABLE stores ADD COLUMN {column_name} {column_type}")
-                        conn.commit()
-                        logger.info(f"Column {column_name} added successfully")
-
-                try:
-                    cursor.execute("ALTER TABLE stores MODIFY COLUMN logo_url LONGTEXT")
-                    conn.commit()
-                except Exception as e:
-                    logger.info(f"Store logo column may already be LONGTEXT: {e}")
-
-                # Assign user_id to existing stores that don't have it
-                cursor.execute("SELECT id FROM stores WHERE user_id IS NULL")
-                stores_without_user = cursor.fetchall()
-                if stores_without_user:
-                    logger.info(f"Assigning user_id to {len(stores_without_user)} existing stores...")
-                    # Get the first admin/dev user to assign as owner
-                    cursor.execute("SELECT id FROM users WHERE role = 'superadmin' LIMIT 1")
-                    admin_user = cursor.fetchone()
-                    if admin_user:
-                        admin_id = admin_user[0]
-                        for store_row in stores_without_user:
-                            store_id = store_row[0]
-                            cursor.execute("UPDATE stores SET user_id = %s WHERE id = %s", (admin_id, store_id))
-                        conn.commit()
-                        logger.info(f"Assigned {len(stores_without_user)} stores to user {admin_id}")
-                    else:
-                        logger.warning("No admin user found to assign existing stores to")
-
-                cursor.execute("""UPDATE stores s
-                                  INNER JOIN users u ON u.id = s.user_id
-                                  SET s.license_key = u.license_key
-                                  WHERE s.license_key IS NULL AND u.license_key IS NOT NULL""")
-                conn.commit()
-
-                # Generate access tokens for existing stores that don't have them
-                import secrets
-                cursor.execute("SELECT id FROM stores WHERE access_token IS NULL OR access_token = ''")
-                stores_without_token = cursor.fetchall()
-                if stores_without_token:
-                    logger.info(f"Generating access tokens for {len(stores_without_token)} existing stores...")
-                    for store_row in stores_without_token:
-                        store_id = store_row[0]
-                        access_token = secrets.token_urlsafe(32)
-                        cursor.execute("UPDATE stores SET access_token = %s WHERE id = %s", (access_token, store_id))
-                    conn.commit()
-
-                # Generate subdomains for existing stores that don't have them
-                cursor.execute("SELECT id, store_name FROM stores WHERE subdomain IS NULL OR subdomain = ''")
-                stores_without_subdomain = cursor.fetchall()
-                if stores_without_subdomain:
-                    logger.info(f"Generating subdomains for {len(stores_without_subdomain)} existing stores...")
-                    for store_row in stores_without_subdomain:
-                        store_id = store_row[0]
-                        store_name = store_row[1]
-                        # Generate subdomain from store name (lowercase, alphanumeric, hyphens)
-                        import re
-                        subdomain = re.sub(r'[^a-zA-Z0-9\s]', '', store_name).lower().replace(' ', '-')
-                        subdomain = re.sub(r'-+', '-', subdomain).strip('-')
-                        # Ensure uniqueness by adding random suffix if needed
-                        cursor.execute("SELECT id FROM stores WHERE subdomain = %s", (subdomain,))
-                        if cursor.fetchone():
-                            subdomain = f"{subdomain}-{secrets.token_hex(3)}"
-                        cursor.execute("UPDATE stores SET subdomain = %s WHERE id = %s", (subdomain, store_id))
-                    conn.commit()
-
-                # Check for responses table receipt_number column
-                cursor.execute("SHOW COLUMNS FROM responses LIKE 'receipt_number'")
-                if not cursor.fetchone():
-                    logger.info("Adding 'receipt_number' column to responses table...")
-                    cursor.execute("ALTER TABLE responses ADD COLUMN receipt_number VARCHAR(100) AFTER user_email")
-                    conn.commit()
-
-                # Reserve receipts already used before one-time enforcement was added.
-                cursor.execute("""
-                    INSERT IGNORE INTO receipt_usages
-                        (store_id, receipt_number, response_id, used_at)
-                    SELECT store_id, receipt_number, MIN(id), MIN(submitted_at)
-                    FROM responses
-                    WHERE receipt_number IS NOT NULL AND receipt_number <> ''
-                    GROUP BY store_id, receipt_number
-                """)
-                conn.commit()
-
-                # Enforce one-time receipt usage across every branch in the system.
-                cursor.execute("""
-                    INSERT IGNORE INTO global_receipt_usages
-                        (receipt_number, store_id, response_id, used_at)
-                    SELECT receipt_number, MIN(store_id), MIN(id), MIN(submitted_at)
-                    FROM responses
-                    WHERE receipt_number IS NOT NULL AND receipt_number <> ''
-                    GROUP BY receipt_number
-                """)
-                conn.commit()
-                
-                # Add rating column to staff_commendations if missing
-                cursor.execute("SHOW COLUMNS FROM staff_commendations LIKE 'rating'")
-                if not cursor.fetchone():
-                    logger.info("Adding 'rating' column to staff_commendations table...")
-                    cursor.execute("ALTER TABLE staff_commendations ADD COLUMN rating INT DEFAULT 5 AFTER staff_id")
-                    conn.commit()
-                
-                conn.commit()
-                conn.close()
-                logger.info("Master schema check/update completed.")
-                break
-            except Exception as e:
-                logger.error(f"Database initialization error: {e}")
-                retries -= 1
-                if retries > 0:
-                    time.sleep(5)
-                else:
-                    logger.critical("Could not initialize database schema after multiple attempts.")
-
-    # Always initialize schema on startup
-    try:
-        init_master_schema()
-        logger.info("Schema initialization completed successfully")
-    except Exception as e:
-        logger.critical(f"CRITICAL: Schema initialization failed: {e}")
-        raise
-
-    # --- ERROR HANDLERS ---
-    @app.errorhandler(Exception)
-    def handle_exception(e):
-        """Global error handler to show tracebacks for ANY crash in Railway"""
-        error_details = traceback.format_exc()
-        logger.error(f"Global Crash: {e}\n{error_details}")
-        
-        return f"""
-        <div style="font-family: sans-serif; padding: 20px; color: #721c24; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 8px;">
-            <h2 style="margin-top: 0;">Oops! Something crashed.</h2>
-            <p><b>Error:</b> {e}</p>
-            <hr>
-            <p><b>Traceback for Debugging:</b></p>
-            <pre style="background: #fff; padding: 15px; border-radius: 4px; overflow: auto; font-size: 13px;">{error_details}</pre>
-        </div>
-        """, 500
-
-    @app.errorhandler(404)
-    def not_found_error(error):
-        return "404 Not Found", 404
-
-    @app.route("/debug/env")
-    @login_required
-    def debug_env():
-        """Route to see available environment variable keys (NOT values)"""
-        user = get_user_by_id(session['user_id'])
-        if user['role'] != 'superadmin':
-            return jsonify({"error": "Unauthorized"}), 403
-        return jsonify({
-            "available_keys": list(os.environ.keys()),
-            "db_config_host": app.config["DB_CONFIG"].get("host"),
-            "db_config_port": app.config["DB_CONFIG"].get("port"),
-            "python_version": sys.version
-        })
-
-    def get_assigned_store_ids(user_id: int) -> List[int]:
-        """Return store ids a view-only user has been granted access to."""
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT store_id FROM user_stores WHERE user_id = %s", (user_id,))
-            return [row[0] for row in cursor.fetchall()]
-        except Exception as e:
-            logger.error(f"Error fetching assigned stores for user {user_id}: {e}")
-            return []
-        finally:
-            conn.close()
-
-    def can_manage_store(user_id: int, store_id: int) -> bool:
-        """Superadmins manage all stores; clients manage only stores they own."""
-        user = get_user_by_id(user_id)
-        if not user or user.get('role') == 'user':
-            return False
-        if user.get('role') == 'superadmin':
-            return True
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM stores WHERE id = %s AND user_id = %s", (store_id, user_id))
-            return cursor.fetchone() is not None
-        finally:
-            conn.close()
-
-    def can_manage_store_staff(user_id: int, store_id: int) -> bool:
-        """Allow owners/superadmins, plus viewers assigned to this exact store."""
-        user = get_user_by_id(user_id)
-        if not user:
-            return False
-        if user.get('role') in ('admin', 'superadmin'):
-            return can_manage_store(user_id, store_id)
-        if user.get('role') != 'user':
-            return False
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT 1 FROM user_stores WHERE user_id = %s AND store_id = %s LIMIT 1",
-                (user_id, store_id),
-            )
-            return cursor.fetchone() is not None
-        finally:
-            conn.close()
-
-    def fetch_stores(user_id: int | None = None, assigned_store_ids: List[int] | None = None) -> List[Dict[str, Any]]:
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-
-            if assigned_store_ids is not None:
-                # View-only user: filter by explicit list of assigned store ids
-                if not assigned_store_ids:
-                    logger.info("Fetching stores for view-only user with no assignments -> []")
-                    return []
-                placeholders = ",".join(["%s"] * len(assigned_store_ids))
-                cursor.execute(
-                    f"""
-                    SELECT id, store_name, address, city, province, postal_code,
-                           contact_number, email, store_manager_name, manager_contact,
-                           store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key,
-                           google_review_url, reward_type, google_review_mode
-                    FROM stores
-                    WHERE id IN ({placeholders})
-                    ORDER BY id ASC
-                    """,
-                    tuple(assigned_store_ids),
-                )
-            elif user_id:
-                # For client users, only show their own stores
-                logger.info(f"Fetching stores for user_id: {user_id}")
-                cursor.execute(
-                    """
-                    SELECT id, store_name, address, city, province, postal_code,
-                           contact_number, email, store_manager_name, manager_contact,
-                           store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key,
-                           google_review_url, reward_type, google_review_mode
-                    FROM stores
-                    WHERE user_id = %s
-                    ORDER BY id ASC
-                    """,
-                    (user_id,)
-                )
-            else:
-                # For admin/dev/superadmin, show all stores
-                logger.info("Fetching all stores (no user_id filter)")
-                cursor.execute(
-                    """
-                    SELECT id, store_name, address, city, province, postal_code,
-                           contact_number, email, store_manager_name, manager_contact,
-                           store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key,
-                           google_review_url, reward_type, google_review_mode
-                    FROM stores
-                    ORDER BY id ASC
-                    """
-                )
-            rows = cursor.fetchall()
-            logger.info(f"Fetched {len(rows)} stores")
-        finally:
-            conn.close()
-
-        return rows
-
-    def fetch_store_by_id(store_id: int) -> Dict[str, Any] | None:
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute(
-                """
-                SELECT id, store_name, address, city, province, postal_code,
-                       contact_number, email, store_manager_name, manager_contact,
-                       store_type, status, created_at, logo_url, access_token, subdomain, user_id, license_key,
-                       google_review_url, reward_type, google_review_mode
-                FROM stores
-                WHERE id = %s
-                LIMIT 1
-                """,
-                (store_id,),
-            )
-            store = cursor.fetchone()
-        finally:
-            conn.close()
-
-        return store
-
-    def create_store(
-        store_name: str,
-        address: str | None = None,
-        city: str | None = None,
-        province: str | None = None,
-        postal_code: str | None = None,
-        contact_number: str | None = None,
-        email: str | None = None,
-        store_manager_name: str | None = None,
-        manager_contact: str | None = None,
-        store_type: str | None = None,
-        status: str = "active",
-        logo_url: str | None = None,
-        subdomain: str | None = None,
-        google_review_url: str | None = None,
-        google_review_mode: str = "reward",
-        user_id: int | None = None,
-        license_key: str | None = None
-    ) -> int:
-        """Create a new store with validation."""
-        # Input validation
-        if not store_name or not store_name.strip():
-            raise ValueError("Store name is required")
-        if status not in ["active", "inactive", "pending"]:
-            raise ValueError("Invalid status value")
-        if email and "@" not in email:
-            raise ValueError("Invalid email format")
-        if google_review_mode not in {"review_only", "reward"}:
-            google_review_mode = "reward"
-        
-        import secrets
-        import re
-        access_token = secrets.token_urlsafe(32)
-        
-        # Generate subdomain from store name if not provided
-        if not subdomain:
-            subdomain = re.sub(r'[^a-zA-Z0-9\s]', '', store_name).lower().replace(' ', '-')
-            subdomain = re.sub(r'-+', '-', subdomain).strip('-')
-        
-        with get_db_connection_with_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO stores (
-                    store_name, address, city, province, postal_code,
-                    contact_number, email, store_manager_name, manager_contact,
-                    store_type, status, logo_url, access_token, subdomain, google_review_url, google_review_mode, user_id, license_key
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    store_name.strip(), address, city, province, postal_code,
-                    contact_number, email, store_manager_name, manager_contact,
-                    store_type, status, logo_url, access_token, subdomain, google_review_url, google_review_mode, user_id, license_key
-                ),
-            )
-            new_store_id = int(cursor.lastrowid)
-
-        return new_store_id
-
-    def fetch_questionnaire_by_store(store_id: int) -> Dict[str, Any] | None:
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute(
-                """
-                SELECT id, store_id, owner_user_id, license_key, title, is_active, logo_url, created_at
-                FROM questionnaires
-                WHERE store_id = %s
-                ORDER BY id ASC
-                LIMIT 1
-                """,
-                (store_id,),
-            )
-            questionnaire = cursor.fetchone()
-        finally:
-            conn.close()
-
-        return questionnaire
-
-    def fetch_questions_for_questionnaire(questionnaire_id: int) -> List[Dict[str, Any]]:
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute(
-                """
-                SELECT id, question_text, question_type, target_scope, min_label, max_label, allow_comment, is_required, question_order
-                FROM questions
-                WHERE questionnaire_id = %s AND is_active = TRUE
-                ORDER BY question_order ASC, id ASC
-                """,
-                (questionnaire_id,),
-            )
-            questions = cursor.fetchall()
-        finally:
-            conn.close()
-
-        return questions
-
-    def fetch_options_for_questions(question_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
-        if not question_ids:
-            return {}
-
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            placeholders = ", ".join(["%s"] * len(question_ids))
-            cursor.execute(
-                f"""
-                SELECT question_id, id, option_text
-                FROM question_options
-                WHERE question_id IN ({placeholders})
-                ORDER BY question_id ASC, id ASC
-                """,
-                tuple(question_ids),
-            )
-            rows = cursor.fetchall()
-        finally:
-            conn.close()
-
-        by_question: Dict[int, List[Dict[str, Any]]] = {}
-        for row in rows:
-            qid = int(row["question_id"])
-            by_question.setdefault(qid, []).append({"id": row["id"], "option_text": row["option_text"]})
-        return by_question
-
-    def get_store_public_url(store_id: int) -> str:
-        """Return a customer-shareable URL, never an internal container IP."""
-        public_domain = (os.getenv("RAILWAY_PUBLIC_DOMAIN") or "").strip().rstrip('/')
-        static_url = (os.getenv("RAILWAY_STATIC_URL") or "").strip().rstrip('/')
-        if public_domain:
-            base_url = public_domain if public_domain.startswith(("http://", "https://")) else f"https://{public_domain}"
-        elif static_url:
-            base_url = static_url if static_url.startswith(("http://", "https://")) else f"https://{static_url}"
-        else:
-            base_url = request.url_root.rstrip('/')
-        return f"{base_url}{url_for('public_survey', store_id=store_id)}"
-
-    def generate_qr_data_uri(text: str) -> str:
-        qr = qrcode.QRCode(
-            version=None,
-            error_correction=qrcode.constants.ERROR_CORRECT_M,
-            box_size=6,
-            border=2,
-        )
-        qr.add_data(text)
-        qr.make(fit=True)
-        img = qr.make_image(fill_color="black", back_color="white")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
-        return f"data:image/png;base64,{encoded}"
-
-    @app.route("/admin/stores/<int:store_id>/qr-download")
-    def download_qr(store_id: int):
-        """Download QR code as PNG file."""
-        store = fetch_store_by_id(store_id=store_id)
-        if not store:
-            flash("Store not found", "danger")
-            return redirect(url_for("stores_management"))
-        public_url = get_store_public_url(store_id=store_id)
-        qr = qrcode.QRCode(
-            version=None,
-            error_correction=qrcode.constants.ERROR_CORRECT_M,
-            box_size=10,
-            border=2,
-        )
-        qr.add_data(public_url)
-        qr.make(fit=True)
-        img = qr.make_image(fill_color="black", back_color="white")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        filename = f"QR_{store['store_name'].replace(' ', '_')}.png"
-        return send_file(buf, mimetype="image/png", as_attachment=True, download_name=filename)
-
-    # -------------------------
-    # REPORT GENERATION (CSV & PDF)
-    # -------------------------
-    def _get_report_data(store_id: int, month: str = None):
-        """Gather feedback data for reports, optionally filtered by month (YYYY-MM)."""
-        store = fetch_store_by_id(store_id=store_id)
-        if not store:
-            return None, None, None, None, None
-        all_feedback = fetch_responses_for_store(store_id=store_id, limit=10000)
-
-        # Filter by month if provided
-        if month:
-            filtered = []
-            for fb in all_feedback:
-                submitted = fb.get("submitted_at")
-                if submitted:
-                    if isinstance(submitted, str):
-                        try:
-                            submitted = datetime.strptime(submitted, "%Y-%m-%d %H:%M:%S")
-                        except (ValueError, TypeError):
-                            continue
-                    if submitted.strftime("%Y-%m") == month:
-                        filtered.append(fb)
-            all_feedback = filtered
-
-        response_ids = [int(r["id"]) for r in all_feedback]
-        answers_map = fetch_answers_for_responses(response_ids) if response_ids else {}
-
-        # Get commendations
-        commendations_map = {}
-        if response_ids:
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor(dictionary=True)
-                ph = ','.join(['%s'] * len(response_ids))
-                cursor.execute(f"""
-                    SELECT sc.response_id, s.first_name, s.last_name, s.position
-                    FROM staff_commendations sc
-                    JOIN staff s ON s.id = sc.staff_id
-                    WHERE sc.response_id IN ({ph})
-                """, response_ids)
-                for row in cursor.fetchall():
-                    commendations_map.setdefault(int(row["response_id"]), []).append(row)
-            finally:
-                conn.close()
-
-        return store, all_feedback, answers_map, commendations_map, response_ids
-
-    @app.route("/admin/stores/<int:store_id>/report/csv")
-    def download_report_csv(store_id: int):
-        """Download feedback data as CSV."""
-        month = request.args.get("month", "")
-        store, feedback_list, answers_map, commendations_map, _ = _get_report_data(store_id, month or None)
-        if not store:
-            flash("Store not found", "danger")
-            return redirect(url_for("stores_management"))
-
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow([
-            "Feedback ID", "Date", "Email", "Receipt #", "Status",
-            "Question", "Type", "Rating", "Answer",
-            "Commended Staff"
-        ])
-
-        for fb in feedback_list:
-            fb_id = int(fb["id"])
-            submitted = fb.get("submitted_at", "")
-            if hasattr(submitted, "strftime"):
-                submitted = submitted.strftime("%Y-%m-%d %H:%M:%S")
-            email = fb.get("user_email", "")
-            receipt = fb.get("receipt_number", "")
-            status = fb.get("status", "")
-            answers = answers_map.get(fb_id, [])
-            comms = commendations_map.get(fb_id, [])
-            comm_names = ", ".join(f"{c['first_name']} {c['last_name']}" for c in comms)
-
-            if answers:
-                for ans in answers:
-                    writer.writerow([
-                        fb_id, submitted, email, receipt, status,
-                        ans.get("question_text", ""),
-                        ans.get("question_type", ""),
-                        ans.get("rating_value", ""),
-                        ans.get("answer_text", ""),
-                        comm_names
-                    ])
-            else:
-                writer.writerow([fb_id, submitted, email, receipt, status, "", "", "", "", comm_names])
-
-        buf = io.BytesIO()
-        buf.write(output.getvalue().encode("utf-8"))
-        buf.seek(0)
-        month_label = month if month else "all"
-        filename = f"Report_{store['store_name'].replace(' ', '_')}_{month_label}.csv"
-        return send_file(buf, mimetype="text/csv", as_attachment=True, download_name=filename)
-
-    @app.route("/admin/stores/<int:store_id>/report/pdf")
-    def download_report_pdf(store_id: int):
-        """Download feedback report as PDF."""
-        month = request.args.get("month", "")
-        store, feedback_list, answers_map, commendations_map, _ = _get_report_data(store_id, month or None)
-        if not store:
-            flash("Store not found", "danger")
-            return redirect(url_for("stores_management"))
-
-        total = len(feedback_list)
-        resolved = sum(1 for f in feedback_list if f.get("status") == "resolved")
-        unresolved = total - resolved
-        resolution_rate = round(resolved / total * 100, 1) if total > 0 else 0
-
-        # Rating stats
-        rating_dist = [0, 0, 0, 0, 0]
-        total_ratings = 0
-        for fb in feedback_list:
-            for ans in answers_map.get(int(fb["id"]), []):
-                rv = ans.get("rating_value")
-                if rv:
-                    r = int(float(rv))
-                    if 1 <= r <= 5:
-                        rating_dist[r - 1] += 1
-                        total_ratings += 1
-        avg_rating = round(sum((i + 1) * c for i, c in enumerate(rating_dist)) / total_ratings, 2) if total_ratings > 0 else 0
-
-        # Top commended staff
-        staff_counts = defaultdict(int)
-        for fb in feedback_list:
-            for c in commendations_map.get(int(fb["id"]), []):
-                staff_counts[f"{c['first_name']} {c['last_name']}"] += 1
-        top_staff = sorted(staff_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-
-        # Build PDF
-        month_label = month if month else "All Time"
-        pdf = FPDF()
-        pdf.set_auto_page_break(auto=True, margin=15)
-        pdf.add_page()
-
-        # Title
-        pdf.set_font("Helvetica", "B", 18)
-        pdf.cell(0, 12, f"{store['store_name']} - Feedback Report", ln=True, align="C")
-        pdf.set_font("Helvetica", "", 11)
-        pdf.cell(0, 8, f"Period: {month_label}  |  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
-        pdf.ln(8)
-
-        # KPI Summary
-        pdf.set_font("Helvetica", "B", 13)
-        pdf.cell(0, 8, "Summary", ln=True)
-        pdf.set_font("Helvetica", "", 10)
-        col_w = 47.5
-        pdf.set_fill_color(240, 240, 240)
-        for label, val in [("Total Feedback", total), ("Resolved", resolved), ("Unresolved", unresolved), ("Resolution Rate", f"{resolution_rate}%")]:
-            pdf.cell(col_w, 18, f"{label}\n{val}", border=1, align="C", fill=True)
-        pdf.ln(18)
-        pdf.ln(4)
-
-        # Rating summary
-        pdf.set_font("Helvetica", "B", 13)
-        pdf.cell(0, 8, "Ratings", ln=True)
-        pdf.set_font("Helvetica", "", 10)
-        pdf.cell(95, 8, f"Average Rating: {avg_rating} / 5", ln=False)
-        pdf.cell(95, 8, f"Total Ratings: {total_ratings}", ln=True)
-        # Rating distribution table
-        pdf.set_font("Helvetica", "B", 9)
-        for i in range(5):
-            pdf.cell(38, 7, f"{i+1} Star", border=1, align="C", fill=True)
-        pdf.ln(7)
-        pdf.set_font("Helvetica", "", 9)
-        for i in range(5):
-            pct = round(rating_dist[i] / total_ratings * 100, 1) if total_ratings > 0 else 0
-            pdf.cell(38, 7, f"{rating_dist[i]} ({pct}%)", border=1, align="C")
-        pdf.ln(7)
-        pdf.ln(6)
-
-        # Top Commended Staff
-        if top_staff:
-            pdf.set_font("Helvetica", "B", 13)
-            pdf.cell(0, 8, "Top Commended Staff", ln=True)
-            pdf.set_font("Helvetica", "B", 9)
-            pdf.set_fill_color(230, 230, 230)
-            pdf.cell(10, 7, "#", border=1, align="C", fill=True)
-            pdf.cell(100, 7, "Staff Member", border=1, fill=True)
-            pdf.cell(40, 7, "Commendations", border=1, align="C", fill=True)
-            pdf.ln(7)
-            pdf.set_font("Helvetica", "", 9)
-            for idx, (name, count) in enumerate(top_staff, 1):
-                pdf.cell(10, 7, str(idx), border=1, align="C")
-                pdf.cell(100, 7, name, border=1)
-                pdf.cell(40, 7, str(count), border=1, align="C")
-                pdf.ln(7)
-            pdf.ln(6)
-
-        # Feedback Detail Table
-        pdf.set_font("Helvetica", "B", 13)
-        pdf.cell(0, 8, "Feedback Details", ln=True)
-        pdf.set_font("Helvetica", "B", 8)
-        pdf.set_fill_color(230, 230, 230)
-        col_widths = [15, 30, 45, 25, 20, 55]
-        headers = ["ID", "Date", "Email", "Receipt #", "Status", "Avg Rating"]
-        for i, h in enumerate(headers):
-            pdf.cell(col_widths[i], 7, h, border=1, align="C", fill=True)
-        pdf.ln(7)
-
-        pdf.set_font("Helvetica", "", 7)
-        for fb in feedback_list:
-            fb_id = int(fb["id"])
-            submitted = fb.get("submitted_at", "")
-            if hasattr(submitted, "strftime"):
-                submitted = submitted.strftime("%m/%d/%y")
-            elif isinstance(submitted, str) and len(submitted) > 10:
-                submitted = submitted[:10]
-            email = (fb.get("user_email", "") or "")[:25]
-            receipt = (fb.get("receipt_number", "") or "")[:15]
-            status = fb.get("status", "")
-            answers = answers_map.get(fb_id, [])
-            ratings = [float(a["rating_value"]) for a in answers if a.get("rating_value")]
-            avg_r = round(sum(ratings) / len(ratings), 1) if ratings else "N/A"
-
-            pdf.cell(col_widths[0], 6, str(fb_id), border=1, align="C")
-            pdf.cell(col_widths[1], 6, str(submitted), border=1, align="C")
-            pdf.cell(col_widths[2], 6, email, border=1)
-            pdf.cell(col_widths[3], 6, receipt, border=1, align="C")
-            pdf.cell(col_widths[4], 6, status, border=1, align="C")
-            pdf.cell(col_widths[5], 6, str(avg_r), border=1, align="C")
-            pdf.ln(6)
-
-        buf = io.BytesIO()
-        pdf.output(buf)
-        buf.seek(0)
-        filename = f"Report_{store['store_name'].replace(' ', '_')}_{month_label.replace(' ', '_')}.pdf"
-        return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=filename)
-
-    # -------------------------
-    # TEMPLATE QUESTIONNAIRE CRUD
-    # -------------------------
-    def _tenant_owner(user_id: int | None = None) -> Dict[str, Any]:
-        uid = int(user_id or session['user_id'])
-        user = get_user_by_id(uid)
-        if not user:
-            raise ValueError("Tenant owner not found")
-        return user
-
-    def fetch_template_questionnaire(owner_user_id: int | None = None, license_key: str | None = None) -> Dict[str, Any] | None:
-        owner = _tenant_owner(owner_user_id)
-        effective_license = license_key if license_key is not None else owner.get('license_key')
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute(
-                """
-                SELECT id, title, is_active, version, created_at, updated_at, logo_url,
-                       owner_user_id, license_key
-                FROM questionnaires
-                WHERE is_template = TRUE AND owner_user_id = %s AND license_key <=> %s
-                ORDER BY id ASC
-                LIMIT 1
-                """,
-                (owner['id'], effective_license),
-            )
-            row = cursor.fetchone()
-        finally:
-            conn.close()
-        return row
-
-    def ensure_template_questionnaire(owner_user_id: int | None = None) -> Dict[str, Any]:
-        owner = _tenant_owner(owner_user_id)
-        existing = fetch_template_questionnaire(int(owner['id']))
-        if existing:
-            return existing
-        with get_db_connection_with_transaction() as conn:
-            cursor = conn.cursor()
-            # An admin receives a detached snapshot of the Dev/Superadmin
-            # starter questionnaire. The copied rows never point back to the
-            # Dev questionnaire, so client edits stay inside their own license.
-            starter = None
-            if owner.get('role') == 'admin':
-                cursor.execute(
-                    """SELECT q.id, q.title, q.is_active, q.version, q.logo_url
-                       FROM questionnaires q
-                       JOIN users u ON u.id = q.owner_user_id
-                       WHERE q.is_template = TRUE AND u.role = 'superadmin'
-                       ORDER BY q.id ASC LIMIT 1"""
-                )
-                starter = cursor.fetchone()
-            if not starter:
-                cursor.execute("""SELECT id, title, is_active, version, logo_url
-                                  FROM questionnaires
-                                  WHERE is_template = TRUE AND owner_user_id IS NULL
-                                  ORDER BY id ASC LIMIT 1""")
-                starter = cursor.fetchone()
-            default_title = starter[1] if starter else "Customer Feedback"
-            default_active = bool(starter[2]) if starter else True
-            default_version = int(starter[3] or 1) if starter else 1
-            default_logo = starter[4] if starter else None
-            cursor.execute(
-                """
-                INSERT INTO questionnaires
-                    (store_id, owner_user_id, license_key, title, is_active, is_template, version, logo_url)
-                VALUES (NULL, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (owner['id'], owner.get('license_key'), default_title, default_active, True, default_version, default_logo),
-            )
-            template_id = int(cursor.lastrowid)
-            copied_count = 0
-            if starter:
-                cursor.execute(
-                    """SELECT id, question_text, question_type, target_scope,
-                              min_label, max_label, allow_comment, is_required,
-                              question_order, is_active
-                       FROM questions
-                       WHERE questionnaire_id = %s AND is_template = TRUE
-                       ORDER BY question_order ASC, id ASC LIMIT 5""",
-                    (int(starter[0]),),
-                )
-                for source_question in cursor.fetchall():
-                    cursor.execute(
-                        """INSERT INTO questions
-                           (questionnaire_id, question_text, question_type, target_scope,
-                            min_label, max_label, allow_comment, is_required,
-                            question_order, is_active, is_template, template_id)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, NULL)""",
-                        (template_id, source_question[1], source_question[2], source_question[3] or 'overall',
-                         source_question[4], source_question[5], source_question[6], source_question[7],
-                         source_question[8], source_question[9]),
-                    )
-                    copied_question_id = int(cursor.lastrowid)
-                    cursor.execute(
-                        "SELECT option_text FROM question_options WHERE question_id = %s ORDER BY id ASC",
-                        (int(source_question[0]),),
-                    )
-                    source_options = cursor.fetchall()
-                    if source_options:
-                        cursor.executemany(
-                            "INSERT INTO question_options (question_id, option_text, is_template) VALUES (%s, %s, TRUE)",
-                            [(copied_question_id, option[0]) for option in source_options],
-                        )
-                    copied_count += 1
-
-            fallback_questions = [
-                ("How would you rate your overall experience and service?", "overall"),
-                ("How would you rate the manager's service?", "manager"),
-                ("How would you rate the staff member who assisted you?", "staff"),
-                ("How satisfied are you with the quality you received?", "overall"),
-                ("How likely are you to recommend this store?", "overall"),
-            ]
-            if copied_count < 5:
-                cursor.executemany(
-                    """INSERT INTO questions
-                       (questionnaire_id, question_text, question_type, target_scope,
-                        min_label, max_label, allow_comment, is_required,
-                        question_order, is_active, is_template, template_id)
-                       VALUES (%s, %s, 'rating', %s, 'Poor', 'Excellent', TRUE,
-                               TRUE, %s, TRUE, TRUE, NULL)""",
-                    [(template_id, text, scope, order)
-                     for order, (text, scope) in enumerate(fallback_questions, 1)
-                     if order > copied_count],
-                )
-            # Existing tenant questionnaires are preserved and never cleared.
-        return {"id": template_id, "title": default_title, "is_active": default_active,
-                "version": default_version, "created_at": None, "is_template": True,
-                "owner_user_id": owner['id'], "license_key": owner.get('license_key'), "logo_url": default_logo}
-
-    def fetch_tenant_branding(owner_user_id: int, license_key: str | None = None) -> Dict[str, Any]:
-        defaults = {"primary_color": "#1B1E76", "secondary_color": "#FC8C12",
-                    "accent_color": "#FC8C12", "text_color": "#212529"}
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            owner = _tenant_owner(owner_user_id)
-            effective_license = license_key if license_key is not None else owner.get('license_key')
-            scope_key = effective_license or f"user:{owner_user_id}"
-            cursor.execute("SELECT primary_color, secondary_color, accent_color, text_color FROM tenant_branding WHERE scope_key = %s", (scope_key,))
-            branding = cursor.fetchone()
-            # Upgrade the former orange default palette while preserving any
-            # genuinely custom tenant color selection.
-            if branding and branding.get("primary_color", "").upper() == "#FF6B35":
-                return defaults
-            return branding or defaults
-        finally:
-            conn.close()
-
-    @app.context_processor
-    def inject_tenant_ui_branding():
-        """Apply company colors to every authenticated client/admin page."""
-        defaults = {"primary_color": "#1B1E76", "secondary_color": "#FC8C12",
-                    "accent_color": "#FC8C12", "text_color": "#212529"}
-        user_id = session.get("user_id")
-        if not user_id:
-            return {"ui_branding": defaults}
-        try:
-            user = get_user_by_id(int(user_id))
-            if not user or user.get("role") == "superadmin":
-                return {"ui_branding": defaults}
-            if user.get("role") == "admin":
-                return {"ui_branding": fetch_tenant_branding(int(user["id"]), user.get("license_key"))}
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor(dictionary=True)
-                cursor.execute(
-                    """SELECT s.user_id, s.license_key FROM user_stores us
-                       JOIN stores s ON s.id = us.store_id
-                       WHERE us.user_id = %s ORDER BY s.id ASC LIMIT 1""",
-                    (int(user["id"]),),
-                )
-                store_owner = cursor.fetchone()
-            finally:
-                conn.close()
-            if store_owner:
-                return {"ui_branding": fetch_tenant_branding(int(store_owner["user_id"]), store_owner.get("license_key"))}
-        except Exception as exc:
-            logger.warning("Unable to load UI branding: %s", exc)
-        return {"ui_branding": defaults}
-
-    def get_questionnaire_license_limit(owner: Dict[str, Any]) -> int:
-        """Return licensed *additional* questions; zero means no extra questions."""
-        if owner.get('role') != 'admin':
-            return 0
-        license_key = owner.get('license_key')
-        if not license_key:
-            raise ValueError("Configure a valid license key before publishing questionnaires.")
-        config = get_license_config()
-        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-        try:
-            import requests as http_requests
-            response = http_requests.post(
-                f"{portal_url}/api/validate/{license_key}",
-                headers=licensing_api_headers(), timeout=10,
-            )
-            data = response.json() if response.content else {}
-            if response.status_code != 200 or not data.get('valid'):
-                raise ValueError(data.get('message') or "The license is invalid or inactive.")
-            return max(0, int(data.get('max_questionnaires') or 0))
-        except ValueError:
-            raise
-        except Exception as exc:
-            logger.error("Unable to validate questionnaire limit: %s", exc)
-            raise ValueError("Unable to validate the questionnaire license limit. Please try again.")
-
-    def enforce_questionnaire_limit(owner: Dict[str, Any], _candidate_store_ids: List[int]) -> None:
-        """Keep the five starter questions plus the licensed additional allowance."""
-        max_questionnaires = get_questionnaire_license_limit(owner)
-        allowed_total = 5 + max_questionnaires
-        template = fetch_template_questionnaire(int(owner['id']), owner.get('license_key'))
-        if not template:
-            return
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                """SELECT COUNT(*) FROM questions
-                   WHERE questionnaire_id = %s AND is_template = TRUE""",
-                (int(template['id']),),
-            )
-            current_count = int(cursor.fetchone()[0])
-        finally:
-            conn.close()
-        if current_count > allowed_total:
-            raise ValueError(
-                f"Question limit exceeded. Your plan includes 5 starter questions plus "
-                f"{max_questionnaires} additional question(s) ({allowed_total} total)."
-            )
-
-    def questionnaire_quota_status(owner: Dict[str, Any]) -> Dict[str, Any]:
-        additional_limit = get_questionnaire_license_limit(owner)
-        allowed_total = 5 + additional_limit
-        template = fetch_template_questionnaire(int(owner['id']), owner.get('license_key'))
-        if not template:
-            return {"used": 0, "max": allowed_total, "base": 5,
-                    "additional": additional_limit, "remaining": allowed_total}
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                """SELECT COUNT(*) FROM questions
-                   WHERE questionnaire_id = %s AND is_template = TRUE""",
-                (int(template['id']),),
-            )
-            used = int(cursor.fetchone()[0])
-        finally:
-            conn.close()
-        return {"used": used, "max": allowed_total, "base": 5,
-                "additional": additional_limit, "remaining": max(0, allowed_total - used)}
-
-    def update_template_questionnaire(title: str, is_active: bool, updated_at: str | None = None) -> None:
-        """Update template questionnaire with validation."""
-        # Input validation
-        if not title or not title.strip():
-            raise ValueError("Title is required")
-        
-        template = ensure_template_questionnaire()
-        with get_db_connection_with_transaction() as conn:
-            cursor = conn.cursor()
-            if updated_at:
-                cursor.execute(
-                    """
-                    UPDATE questionnaires
-                    SET title = %s, is_active = %s, updated_at = %s
-                    WHERE id = %s
-                    """,
-                    (title.strip(), is_active, updated_at, int(template["id"])),
-                )
-            else:
-                cursor.execute(
-                    """
-                    UPDATE questionnaires
-                    SET title = %s, is_active = %s, updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (title.strip(), is_active, int(template["id"])),
-                )
-
-    def fetch_template_questions(template_questionnaire_id: int) -> List[Dict[str, Any]]:
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute(
-                """
-                SELECT id, question_text, question_type, target_scope, min_label, max_label, allow_comment, is_required, question_order
-                FROM questions
-                WHERE questionnaire_id = %s
-                ORDER BY question_order ASC, id ASC
-                """,
-                (template_questionnaire_id,),
-            )
-            rows = cursor.fetchall()
-        finally:
-            conn.close()
-        return rows
-
-    def fetch_template_options_by_question(template_question_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
-        if not template_question_ids:
-            return {}
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            placeholders = ", ".join(["%s"] * len(template_question_ids))
-            cursor.execute(
-                f"""
-                SELECT question_id, id, option_text
-                FROM question_options
-                WHERE question_id IN ({placeholders})
-                ORDER BY question_id ASC, id ASC
-                """,
-                tuple(template_question_ids),
-            )
-            rows = cursor.fetchall()
-        finally:
-            conn.close()
-        by_q: Dict[int, List[Dict[str, Any]]] = {}
-        for r in rows:
-            qid = int(r["question_id"])
-            by_q.setdefault(qid, []).append({"id": r["id"], "option_text": r["option_text"]})
-        return by_q
-
-    def add_template_question(
-        template_questionnaire_id: int,
-        question_text: str,
-        question_type: str,
-        is_required: bool,
-        question_order: int,
-        min_label: str = "Poor",
-        max_label: str = "Excellent",
-        allow_comment: bool = False,
-        target_scope: str = "overall",
-    ) -> int:
-        """Add a template question with validation."""
-        # Input validation
-        if not question_text or not question_text.strip():
-            raise ValueError("Question text is required")
-        if question_type not in ["rating", "text", "multiple_choice"]:
-            raise ValueError("Invalid question type")
-        if target_scope not in ["overall", "staff", "manager"]:
-            raise ValueError("Invalid question target")
-        if question_order < 0:
-            raise ValueError("Question order must be non-negative")
-        
-        with get_db_connection_with_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO questions
-                (questionnaire_id, question_text, question_type, target_scope, min_label, max_label, allow_comment, is_required, question_order, is_template)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (template_questionnaire_id, question_text.strip(), question_type, target_scope, min_label, max_label, allow_comment, is_required, question_order, True),
-            )
-            return int(cursor.lastrowid)
-
-    def delete_template_question(template_question_id: int) -> None:
-        """Delete a template question by ID."""
-        template = ensure_template_questionnaire()
-        with get_db_connection_with_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM questions WHERE id = %s AND questionnaire_id = %s AND is_template = TRUE", (template_question_id, template['id']))
-
-    def update_template_question(question_id: int, question_text: str, question_type: str, is_required: bool, min_label: str = "Poor", max_label: str = "Excellent", allow_comment: bool = False, target_scope: str = "overall") -> None:
-        """Update a template question with validation."""
-        # Input validation
-        if not question_text or not question_text.strip():
-            raise ValueError("Question text is required")
-        if question_type not in ["rating", "text", "multiple_choice"]:
-            raise ValueError("Invalid question type")
-        if target_scope not in ["overall", "staff", "manager"]:
-            raise ValueError("Invalid question target")
-        
-        template = ensure_template_questionnaire()
-        with get_db_connection_with_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                UPDATE questions
-                SET question_text = %s, question_type = %s, target_scope = %s, is_required = %s, min_label = %s, max_label = %s, allow_comment = %s
-                WHERE id = %s AND questionnaire_id = %s AND is_template = TRUE
-                """,
-                (question_text.strip(), question_type, target_scope, is_required, min_label, max_label, allow_comment, question_id, template['id']),
-            )
-
-    def add_template_option(template_question_id: int, option_text: str) -> int:
-        """Add a template option with validation."""
-        # Input validation
-        if not option_text or not option_text.strip():
-            raise ValueError("Option text is required")
-        
-        template = ensure_template_questionnaire()
-        with get_db_connection_with_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM questions WHERE id = %s AND questionnaire_id = %s AND is_template = TRUE", (template_question_id, template['id']))
-            if not cursor.fetchone():
-                raise ValueError("Question does not belong to this license")
-            cursor.execute(
-                """
-                INSERT INTO question_options (question_id, option_text)
-                VALUES (%s, %s)
-                """,
-                (template_question_id, option_text.strip()),
-            )
-            return int(cursor.lastrowid)
-
-    def delete_template_option(template_option_id: int) -> None:
-        """Delete a template option by ID."""
-        template = ensure_template_questionnaire()
-        with get_db_connection_with_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""DELETE qo FROM question_options qo
-                              INNER JOIN questions q ON q.id = qo.question_id
-                              WHERE qo.id = %s AND q.questionnaire_id = %s AND q.is_template = TRUE""",
-                           (template_option_id, template['id']))
-
-    def publish_template_to_all_stores() -> int:
-        """Publish only inside the signed-in admin's tenant/license scope."""
-        owner = _tenant_owner()
-        template = ensure_template_questionnaire()
-        template_id = int(template["id"])
-        template_questions = fetch_template_questions(template_questionnaire_id=template_id)
-        template_options_by_question_id = fetch_template_options_by_question([int(q["id"]) for q in template_questions])
-
-        stores = [store for store in fetch_stores(user_id=int(owner['id']))
-                  if (store.get('license_key') or None) == (owner.get('license_key') or None)]
-        enforce_questionnaire_limit(owner, [int(store['id']) for store in stores])
-        with get_db_connection_with_transaction() as conn:
-            cursor = conn.cursor(dictionary=True)
-            published_count = 0
-
-            for store in stores:
-                store_id = int(store["id"])
-
-                # Check if store already has a questionnaire
-                cursor.execute("SELECT id FROM questionnaires WHERE store_id = %s AND is_template = FALSE ORDER BY id ASC LIMIT 1", (store_id,))
-                existing = cursor.fetchone()
-                
-                if existing:
-                    # Update existing questionnaire metadata without deleting it
-                    cursor.execute(
-                        """
-                        UPDATE questionnaires
-                        SET title = %s, is_active = %s, template_id = %s,
-                            owner_user_id = %s, license_key = %s, logo_url = %s
-                        WHERE id = %s
-                        """,
-                        (template["title"], bool(template["is_active"]), template_id,
-                         owner['id'], owner.get('license_key'), store.get('logo_url') or template.get('logo_url'), int(existing["id"])),
-                    )
-                    questionnaire_id = int(existing["id"])
-                    
-                    # Deactivate existing questions instead of deleting them
-                    cursor.execute(
-                        """
-                        UPDATE questions
-                        SET is_active = FALSE
-                        WHERE questionnaire_id = %s AND is_template = FALSE
-                        """,
-                        (questionnaire_id,),
-                    )
-                else:
-                    # Create new store questionnaire
-                    cursor.execute(
-                        """
-                        INSERT INTO questionnaires
-                            (store_id, owner_user_id, license_key, title, is_active, is_template, template_id, logo_url)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (store_id, owner['id'], owner.get('license_key'), template["title"],
-                         bool(template["is_active"]), False, template_id, store.get('logo_url') or template.get('logo_url')),
-                    )
-                    questionnaire_id = int(cursor.lastrowid)
-
-                # Add new active questions from template
-                question_id_map: Dict[int, int] = {}
-                for tq in template_questions:
-                    cursor.execute(
-                        """
-                        INSERT INTO questions
-                        (questionnaire_id, question_text, question_type, target_scope, min_label, max_label, allow_comment, is_required, question_order, is_template, template_id)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            questionnaire_id,
-                            tq["question_text"],
-                            tq["question_type"],
-                            tq.get("target_scope", "overall"),
-                            tq.get("min_label", "Poor"),
-                            tq.get("max_label", "Excellent"),
-                            bool(tq.get("allow_comment", False)),
-                            bool(tq["is_required"]),
-                            int(tq["question_order"]),
-                            False,  # Store questions are not templates
-                            int(tq["id"]),  # Link to template question
-                        ),
-                    )
-                    new_qid = int(cursor.lastrowid)
-                    question_id_map[int(tq["id"])] = new_qid
-
-                for old_tq_id, opts in template_options_by_question_id.items():
-                    new_qid = question_id_map.get(int(old_tq_id))
-                    if not new_qid:
-                        continue
-                    for opt in opts:
-                        cursor.execute(
-                            """
-                            INSERT INTO question_options (question_id, option_text)
-                            VALUES (%s, %s)
-                            """,
-                            (new_qid, opt["option_text"]),
-                        )
-
-                published_count += 1
-
-            return published_count
-
-    @app.route("/")
-    def index():
-        if 'user_id' in session:
-            return redirect(url_for("admin_dashboard"))
-        return redirect(url_for("login"))
-
-    @app.route("/login", methods=["GET", "POST"])
-    def login():
-        if request.method == "POST":
-            username = request.form.get("username", "").strip()
-            password = request.form.get("password", "")
-            
-            if not username or not password:
-                flash("Username and password are required.", "danger")
-                return redirect(url_for("login"))
-            
-            user = get_user_by_username(username)
-            if not user:
-                flash("Invalid username or password.", "danger")
-                return redirect(url_for("login"))
-            
-            if not user['is_active']:
-                flash("Your account has been deactivated.", "danger")
-                return redirect(url_for("login"))
-            
-            if verify_password(password, user['password_hash']):
-                if _expired_license_for_user(user, force=True):
-                    flash("License Expired. Please Renew your license.", "danger")
-                    return redirect(url_for("login"))
-                session['user_id'] = user['id']
-                session['username'] = user['username']
-                session['role'] = user['role']
-                flash(f"Welcome back, {user['username']}!", "success")
-                return redirect(url_for("admin_dashboard"))
-            else:
-                flash("Invalid username or password.", "danger")
-                return redirect(url_for("login"))
-        
-        return render_template("auth/login.html")
-
-    @app.route("/logout")
-    def logout():
-        session.clear()
-        flash("You have been logged out.", "info")
-        return redirect(url_for("login"))
-
-    @app.route("/api/license/refresh", methods=["GET"])
-    @login_required
-    def api_refresh_license_status():
-        """Bypass the hourly cache so a completed renewal clears immediately."""
-        user = get_user_by_id(session["user_id"])
-        if not user or user.get("role") != "admin" or not user.get("license_key"):
-            return jsonify({"success": False, "error": "No client license connected"}), 403
-        status = validate_tenant_license(user["license_key"], force=True)
-        expiry = _parse_license_expiry(status)
-        seconds_left = int((expiry - datetime.now(timezone.utc)).total_seconds()) if expiry else None
-        return jsonify({
-            "success": True,
-            "expired": _license_is_expired(status),
-            "show_warning": seconds_left is not None and 0 < seconds_left <= 30 * 24 * 60 * 60,
-            "expires_at": expiry.isoformat() if expiry else None,
-            "expiry_date": expiry.strftime("%B %d, %Y") if expiry else None,
-        })
-
-    @app.route("/admin/questionnaire", methods=["GET", "POST"])
-    @login_required
-    def master_questionnaire():
-        user = get_user_by_id(session['user_id'])
-        if not user or user.get('role') not in ('admin', 'superadmin'):
-            flash("You don't have permission to manage questionnaires.", "danger")
-            return redirect(url_for("admin_dashboard"))
-        if request.method == "POST":
-            title = request.form.get("title", "").strip()
-            updated_at = request.form.get("updated_at", "").strip()
-            if not title:
-                flash("Template questionnaire title is required.", "danger")
-                return redirect(url_for("master_questionnaire"))
-            
-            template = ensure_template_questionnaire()
-            old_title = template.get("title", "")
-            
-            update_template_questionnaire(title=title, updated_at=updated_at if updated_at else None)
-            
-            # Log questionnaire changes
-            changes = []
-            if old_title != title:
-                changes.append(f"Title: {old_title} â†’ {title}")
-            
-            if changes:
-                log_audit(
-                    entity_type="questionnaire",
-                    entity_id=int(template["id"]),
-                    action="updated",
-                    old_values=f"{', '.join(changes)}"
-                )
-            
-            flash("Questionnaire Saved Successfully", "success")
-            return redirect(url_for("master_questionnaire"))
-
-        # Single database connection for better performance
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            
-            # One master template per admin/license tenant.
-            template = ensure_template_questionnaire()
-            
-            # Initialize questions and options
-            questions = []
-            options_by_question_id = {}
-            
-            if template:
-                template_id = int(template["id"])
-                
-                # Get questions with single query
-                cursor.execute(
-                    """
-                    SELECT q.id, q.question_text, q.question_type, q.target_scope, q.min_label, q.max_label,
-                           q.allow_comment, q.is_required, q.question_order,
-                           qo.id as option_id, qo.option_text
-                    FROM questions q
-                    LEFT JOIN question_options qo ON q.id = qo.question_id
-                    WHERE q.questionnaire_id = %s
-                    ORDER BY q.question_order ASC, q.id ASC, qo.id ASC
-                    """,
-                    (template_id,),
-                )
-                rows = cursor.fetchall()
-                
-                # Organize questions and options
-                current_question = None
-                
-                for row in rows:
-                    qid = int(row["id"])
-                    
-                    # Create question if not exists
-                    if qid not in [q.get("id") for q in questions]:
-                        questions.append({
-                            "id": qid,
-                            "question_text": row["question_text"],
-                            "question_type": row["question_type"],
-                            "target_scope": row["target_scope"] or "overall",
-                            "min_label": row["min_label"],
-                            "max_label": row["max_label"],
-                            "allow_comment": bool(row["allow_comment"]),
-                            "is_required": bool(row["is_required"]),
-                            "question_order": int(row["question_order"])
-                        })
-                        options_by_question_id[qid] = []
-                    
-                    # Add option if exists
-                    if row["option_id"]:
-                        options_by_question_id[qid].append({
-                            "id": row["option_id"],
-                            "option_text": row["option_text"]
-                        })
-                        
-        finally:
-            conn.close()
-
-        try:
-            questionnaire_quota = questionnaire_quota_status(user)
-            questionnaire_quota_error = None
-        except ValueError as exc:
-            questionnaire_quota = None
-            questionnaire_quota_error = str(exc)
-
-        return render_template(
-            "master_questionnaire/master_questionnaire.html",
-            master=template,
-            questions=questions,
-            options_by_question_id=options_by_question_id,
-            branding=fetch_tenant_branding(int(user['id'])),
-            questionnaire_quota=questionnaire_quota,
-            questionnaire_quota_error=questionnaire_quota_error,
-        )
-
-    @app.route("/admin/my-survey", methods=["GET"])
-    @role_required('user')
-    def assigned_store_survey():
-        """Open the public survey for the viewer's assigned branch only."""
-        assigned_store_ids = get_assigned_store_ids(session['user_id'])
-        if not assigned_store_ids:
-            flash("No store is assigned to your account yet.", "warning")
-            return redirect(url_for("stores_management"))
-        return redirect(url_for("public_survey", store_id=assigned_store_ids[0]))
-
-    @app.route("/admin/questionnaire/questions/add", methods=["POST"])
-    def master_add_question():
-        template = ensure_template_questionnaire()
-        template_id = int(template["id"])
-
-        try:
-            quota = questionnaire_quota_status(_tenant_owner())
-        except ValueError as exc:
-            flash(str(exc), "danger")
-            return redirect(url_for("master_questionnaire"))
-        if quota["used"] >= quota["max"]:
-            flash(
-                f"Question limit reached. Your plan includes 5 starter questions plus "
-                f"{quota['additional']} additional question(s) ({quota['max']} total). "
-                "Edit or delete an existing question before adding another.",
-                "danger",
-            )
-            return redirect(url_for("master_questionnaire"))
-
-        question_text = request.form.get("question_text", "").strip()
-        question_type = request.form.get("question_type", "").strip()
-        is_required = request.form.get("is_required") == "on"
-        min_label = request.form.get("min_label", "Poor").strip() or "Poor"
-        max_label = request.form.get("max_label", "Excellent").strip() or "Excellent"
-        allow_comment = request.form.get("allow_comment") == "on"
-        target_scope = request.form.get("target_scope", "overall").strip()
-        try:
-            question_order = int(request.form.get("question_order", "0"))
-        except ValueError:
-            question_order = 0
-
-        if not question_text:
-            flash("Question text is required.", "danger")
-            return redirect(url_for("master_questionnaire"))
-
-        if question_type not in {"rating", "text", "multiple_choice"}:
-            flash("Invalid question type.", "danger")
-            return redirect(url_for("master_questionnaire"))
-
-        new_question_id = add_template_question(
-            template_questionnaire_id=template_id,
-            question_text=question_text,
-            question_type=question_type,
-            is_required=is_required,
-            question_order=question_order,
-            min_label=min_label,
-            max_label=max_label,
-            allow_comment=allow_comment,
-            target_scope=target_scope,
-        )
-        
-        # Log the question addition
-        log_audit(
-            entity_type="question",
-            entity_id=new_question_id,
-            action="created",
-            new_values=f"Text: {question_text}, Type: {question_type}, Required: {is_required}"
-        )
-        
-        flash("Question Added Successfully", "success")
-        return redirect(url_for("master_questionnaire"))
-
-    @app.route("/admin/questionnaire/questions/<int:master_question_id>/delete", methods=["POST"])
-    def master_delete_question(master_question_id: int):
-        # Get question text before deletion for logging
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT question_text FROM questions WHERE id = %s", (master_question_id,))
-            question = cursor.fetchone()
-            question_text = question[0] if question else "Unknown"
-        finally:
-            conn.close()
-        
-        delete_template_question(template_question_id=master_question_id)
-        
-        # Log the question deletion
-        log_audit(
-            entity_type="question",
-            entity_id=master_question_id,
-            action="deleted",
-            old_values=f"Text: {question_text}"
-        )
-        
-        flash("Question Deleted", "success")
-        return redirect(url_for("master_questionnaire"))
-
-    @app.route("/admin/questionnaire/questions/<int:master_question_id>/edit", methods=["POST"])
-    def master_edit_question(master_question_id: int):
-        question_text = request.form.get("question_text", "").strip()
-        question_type = request.form.get("question_type", "").strip()
-        is_required = request.form.get("is_required") == "on"
-        min_label = request.form.get("min_label", "Poor").strip() or "Poor"
-        max_label = request.form.get("max_label", "Excellent").strip() or "Excellent"
-        allow_comment = request.form.get("allow_comment") == "on"
-        target_scope = request.form.get("target_scope", "overall").strip()
-
-        if not question_text:
-            flash("Question text is required.", "danger")
-            return redirect(url_for("master_questionnaire"))
-
-        update_template_question(master_question_id, question_text, question_type, is_required, min_label, max_label, allow_comment, target_scope)
-        flash("Question Updated Successfully", "success")
-        return redirect(url_for("master_questionnaire"))
-
-    @app.route("/admin/questionnaire/questions/<int:master_question_id>/target", methods=["POST"])
-    def master_update_question_target(master_question_id: int):
-        target_scope = request.form.get("target_scope", "overall").strip()
-        if target_scope not in {"overall", "staff", "manager"}:
-            flash("Invalid question target.", "danger")
-            return redirect(url_for("master_questionnaire"))
-        template = ensure_template_questionnaire()
-        with get_db_connection_with_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """UPDATE questions SET target_scope = %s
-                   WHERE id = %s AND questionnaire_id = %s AND is_template = TRUE""",
-                (target_scope, master_question_id, int(template['id'])),
-            )
-        flash("Question target updated. Publish or sync to apply it to stores.", "success")
-        return redirect(url_for("master_questionnaire"))
-
-    @app.route("/admin/questionnaire/questions/<int:master_question_id>/options/add", methods=["POST"])
-    def master_add_option(master_question_id: int):
-        option_text = request.form.get("option_text", "").strip()
-        if not option_text:
-            flash("Option text is required.", "danger")
-            return redirect(url_for("master_questionnaire"))
-        add_template_option(template_question_id=master_question_id, option_text=option_text)
-        flash("Option added.", "success")
-        return redirect(url_for("master_questionnaire"))
-
-    @app.route("/admin/questionnaire/options/<int:master_option_id>/delete", methods=["POST"])
-    def master_delete_option(master_option_id: int):
-        delete_template_option(template_option_id=master_option_id)
-        flash("Option deleted.", "success")
-        return redirect(url_for("master_questionnaire"))
-
-    @app.route("/admin/questionnaire/upload-logo", methods=["POST"])
-    def master_upload_logo():
-        template = ensure_template_questionnaire()
-        # Handle logo upload for master questionnaire - store as base64 in database
-        logo_data = None
-        if 'logo' in request.files:
-            logo_file = request.files['logo']
-            if logo_file and logo_file.filename:
-                # Validate file type
-                allowed_extensions = {'png', 'jpg', 'jpeg'}
-                if '.' not in logo_file.filename or logo_file.filename.rsplit('.', 1)[1].lower() not in allowed_extensions:
-                    flash("Invalid file type. Only PNG, JPG, and JPEG files are allowed.", "danger")
-                    return redirect(url_for("master_questionnaire"))
-                
-                # Validate file size (5MB max)
-                logo_file.seek(0, os.SEEK_END)
-                file_size = logo_file.tell()
-                logo_file.seek(0)
-                if file_size > 5 * 1024 * 1024:
-                    flash("File size exceeds 5MB limit.", "danger")
-                    return redirect(url_for("master_questionnaire"))
-                
-                # Convert image to base64 with data URI prefix
-                import base64
-                logo_bytes = logo_file.read()
-                file_ext = logo_file.filename.rsplit('.', 1)[1].lower()
-                mime_type = f"image/{file_ext}"
-                logo_data = f"data:{mime_type};base64,{base64.b64encode(logo_bytes).decode('utf-8')}"
-
-        # Update the master template questionnaire with the base64 logo data
-        if logo_data:
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor()
-                cursor.execute("UPDATE questionnaires SET logo_url = %s WHERE id = %s", (logo_data, template['id']))
-                conn.commit()
-                flash("Brand logo uploaded successfully", "success")
-            except Exception as e:
-                logger.error(f"Error uploading logo: {e}")
-                flash(f"Error uploading logo: {e}", "danger")
-            finally:
-                conn.close()
-        else:
-            flash("No file selected", "warning")
-
-        return redirect(url_for("master_questionnaire"))
-
-    @app.route("/admin/questionnaire/delete-logo", methods=["POST"])
-    def master_delete_logo():
-        # Delete the logo from the master questionnaire
-        template = ensure_template_questionnaire()
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE questionnaires SET logo_url = NULL WHERE id = %s", (template['id'],))
-            conn.commit()
-            flash("Brand logo deleted successfully", "success")
-        except Exception as e:
-            logger.error(f"Error deleting logo: {e}")
-            flash(f"Error deleting logo: {e}", "danger")
-        finally:
-            conn.close()
-
-        return redirect(url_for("master_questionnaire"))
-
-    @app.route("/admin/questionnaire/branding", methods=["POST"])
-    @login_required
-    def save_tenant_branding():
-        user = get_user_by_id(session['user_id'])
-        if not user or user.get('role') not in ('admin', 'superadmin'):
-            return jsonify({"success": False, "error": "Access denied"}), 403
-        fields = ("primary_color", "secondary_color", "accent_color", "text_color")
-        colors = {name: request.form.get(name, "").strip().upper() for name in fields}
-        if any(not re.fullmatch(r"#[0-9A-F]{6}", value) for value in colors.values()):
-            flash("Please select valid brand colors.", "danger")
-            return redirect(url_for("master_questionnaire"))
-        with get_db_connection_with_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """INSERT INTO tenant_branding
-                       (owner_user_id, scope_key, license_key, primary_color, secondary_color, accent_color, text_color)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s)
-                   ON DUPLICATE KEY UPDATE license_key = VALUES(license_key),
-                       primary_color = VALUES(primary_color), secondary_color = VALUES(secondary_color),
-                       accent_color = VALUES(accent_color), text_color = VALUES(text_color)""",
-                (user['id'], user.get('license_key') or f"user:{user['id']}", user.get('license_key'), colors['primary_color'], colors['secondary_color'],
-                 colors['accent_color'], colors['text_color']),
-            )
-        flash("Brand colors saved for your company license.", "success")
-        return redirect(url_for("master_questionnaire"))
-
-    @app.route("/admin/questionnaire/publish", methods=["POST"])
-    def master_publish():
-        template = ensure_template_questionnaire()
-        template_id = int(template["id"])
-        questions = fetch_template_questions(template_questionnaire_id=template_id)
-        if not questions:
-            flash("Add at least 1 question before publishing.", "danger")
-            return redirect(url_for("master_questionnaire"))
-
-        try:
-            count = publish_template_to_all_stores()
-        except ValueError as exc:
-            flash(str(exc), "danger")
-            return redirect(url_for("master_questionnaire"))
-        
-        # Log the publish action
-        log_audit(
-            entity_type="questionnaire",
-            entity_id=template_id,
-            action="published",
-            new_values=f"Published to {count} store(s)"
-        )
-        
-        flash(f"Published to {count} store(s) Successfully", "success")
-        return redirect(url_for("master_questionnaire"))
-
-    @app.route("/admin/api/stores", methods=["GET"])
-    def api_stores():
-        """Return only stores owned by the current questionnaire tenant."""
-        template = ensure_template_questionnaire()
-        stores = [store for store in fetch_stores(user_id=session['user_id'])
-                  if (store.get('license_key') or None) == (template.get('license_key') or None)]
-        return jsonify(stores)
-
-    @app.route("/admin/questionnaire/sync", methods=["POST"])
-    def sync_to_selected_stores():
-        """Sync master questionnaire to selected stores"""
-        try:
-            data = request.get_json() or {}
-            try:
-                store_ids = list(dict.fromkeys(int(store_id) for store_id in data.get('store_ids', [])))
-            except (TypeError, ValueError):
-                return {"success": False, "error": "Invalid store selection"}, 400
-            
-            if not store_ids:
-                return {"success": False, "error": "No stores selected"}, 400
-            
-            template = ensure_template_questionnaire()
-            template_id = int(template["id"])
-            template_questions = fetch_template_questions(template_questionnaire_id=template_id)
-            template_options_by_question_id = fetch_template_options_by_question([int(q["id"]) for q in template_questions])
-            owner = _tenant_owner()
-            enforce_questionnaire_limit(owner, store_ids)
-            
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor(dictionary=True)
-                synced_count = 0
-                
-                for store_id in store_ids:
-                    store_id = int(store_id)
-                    
-                    # Check if store exists
-                    cursor.execute("""SELECT id, logo_url FROM stores
-                                      WHERE id = %s AND user_id = %s AND license_key <=> %s""",
-                                   (store_id, session['user_id'], template.get('license_key')))
-                    scoped_store = cursor.fetchone()
-                    if not scoped_store:
-                        continue
-                    
-                    # Check if store already has a questionnaire
-                    cursor.execute("SELECT id FROM questionnaires WHERE store_id = %s AND is_template = FALSE ORDER BY id ASC LIMIT 1", (store_id,))
-                    existing = cursor.fetchone()
-                    
-                    if existing:
-                        # Update existing questionnaire metadata
-                        cursor.execute(
-                            """
-                            UPDATE questionnaires
-                            SET title = %s, is_active = %s, template_id = %s,
-                                owner_user_id = %s, license_key = %s, logo_url = %s
-                            WHERE id = %s
-                            """,
-                            (template["title"], bool(template["is_active"]), template_id,
-                             session['user_id'], template.get('license_key'), scoped_store.get('logo_url') or template.get('logo_url'), int(existing["id"])),
-                        )
-                        questionnaire_id = int(existing["id"])
-                        
-                        # Deactivate existing questions
-                        cursor.execute(
-                            """
-                            UPDATE questions
-                            SET is_active = FALSE
-                            WHERE questionnaire_id = %s AND is_template = FALSE
-                            """,
-                            (questionnaire_id,),
-                        )
-                    else:
-                        # Create new store questionnaire
-                        cursor.execute(
-                            """
-                            INSERT INTO questionnaires
-                                (store_id, owner_user_id, license_key, title, is_active, is_template, template_id, logo_url)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                            """,
-                            (store_id, session['user_id'], template.get('license_key'), template["title"],
-                             bool(template["is_active"]), False, template_id, scoped_store.get('logo_url') or template.get('logo_url')),
-                        )
-                        questionnaire_id = int(cursor.lastrowid)
-                    
-                    # Copy questions from template
-                    for template_question in template_questions:
-                        cursor.execute(
-                            """
-                            INSERT INTO questions (questionnaire_id, question_text, question_type, target_scope, min_label, max_label, allow_comment, is_required, question_order, is_template, template_id)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            """,
-                            (questionnaire_id, template_question["question_text"], template_question["question_type"],
-                             template_question.get("target_scope", "overall"),
-                             template_question["min_label"], template_question["max_label"], template_question["allow_comment"],
-                             template_question["is_required"], template_question["question_order"], False, int(template_question["id"])),
-                        )
-                        new_question_id = int(cursor.lastrowid)
-                        
-                        # Copy options for this question
-                        template_options = template_options_by_question_id.get(int(template_question["id"]), [])
-                        for option in template_options:
-                            cursor.execute(
-                                """
-                                INSERT INTO question_options (question_id, option_text, is_template)
-                                VALUES (%s, %s, %s)
-                                """,
-                                (new_question_id, option["option_text"], False),
-                            )
-                    
-                    synced_count += 1
-                
-                conn.commit()
-                
-                # Log the sync action
-                log_audit(
-                    entity_type="questionnaire",
-                    entity_id=template_id,
-                    action="synced",
-                    new_values=f"Synced to {synced_count} store(s)"
-                )
-                
-                return {"success": True, "count": synced_count}
-                
-            finally:
-                conn.close()
-                
-        except ValueError as e:
-            logger.warning(f"Questionnaire sync blocked: {e}")
-            return {"success": False, "error": str(e)}, 409
-        except Exception as e:
-            logger.error(f"Error syncing to stores: {e}")
-            return {"success": False, "error": str(e)}, 500
-
-    @app.route("/admin/questionnaire/sync-status", methods=["GET"])
-    def sync_status():
-        """Check sync status of stores"""
-        try:
-            template = ensure_template_questionnaire()
-            template_id = int(template["id"])
-            
-            conn = get_db_connection()
-            cursor = conn.cursor(dictionary=True)
-            
-            # Get total stores
-            cursor.execute("SELECT COUNT(*) as total FROM stores WHERE user_id = %s AND license_key <=> %s",
-                           (session['user_id'], template.get('license_key')))
-            total_stores = cursor.fetchone()['total']
-            
-            # Get stores with synced questionnaire
-            cursor.execute("""
-                SELECT COUNT(DISTINCT s.id) as synced
-                FROM stores s
-                JOIN questionnaires q ON s.id = q.store_id
-                WHERE q.is_template = FALSE AND q.template_id = %s AND s.user_id = %s
-                  AND s.license_key <=> %s
-            """, (template_id, session['user_id'], template.get('license_key')))
-            synced_stores = cursor.fetchone()['synced']
-            
-            cursor.close()
-            conn.close()
-            
-            unsynced_count = total_stores - synced_stores
-            
-            return jsonify({
-                "synced": unsynced_count == 0,
-                "synced_count": synced_stores,
-                "unsynced_count": unsynced_count,
-                "total_stores": total_stores
-            })
-            
-        except Exception as e:
-            logger.error(f"Error checking sync status: {e}")
-            return jsonify({"synced": False, "error": str(e)}), 500
-
-    @app.route("/admin/questionnaire/toggle-active", methods=["POST"])
-    def master_toggle_active():
-        template = ensure_template_questionnaire()
-        current_active = template.get("is_active", False)
-        new_active = not current_active
-        
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                UPDATE questionnaires
-                SET is_active = %s
-                WHERE id = %s AND is_template = TRUE
-                """,
-                (new_active, int(template["id"])),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        
-        # Log the toggle action
-        log_audit(
-            entity_type="questionnaire",
-            entity_id=int(template["id"]),
-            action="toggled",
-            old_values=f"Active: {current_active} â†’ {new_active}"
-        )
-        
-        if new_active:
-            flash("Survey enabled successfully. Stores can now accept feedback.", "success")
-        else:
-            flash("Survey disabled successfully. Stores can no longer accept feedback.", "warning")
-        
-        return redirect(url_for("master_questionnaire"))
-
-    @app.route("/admin/questionnaire/preview")
-    def master_preview():
-        template = ensure_template_questionnaire()
-        template_id = int(template["id"])
-        questions = fetch_template_questions(template_questionnaire_id=template_id)
-        question_ids = [q["id"] for q in questions]
-        options_by_question_id = fetch_options_for_questions(question_ids)
-
-        return render_template(
-            "master_questionnaire/preview.html",
-            master=template,
-            questions=questions,
-            options_by_question_id=options_by_question_id,
-        )
-
-    # -------------------------
-    # DASHBOARD ANALYTICS
-    # -------------------------
-    # Bayesian-average smoothing constant: how many feedbacks a store/staff
-    # needs before its own average dominates the global prior.
-    BAYESIAN_C = 5
-
-    def fetch_dashboard_analytics() -> Dict[str, Any]:
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-
-            # One scope drives every dashboard query so totals, rankings,
-            # activity, and staff never leak stores outside the user's access.
-            dashboard_user = get_user_by_id(session['user_id'])
-            scoped_store_ids: Optional[List[int]] = None
-            if dashboard_user['role'] == 'admin':
-                scoped_store_ids = [s['id'] for s in fetch_stores(user_id=session['user_id'])]
-            elif dashboard_user['role'] == 'user':
-                scoped_store_ids = get_assigned_store_ids(session['user_id'])
-
-            scope_join = ""
-            if scoped_store_ids is not None:
-                cursor.execute("CREATE TEMPORARY TABLE dashboard_store_scope (store_id INT PRIMARY KEY)")
-                if scoped_store_ids:
-                    cursor.executemany(
-                        "INSERT INTO dashboard_store_scope (store_id) VALUES (%s)",
-                        [(store_id,) for store_id in scoped_store_ids],
-                    )
-                scope_join = "INNER JOIN dashboard_store_scope dss ON dss.store_id = s.id"
-
-            # Global average rating across all stores (prior `m`).
-            # Falls back to 4.0 (mid-high default) when there are no ratings yet.
-            cursor.execute(
-                f"""
-                SELECT AVG(a.rating_value) as global_avg
-                FROM stores s
-                {scope_join}
-                LEFT JOIN questionnaires q ON s.id = q.store_id
-                LEFT JOIN responses r ON q.id = r.questionnaire_id
-                LEFT JOIN answers a ON r.id = a.response_id
-                JOIN questions q2 ON a.question_id = q2.id
-                WHERE q2.question_type = 'rating' AND a.rating_value IS NOT NULL
-                """
-            )
-            row = cursor.fetchone()
-            global_avg_rating = float(row['global_avg']) if row and row['global_avg'] is not None else 4.0
-
-            # Store overview data â€” `weighted_score` is now a Bayesian average:
-            #   (C * m + sum_of_ratings) / (C + n)
-            # which keeps the score on the 1â€“5 scale and pulls low-volume stores
-            # toward the global mean until they accumulate enough feedback.
-            cursor.execute(
-                f"""
-                SELECT s.id, s.store_name, s.address, s.city, s.created_at,
-                       COUNT(DISTINCT r.id) as total_responses,
-                       AVG(CASE WHEN q2.question_type = 'rating' THEN a.rating_value END) as avg_rating,
-                       COUNT(DISTINCT CASE WHEN q2.question_type = 'rating' AND a.rating_value IS NOT NULL THEN r.id END) as rating_feedback_count,
-                       (
-                           (%s * %s) + COALESCE(SUM(CASE WHEN q2.question_type = 'rating' THEN a.rating_value END), 0)
-                       ) / (
-                           %s + COUNT(CASE WHEN q2.question_type = 'rating' AND a.rating_value IS NOT NULL THEN 1 END)
-                       ) as weighted_score,
-                       COUNT(DISTINCT r.user_email) as unique_users
-                FROM stores s
-                {scope_join}
-                LEFT JOIN questionnaires q ON s.id = q.store_id
-                LEFT JOIN responses r ON q.id = r.questionnaire_id
-                LEFT JOIN answers a ON r.id = a.response_id
-                LEFT JOIN questions q2 ON a.question_id = q2.id
-                GROUP BY s.id, s.store_name, s.address, s.city, s.created_at
-                ORDER BY weighted_score DESC, total_responses DESC
-                """,
-                (BAYESIAN_C, global_avg_rating, BAYESIAN_C),
-            )
-            stores_data = cursor.fetchall()
-            
-            # Convert Decimal values to float for template compatibility
-            for store in stores_data:
-                store['avg_rating'] = float(store['avg_rating']) if store['avg_rating'] is not None else 0.0
-                store['rating_feedback_count'] = int(store['rating_feedback_count']) if store.get('rating_feedback_count') else 0
-                store['weighted_score'] = float(store['weighted_score']) if store.get('weighted_score') is not None else 0.0
-            
-            # Overall statistics
-            cursor.execute(
-                f"""
-                SELECT 
-                    COUNT(DISTINCT r.id) as total_responses,
-                    COUNT(DISTINCT s.id) as total_stores,
-                    COUNT(DISTINCT r.user_email) as total_unique_users,
-                    AVG(CASE WHEN q2.question_type = 'rating' THEN a.rating_value END) as overall_avg_rating,
-                    COUNT(DISTINCT q.id) as total_questionnaires
-                FROM stores s
-                {scope_join}
-                LEFT JOIN questionnaires q ON s.id = q.store_id
-                LEFT JOIN responses r ON q.id = r.questionnaire_id
-                LEFT JOIN answers a ON r.id = a.response_id
-                LEFT JOIN questions q2 ON a.question_id = q2.id
-                """
-            )
-            overall_stats = cursor.fetchone()
-            
-            if overall_stats:
-                overall_stats['overall_avg_rating'] = float(overall_stats['overall_avg_rating']) if overall_stats['overall_avg_rating'] is not None else 0.0
-            else:
-                overall_stats = {
-                    'total_responses': 0,
-                    'total_stores': 0,
-                    'total_unique_users': 0,
-                    'overall_avg_rating': 0,
-                    'total_questionnaires': 0
-                }
-            
-            # Recent activity (last 7 days, linked to stores)
-            cursor.execute(
-                f"""
-                SELECT DATE(r.submitted_at) as date, COUNT(DISTINCT r.id) as responses
-                FROM responses r
-                INNER JOIN questionnaires q ON r.questionnaire_id = q.id
-                INNER JOIN stores s ON q.store_id = s.id
-                {scope_join}
-                WHERE r.submitted_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
-                GROUP BY DATE(r.submitted_at)
-                ORDER BY date
-                """
-            )
-            recent_activity = cursor.fetchall()
-            
-            # Top performing stores by feedback
-            cursor.execute(
-                f"""
-                SELECT s.store_name, COUNT(r.id) as response_count
-                FROM stores s
-                {scope_join}
-                LEFT JOIN questionnaires q ON s.id = q.store_id
-                LEFT JOIN responses r ON q.id = r.questionnaire_id
-                GROUP BY s.id, s.store_name
-                ORDER BY response_count DESC
-                LIMIT 5
-                """
-            )
-            top_stores = cursor.fetchall()
-
-            # Best overall store ranked by Bayesian-average score so a store
-            # with one lucky 5â˜… doesn't beat a store with sustained 4.6â˜….
-            cursor.execute(
-                f"""
-                SELECT s.id, s.store_name, s.address, s.city,
-                       COUNT(DISTINCT r.id) as total_responses,
-                       AVG(CASE WHEN q2.question_type = 'rating' THEN a.rating_value END) as avg_rating,
-                       (
-                           (%s * %s) + COALESCE(SUM(CASE WHEN q2.question_type = 'rating' THEN a.rating_value END), 0)
-                       ) / (
-                           %s + COUNT(CASE WHEN q2.question_type = 'rating' AND a.rating_value IS NOT NULL THEN 1 END)
-                       ) as weighted_score
-                FROM stores s
-                {scope_join}
-                LEFT JOIN questionnaires q ON s.id = q.store_id
-                LEFT JOIN responses r ON q.id = r.questionnaire_id
-                LEFT JOIN answers a ON r.id = a.response_id
-                LEFT JOIN questions q2 ON a.question_id = q2.id
-                WHERE q2.question_type = 'rating'
-                GROUP BY s.id, s.store_name, s.address, s.city
-                HAVING total_responses >= 1
-                ORDER BY weighted_score DESC, total_responses DESC
-                LIMIT 1
-                """,
-                (BAYESIAN_C, global_avg_rating, BAYESIAN_C),
-            )
-            best_overall_store = cursor.fetchone()
-            if best_overall_store:
-                best_overall_store['avg_rating'] = float(best_overall_store['avg_rating']) if best_overall_store['avg_rating'] is not None else 0.0
-
-            # Global average commendation rating (Bayesian prior `m`).
-            cursor.execute(
-                f"""SELECT AVG(sc.rating) as global_avg
-                    FROM stores s
-                    {scope_join}
-                    LEFT JOIN staff stf ON stf.store_id = s.id
-                    LEFT JOIN staff_commendations sc ON sc.staff_id = stf.id
-                    WHERE sc.rating IS NOT NULL"""
-            )
-            srow = cursor.fetchone()
-            staff_global_avg = float(srow['global_avg']) if srow and srow['global_avg'] is not None else 4.0
-
-            # Best overall staff (highest Bayesian-average score).
-            cursor.execute(
-                f"""
-                SELECT s.id, s.first_name, s.last_name, s.position, s.role,
-                       AVG(sc.rating) as avg_rating,
-                       COUNT(sc.id) as commendation_count,
-                       (
-                           (%s * %s) + COALESCE(SUM(sc.rating), 0)
-                       ) / (
-                           %s + COUNT(sc.rating)
-                       ) as weighted_score,
-                       st.store_name
-                FROM staff s
-                LEFT JOIN staff_commendations sc ON s.id = sc.staff_id
-                LEFT JOIN responses r ON sc.response_id = r.id
-                LEFT JOIN questionnaires q ON r.questionnaire_id = q.id
-                LEFT JOIN stores st ON q.store_id = st.id
-                {scope_join.replace('s.id', 'st.id')}
-                GROUP BY s.id, s.first_name, s.last_name, s.position, s.role, st.store_name
-                HAVING avg_rating IS NOT NULL
-                ORDER BY weighted_score DESC
-                LIMIT 1
-                """,
-                (BAYESIAN_C, staff_global_avg, BAYESIAN_C),
-            )
-            best_overall_staff = cursor.fetchone()
-            if best_overall_staff:
-                best_overall_staff['avg_rating'] = float(best_overall_staff['avg_rating']) if best_overall_staff['avg_rating'] is not None else 0.0
-                best_overall_staff['weighted_score'] = float(best_overall_staff['weighted_score']) if best_overall_staff['weighted_score'] is not None else 0.0
-
-            return {
-                'stores_data': stores_data,
-                'overall_stats': overall_stats,
-                'recent_activity': recent_activity,
-                'top_stores': top_stores,
-                'best_overall_store': best_overall_store,
-                'best_overall_staff': best_overall_staff
-            }
-        finally:
-            conn.close()
-
-    @app.route("/admin/dashboard")
-    @login_required
-    def admin_dashboard():
-        try:
-            analytics = fetch_dashboard_analytics()
-            return render_template("dashboard/dashboard.html", **analytics)
-        except Exception as e:
-            error_details = traceback.format_exc()
-            logger.error(f"Dashboard Crash: {e}\n{error_details}")
-            return f"Dashboard Error: {e}<br><pre>{error_details}</pre>", 500
-
-    @app.route("/admin/users")
-    @role_required('superadmin')
-    def admin_users():
-        """User management page"""
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT * FROM users ORDER BY created_at DESC")
-            users = cursor.fetchall()
-            config = get_license_config()
-            portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-            return render_template("admin/users.html", users=users, licensing_portal_url=portal_url)
-        finally:
-            conn.close()
-
-    @app.route("/admin/users/add", methods=["POST"])
-    @role_required('superadmin')
-    def admin_add_user():
-        """Add a new user"""
-        username = request.form.get("username", "").strip()
-        email = request.form.get("email", "").strip()
-        password = request.form.get("password", "")
-        role = request.form.get("role", "user")
-        license_key = request.form.get("license_key", "").strip()
-        max_stores = 0
-        
-        if not username or not email or not password:
-            flash("Username, email, and password are required.", "danger")
-            return redirect(url_for("admin_users"))
-        
-        if role not in ['superadmin', 'admin', 'user']:
-            flash("Invalid role.", "danger")
-            return redirect(url_for("admin_users"))
-
-        # The licensing portal is the source of truth for client limits.
-        if role == 'admin':
-            if not license_key:
-                flash("A License Key from the Licensing Portal is required for a client account.", "danger")
-                return redirect(url_for("admin_users"))
-            try:
-                import requests as http_requests
-                config = get_license_config()
-                portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-                response = http_requests.post(
-                    f"{portal_url}/api/validate/{license_key}",
-                    headers=licensing_api_headers(), timeout=10,
-                )
-                license_data = response.json() if response.content else {}
-                if response.status_code != 200 or not license_data.get("valid"):
-                    flash(license_data.get("message") or "The License Key is invalid or inactive.", "danger")
-                    return redirect(url_for("admin_users"))
-                max_stores = int(license_data.get("max_stores") or 0)
-            except Exception as exc:
-                logger.error("Unable to validate client license: %s", exc)
-                flash("Unable to connect to the Licensing Portal. Please try again.", "danger")
-                return redirect(url_for("admin_users"))
-        
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            # Check if username or email already exists
-            cursor.execute("SELECT id FROM users WHERE username = %s OR email = %s", (username, email))
-            if cursor.fetchone():
-                flash("Username or email already exists.", "danger")
-                return redirect(url_for("admin_users"))
-            if license_key:
-                cursor.execute("SELECT id FROM users WHERE license_key = %s", (license_key,))
-                if cursor.fetchone():
-                    flash("This License Key is already connected to another client.", "danger")
-                    return redirect(url_for("admin_users"))
-            
-            password_hash = hash_password(password)
-            cursor.execute(
-                "INSERT INTO users (username, email, password_hash, role, max_stores, license_key) VALUES (%s, %s, %s, %s, %s, %s)",
-                (username, email, password_hash, role, max_stores if role == 'admin' else 0, license_key if role == 'admin' else None)
-            )
-            conn.commit()
-            conn.close()
-            
-            if role == 'admin':
-                flash(f"Client account created and connected to its license ({max_stores or 'Unlimited'} stores).", "success")
-                log_audit(
-                    entity_type="user",
-                    entity_id=0,
-                    action="created",
-                    new_values=f"Client {username} created with max_stores={max_stores}"
-                )
-            else:
-                flash("User created successfully.", "success")
-                log_audit(
-                    entity_type="user",
-                    entity_id=0,
-                    action="created",
-                    new_values=f"User {username} created with role {role}"
-                )
-        except Exception as e:
-            logger.error(f"Error creating user: {e}")
-            flash("Failed to create user.", "danger")
-        
-        return redirect(url_for("admin_users"))
-
-    @app.route("/api/admin/licenses/validate", methods=["POST"])
-    @role_required('superadmin')
-    def admin_validate_license():
-        """Validate a pasted portal key and return its licensed limits."""
-        data = request.get_json(silent=True) or {}
-        license_key = (data.get("license_key") or "").strip()
-        if not license_key:
-            return jsonify({"valid": False, "error": "License Key is required"}), 400
-        try:
-            import requests as http_requests
-            config = get_license_config()
-            portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-            response = http_requests.post(
-                f"{portal_url}/api/validate/{license_key}",
-                headers=licensing_api_headers(), timeout=10,
-            )
-            payload = response.json() if response.content else {}
-            return jsonify(payload), response.status_code
-        except Exception as exc:
-            logger.error("License preview validation failed: %s", exc)
-            return jsonify({"valid": False, "error": "Licensing Portal is unavailable"}), 502
-
-    @app.route("/admin/users/<int:user_id>/toggle", methods=["POST"])
-    @role_required('superadmin')
-    def admin_toggle_user(user_id: int):
-        """Toggle user active status"""
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            # Don't allow deactivating yourself
-            if user_id == session.get('user_id'):
-                flash("You cannot deactivate your own account.", "danger")
-                return redirect(url_for("admin_users"))
-            
-            cursor.execute("UPDATE users SET is_active = NOT is_active WHERE id = %s", (user_id,))
-            conn.commit()
-            conn.close()
-            flash("User status updated successfully.", "success")
-            log_audit(
-                entity_type="user",
-                entity_id=user_id,
-                action="toggled",
-                old_values="User status toggled"
-            )
-        except Exception as e:
-            logger.error(f"Error toggling user: {e}")
-            flash("Failed to update user status.", "danger")
-        
-        return redirect(url_for("admin_users"))
-
-    @app.route("/admin/users/<int:user_id>/generate-license", methods=["POST"])
-    @role_required('superadmin')
-    def admin_generate_user_license(user_id: int):
-        """Generate and attach a client license without a second portal login."""
-        user = get_user_by_id(user_id)
-        if not user or user.get("role") != "admin":
-            flash("A license can only be generated for an Admin (Client) account.", "danger")
-            return redirect(url_for("admin_users"))
-
-        config = get_license_config()
-        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-        try:
-            import requests as http_requests
-            response = http_requests.post(
-                f"{portal_url}/api/licenses/generate",
-                headers=licensing_api_headers(),
-                json={
-                    "external_user_id": user_id,
-                    "company_name": user.get("username") or user.get("email"),
-                    "contact_email": user.get("email"),
-                    "max_stores": int(user.get("max_stores") or 0),
-                    "max_questionnaires": 0,
-                },
-                timeout=15,
-            )
-            payload = response.json() if response.content else {}
-            if response.status_code not in (200, 201) or not payload.get("license_key"):
-                logger.error("Portal license generation failed: %s %s", response.status_code, response.text)
-                flash(payload.get("error") or "Unable to generate license from the licensing portal.", "danger")
-                return redirect(url_for("admin_users"))
-
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor()
-                cursor.execute("UPDATE users SET license_key = %s WHERE id = %s", (payload["license_key"], user_id))
-                conn.commit()
-            finally:
-                conn.close()
-
-            flash(f"License generated and connected to {user['username']}.", "success")
-            log_audit("user", user_id, "license_generated", new_values=f"Portal: {portal_url}")
-        except Exception as exc:
-            logger.error("Error generating client license: %s", exc)
-            flash("Unable to connect to the licensing portal. Check the portal URL and shared API key.", "danger")
-        return redirect(url_for("admin_users"))
-
-    @app.route("/account/password", methods=["GET", "POST"])
-    @login_required
-    def account_change_password():
-        """Self-service account settings: change username and/or password."""
-        user_id = session.get('user_id')
-        if not user_id:
-            return redirect(url_for('login'))
-
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT id, username, email, role, password_hash, created_at, is_active FROM users WHERE id = %s", (user_id,))
-            user = cursor.fetchone()
-
-            if not user:
-                session.clear()
-                flash("Your account could not be found. Please log in again.", "danger")
-                return redirect(url_for('login'))
-
-            if request.method == "POST":
-                form_type = request.form.get("form_type", "password")
-
-                if form_type == "email":
-                    new_email = request.form.get("new_email", "").strip()
-
-                    if not new_email:
-                        flash("Email is required.", "danger")
-                        return redirect(url_for("account_change_password"))
-
-                    if "@" not in new_email or "." not in new_email.split("@")[-1]:
-                        flash("Please enter a valid email address.", "danger")
-                        return redirect(url_for("account_change_password"))
-
-                    if new_email == user['email']:
-                        flash("New email must be different from your current email.", "warning")
-                        return redirect(url_for("account_change_password"))
-
-                    cursor.execute(
-                        "SELECT id FROM users WHERE email = %s AND id != %s",
-                        (new_email, user_id)
-                    )
-                    if cursor.fetchone():
-                        flash("That email is already in use by another account.", "danger")
-                        return redirect(url_for("account_change_password"))
-
-                    cursor.execute(
-                        "UPDATE users SET email = %s WHERE id = %s",
-                        (new_email, user_id)
-                    )
-                    conn.commit()
-
-                    try:
-                        log_audit(
-                            entity_type="user",
-                            entity_id=user_id,
-                            action="email_changed",
-                            old_values=user['email'],
-                            new_values=new_email,
-                            user_id=user_id
-                        )
-                    except Exception:
-                        pass
-
-                    flash(f"Email updated to {new_email}.", "success")
-                    return redirect(url_for("account_change_password"))
-
-                if form_type == "username":
-                    new_username = request.form.get("new_username", "").strip()
-
-                    if not new_username:
-                        flash("New username is required.", "danger")
-                        return redirect(url_for("account_change_password"))
-
-                    if len(new_username) < 2:
-                        flash("Username must be at least 2 characters long.", "danger")
-                        return redirect(url_for("account_change_password"))
-
-                    if new_username == user['username']:
-                        flash("New username must be different from your current username.", "warning")
-                        return redirect(url_for("account_change_password"))
-
-                    # Uniqueness check
-                    cursor.execute(
-                        "SELECT id FROM users WHERE username = %s AND id != %s",
-                        (new_username, user_id)
-                    )
-                    if cursor.fetchone():
-                        flash("That username is already taken.", "danger")
-                        return redirect(url_for("account_change_password"))
-
-                    cursor.execute(
-                        "UPDATE users SET username = %s WHERE id = %s",
-                        (new_username, user_id)
-                    )
-                    conn.commit()
-                    session['username'] = new_username
-
-                    try:
-                        log_audit(
-                            entity_type="user",
-                            entity_id=user_id,
-                            action="username_changed",
-                            old_values=user['username'],
-                            new_values=new_username,
-                            user_id=user_id
-                        )
-                    except Exception:
-                        pass
-
-                    flash(f"Username changed to {new_username}.", "success")
-                    return redirect(url_for("account_change_password"))
-
-                # Password change (default)
-                current_password = request.form.get("current_password", "")
-                new_password = request.form.get("new_password", "")
-                confirm_password = request.form.get("confirm_password", "")
-
-                if not current_password or not new_password or not confirm_password:
-                    flash("All password fields are required.", "danger")
-                    return redirect(url_for("account_change_password"))
-
-                if not verify_password(current_password, user['password_hash']):
-                    flash("Current password is incorrect.", "danger")
-                    return redirect(url_for("account_change_password"))
-
-                if len(new_password) < 4:
-                    flash("New password must be at least 4 characters long.", "danger")
-                    return redirect(url_for("account_change_password"))
-
-                if new_password != confirm_password:
-                    flash("New password and confirmation do not match.", "danger")
-                    return redirect(url_for("account_change_password"))
-
-                if new_password == current_password:
-                    flash("New password must be different from your current password.", "warning")
-                    return redirect(url_for("account_change_password"))
-
-                new_hash = hash_password(new_password)
-                cursor.execute(
-                    "UPDATE users SET password_hash = %s WHERE id = %s",
-                    (new_hash, user_id)
-                )
-                conn.commit()
-
-                try:
-                    log_audit(
-                        entity_type="user",
-                        entity_id=user_id,
-                        action="password_changed",
-                        new_values="self-service password change",
-                        user_id=user_id
-                    )
-                except Exception:
-                    pass
-
-                flash("Password updated successfully.", "success")
-                return redirect(url_for("account_change_password"))
-
-            return render_template("account/change_password.html", user=user)
-        except Exception as e:
-            logger.error(f"Error in account settings: {e}")
-            flash(f"Error updating account: {e}", "danger")
-            return redirect(url_for("admin_dashboard"))
-        finally:
-            conn.close()
-
-    @app.route("/admin/users/<int:user_id>/edit", methods=["GET", "POST"])
-    @role_required('superadmin')
-    def admin_edit_user(user_id: int):
-        """Edit an existing user."""
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-            user = cursor.fetchone()
-
-            if not user:
-                flash("User not found.", "danger")
-                return redirect(url_for("admin_users"))
-
-            if request.method == "POST":
-                username = request.form.get("username", "").strip()
-                email = request.form.get("email", "").strip()
-                role = request.form.get("role", user['role'])
-                try:
-                    max_stores = int(request.form.get("max_stores", "0") or 0)
-                except ValueError:
-                    max_stores = 0
-                is_active = request.form.get("is_active") == "on"
-                new_password = request.form.get("new_password", "")
-
-                if not username or not email:
-                    flash("Username and email are required.", "danger")
-                    return redirect(url_for("admin_edit_user", user_id=user_id))
-
-                # Treat legacy 'dev' as superadmin (in case migration didn't run)
-                if role == 'dev':
-                    role = 'superadmin'
-
-                if role not in ['superadmin', 'admin', 'user']:
-                    flash(f"Invalid role: {role}", "danger")
-                    return redirect(url_for("admin_edit_user", user_id=user_id))
-
-                # Normalize stored legacy role for self-edit comparison
-                stored_role = 'superadmin' if user['role'] in ('dev',) else user['role']
-
-                # Don't allow demoting/deactivating yourself
-                if user_id == session.get('user_id'):
-                    if role != stored_role:
-                        flash("You cannot change your own role.", "danger")
-                        return redirect(url_for("admin_edit_user", user_id=user_id))
-                    if not is_active:
-                        flash("You cannot deactivate your own account.", "danger")
-                        return redirect(url_for("admin_edit_user", user_id=user_id))
-
-                # Check uniqueness of username/email (excluding self)
-                cursor.execute(
-                    "SELECT id FROM users WHERE (username = %s OR email = %s) AND id != %s",
-                    (username, email, user_id)
-                )
-                if cursor.fetchone():
-                    flash("Username or email already in use by another user.", "danger")
-                    return redirect(url_for("admin_edit_user", user_id=user_id))
-
-                old_values = {
-                    'username': user['username'], 'email': user['email'],
-                    'role': user['role'], 'max_stores': user.get('max_stores', 0),
-                    'is_active': bool(user['is_active'])
-                }
-
-                # Update fields
-                cursor.execute(
-                    """
-                    UPDATE users
-                    SET username = %s,
-                        email = %s,
-                        role = %s,
-                        max_stores = %s,
-                        is_active = %s
-                    WHERE id = %s
-                    """,
-                    (username, email, role, max_stores if role == 'admin' else 0, is_active, user_id)
-                )
-
-                # Optional password reset
-                if new_password:
-                    if len(new_password) < 4:
-                        flash("Password must be at least 4 characters.", "danger")
-                        conn.rollback()
-                        return redirect(url_for("admin_edit_user", user_id=user_id))
-                    password_hash = hash_password(new_password)
-                    cursor.execute(
-                        "UPDATE users SET password_hash = %s WHERE id = %s",
-                        (password_hash, user_id)
-                    )
-
-                conn.commit()
-
-                # If editing self, refresh session so new username/role show immediately
-                if user_id == session.get('user_id'):
-                    session['username'] = username
-                    session['role'] = role
-
-                new_values = {
-                    'username': username, 'email': email, 'role': role,
-                    'max_stores': max_stores if role == 'admin' else 0,
-                    'is_active': is_active,
-                    'password_changed': bool(new_password),
-                }
-                try:
-                    log_audit(
-                        entity_type="user",
-                        entity_id=user_id,
-                        action="updated",
-                        old_values=str(old_values),
-                        new_values=str(new_values),
-                        user_id=session.get('user_id')
-                    )
-                except Exception:
-                    pass
-
-                flash("User updated successfully.", "success")
-                return redirect(url_for("admin_users"))
-
-            return render_template("admin/edit_user.html", user=user)
-        except Exception as e:
-            logger.error(f"Error editing user: {e}")
-            flash(f"Error editing user: {e}", "danger")
-            return redirect(url_for("admin_users"))
-        finally:
-            conn.close()
-
-    @app.route("/admin/users/<int:user_id>/delete", methods=["POST"])
-    @role_required('superadmin')
-    def admin_delete_user(user_id: int):
-        """Delete a user"""
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            # Don't allow deleting yourself
-            if user_id == session.get('user_id'):
-                flash("You cannot delete your own account.", "danger")
-                return redirect(url_for("admin_users"))
-            
-            cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
-            conn.commit()
-            conn.close()
-            flash("User deleted successfully.", "success")
-            log_audit(
-                entity_type="user",
-                entity_id=user_id,
-                action="deleted",
-                user_id=session.get('user_id')
-            )
-        except Exception as e:
-            logger.error(f"Error deleting user: {e}")
-            flash(f"Error deleting user: {e}", "danger")
-        return redirect(url_for("admin_users"))
-
-    # â”€â”€ Per-store view-only viewers (admin/superadmin manage who can view a store) â”€â”€
-    def _user_can_manage_store(user: Dict[str, Any], store_id: int) -> bool:
-        """Superadmin can manage any store; admin (client) can manage only stores they own."""
-        if not user:
-            return False
-        if user['role'] == 'superadmin':
-            return True
-        if user['role'] != 'admin':
-            return False
-        # Verify ownership
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id FROM stores WHERE id = %s", (store_id,))
-            row = cursor.fetchone()
-            return bool(row and row[0] == user['id'])
-        finally:
-            conn.close()
-
-    @app.route("/admin/stores/<int:store_id>/viewers", methods=["GET"])
-    @role_required('admin', 'superadmin')
-    def store_viewers_list(store_id: int):
-        """Return JSON: list of view-only users assigned to a store + available users to assign."""
-        user = get_user_by_id(session['user_id'])
-        if not _user_can_manage_store(user, store_id):
-            return jsonify({"success": False, "error": "Forbidden"}), 403
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute(
-                """
-                SELECT u.id, u.username, u.email, us.created_at
-                FROM user_stores us
-                JOIN users u ON u.id = us.user_id
-                WHERE us.store_id = %s
-                ORDER BY u.username
-                """,
-                (store_id,)
-            )
-            assigned = cursor.fetchall()
-
-            # A license may have at most one store viewer/manager per store,
-            # and no more assigned viewers than the owning Admin's store limit.
-            cursor.execute(
-                """SELECT s.user_id AS owner_user_id, COALESCE(u.max_stores, 0) AS max_viewers,
-                          u.license_key
-                   FROM stores s
-                   LEFT JOIN users u ON u.id = s.user_id
-                   WHERE s.id = %s""",
-                (store_id,),
-            )
-            ownership = cursor.fetchone() or {}
-            owner_user_id = ownership.get('owner_user_id')
-            max_viewers = int(ownership.get('max_viewers') or 0)
-            if ownership.get('license_key'):
-                license_status = validate_tenant_license(ownership['license_key'])
-                if license_status.get('valid'):
-                    max_viewers = int(license_status.get('max_stores') or 0)
-            assigned_total = 0
-            if owner_user_id:
-                cursor.execute(
-                    """SELECT COUNT(*) AS total
-                       FROM user_stores us
-                       JOIN stores s ON s.id = us.store_id
-                       WHERE s.user_id = %s""",
-                    (owner_user_id,),
-                )
-                assigned_total = int((cursor.fetchone() or {}).get('total') or 0)
-
-            store_has_viewer = bool(assigned)
-            limit_reached = max_viewers > 0 and assigned_total >= max_viewers
-
-            # Available view-only users not yet assigned to this store
-            if not store_has_viewer and not limit_reached:
-                cursor.execute(
-                    """SELECT u.id, u.username, u.email
-                       FROM users u
-                       WHERE u.role='user' AND u.is_active=TRUE
-                         AND NOT EXISTS (
-                           SELECT 1 FROM user_stores us WHERE us.user_id = u.id
-                         )
-                       ORDER BY u.username"""
-                )
-                available = cursor.fetchall()
-            else:
-                available = []
-            return jsonify({
-                "success": True,
-                "assigned": assigned,
-                "available": available,
-                "assigned_total": assigned_total,
-                "max_viewers": max_viewers,
-                "limit_reached": limit_reached,
-                "store_has_viewer": store_has_viewer,
-            })
-        finally:
-            conn.close()
-
-    @app.route("/admin/stores/<int:store_id>/viewers/add", methods=["POST"])
-    @role_required('admin', 'superadmin')
-    def store_viewers_add(store_id: int):
-        """Assign an existing view-only user to a store."""
-        user = get_user_by_id(session['user_id'])
-        if not _user_can_manage_store(user, store_id):
-            flash("You don't have permission to manage viewers for this store.", "danger")
-            return redirect(url_for("stores_management"))
-
-        try:
-            target_user_id = int(request.form.get("user_id", "0") or 0)
-        except ValueError:
-            target_user_id = 0
-        if not target_user_id:
-            flash("Please choose a user to assign.", "danger")
-            return redirect(url_for("stores_management", store_id=store_id))
-
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT id, username, role FROM users WHERE id = %s", (target_user_id,))
-            target = cursor.fetchone()
-            if not target or target['role'] != 'user':
-                flash("Selected account must be a view-only user.", "danger")
-                return redirect(url_for("stores_management", store_id=store_id))
-
-            cursor.execute("""SELECT s.user_id, u.license_key, COALESCE(u.max_stores, 0) AS max_viewers
-                              FROM stores s LEFT JOIN users u ON u.id = s.user_id
-                              WHERE s.id = %s""", (store_id,))
-            store_row = cursor.fetchone()
-            owner_user_id = store_row.get('user_id') if store_row else None
-
-            cursor.execute("SELECT COUNT(*) AS total FROM user_stores WHERE store_id = %s", (store_id,))
-            if int((cursor.fetchone() or {}).get('total') or 0) >= 1:
-                flash("This store already has a viewer/manager. Remove the current viewer first.", "warning")
-                return redirect(url_for("stores_management", store_id=store_id))
-
-            cursor.execute("SELECT COUNT(*) AS total FROM user_stores WHERE user_id = %s", (target_user_id,))
-            if int((cursor.fetchone() or {}).get('total') or 0) >= 1:
-                flash("That viewer is already assigned to another store.", "warning")
-                return redirect(url_for("stores_management", store_id=store_id))
-
-            if owner_user_id:
-                max_viewers = int(store_row.get('max_viewers') or 0)
-                if store_row.get('license_key'):
-                    license_status = validate_tenant_license(store_row['license_key'], force=True)
-                    if not license_status.get('valid'):
-                        flash("Unable to verify the store owner's license. Please try again.", "danger")
-                        return redirect(url_for("stores_management", store_id=store_id))
-                    max_viewers = int(license_status.get('max_stores') or 0)
-                if max_viewers > 0:
-                    cursor.execute(
-                        """SELECT COUNT(*) AS total
-                           FROM user_stores us
-                           JOIN stores s ON s.id = us.store_id
-                           WHERE s.user_id = %s""",
-                        (owner_user_id,),
-                    )
-                    assigned_total = int((cursor.fetchone() or {}).get('total') or 0)
-                    if assigned_total >= max_viewers:
-                        flash(f"Viewer limit reached. This license allows up to {max_viewers} store viewers.", "danger")
-                        return redirect(url_for("stores_management", store_id=store_id))
-
-            try:
-                cursor.execute(
-                    "INSERT INTO user_stores (user_id, store_id) VALUES (%s, %s)",
-                    (target_user_id, store_id)
-                )
-                conn.commit()
-                flash(f"{target['username']} can now view this store.", "success")
-                try:
-                    log_audit(
-                        entity_type="store",
-                        entity_id=store_id,
-                        action="viewer_added",
-                        new_values=f"user_id={target_user_id}",
-                        user_id=session.get('user_id')
-                    )
-                except Exception:
-                    pass
-            except Exception as e:
-                # Likely unique constraint (already assigned)
-                logger.info(f"Viewer add no-op: {e}")
-                flash("That user is already assigned to this store.", "warning")
-        finally:
-            conn.close()
-
-        return redirect(url_for("stores_management", store_id=store_id))
-
-    @app.route("/admin/stores/<int:store_id>/viewers/<int:user_id>/remove", methods=["POST"])
-    @role_required('admin', 'superadmin')
-    def store_viewers_remove(store_id: int, user_id: int):
-        """Remove a view-only user's access from a store."""
-        user = get_user_by_id(session['user_id'])
-        if not _user_can_manage_store(user, store_id):
-            flash("You don't have permission to manage viewers for this store.", "danger")
-            return redirect(url_for("stores_management"))
-
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                "DELETE FROM user_stores WHERE user_id = %s AND store_id = %s",
-                (user_id, store_id)
-            )
-            conn.commit()
-            flash("Viewer removed.", "success")
-            try:
-                log_audit(
-                    entity_type="store",
-                    entity_id=store_id,
-                    action="viewer_removed",
-                    new_values=f"user_id={user_id}",
-                    user_id=session.get('user_id')
-                )
-            except Exception:
-                pass
-        finally:
-            conn.close()
-
-        return redirect(url_for("stores_management", store_id=store_id))
-
-    @app.route("/api/licensing/users", methods=["GET"])
-    def api_licensing_users():
-        """API endpoint for licensing portal to fetch users"""
-        # Simple API key check for security
-        api_key = request.headers.get("X-Licensing-API-Key")
-        expected_api_key = os.getenv("LICENSING_API_KEY")
-        if not expected_api_key:
-            return jsonify({"error": "Licensing API is not configured"}), 503
-        if not api_key or not secrets.compare_digest(api_key, expected_api_key):
-            return jsonify({"error": "Unauthorized"}), 401
-        
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("""
-                SELECT id, username, email, role, max_stores, created_at, is_active
-                FROM users
-                WHERE role = 'admin'
-                ORDER BY created_at DESC
-            """)
-            users = cursor.fetchall()
-            return jsonify({"users": users})
-        except Exception as e:
-            logger.error(f"Error fetching users for licensing portal: {e}")
-            return jsonify({"error": str(e)}), 500
-        finally:
-            conn.close()
-
-    @app.route("/admin/license-config")
-    @login_required
-    @role_required('superadmin')
-    def admin_license_config():
-        """License configuration page"""
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            # Create table if it doesn't exist
-            cursor.execute("CREATE TABLE IF NOT EXISTS license_config (id INT AUTO_INCREMENT PRIMARY KEY, license_key VARCHAR(255) NOT NULL, api_key VARCHAR(255) NOT NULL, licensing_portal_url VARCHAR(255) DEFAULT 'https://feedbacklicensing-production-c938.up.railway.app', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)")
-            cursor.execute("SELECT * FROM license_config ORDER BY id DESC LIMIT 1")
-            config = cursor.fetchone()
-            
-            # Fetch license status from portal if config exists
-            license_status = None
-            license_error = None
-            if config:
-                try:
-                    import requests
-                    portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-                    
-                    logger.info(f"Fetching license status from portal: {portal_url}/api/validate/{config['license_key']}")
-                    response = requests.post(
-                        f"{portal_url}/api/validate/{config['license_key']}",
-                        headers=licensing_api_headers(),
-                        timeout=10
-                    )
-                    
-                    logger.info(f"License status response status: {response.status_code}")
-                    if response.status_code == 200:
-                        license_status = response.json()
-                        logger.info(f"License status data: {license_status}")
-                        if not license_status.get('valid'):
-                            license_error = license_status.get('message', 'License validation failed')
-                    else:
-                        logger.error(f"License validation failed with status: {response.status_code}")
-                        license_error = f"API error: {response.status_code}"
-                except Exception as e:
-                    logger.error(f"Error fetching license status: {e}")
-                    license_error = "Unable to reach licensing portal. Please try again later."
-            
-            return render_template("admin/license_config.html", config=config, license_status=license_status, license_error=license_error)
-        finally:
-            conn.close()
-
-    @app.route("/admin/license-config/save", methods=["POST"])
-    @role_required('superadmin')
-    def admin_save_license_config():
-        """Save license configuration"""
-        license_key = request.form.get("license_key", "").strip()
-        api_key = request.form.get("api_key", "").strip()
-        licensing_portal_url = normalize_portal_url(request.form.get("licensing_portal_url"))
-        
-        if not license_key or not api_key:
-            flash("License key and API key are required.", "danger")
-            return redirect(url_for("admin_license_config"))
-        
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            # Check if config exists
-            cursor.execute("SELECT id FROM license_config ORDER BY id DESC LIMIT 1")
-            existing = cursor.fetchone()
-            
-            if existing:
-                # Update existing config
-                cursor.execute(
-                    "UPDATE license_config SET license_key = %s, api_key = %s, licensing_portal_url = %s WHERE id = %s",
-                    (license_key, api_key, licensing_portal_url, existing[0])
-                )
-            else:
-                # Insert new config
-                cursor.execute(
-                    "INSERT INTO license_config (license_key, api_key, licensing_portal_url) VALUES (%s, %s, %s)",
-                    (license_key, api_key, licensing_portal_url)
-                )
-            
-            conn.commit()
-            conn.close()
-            
-            flash("License configuration saved successfully.", "success")
-            log_audit(
-                entity_type="license_config",
-                entity_id=0,
-                action="updated",
-                new_values=f"License configured for portal: {licensing_portal_url}"
-            )
-        except Exception as e:
-            logger.error(f"Error saving license config: {e}")
-            flash("Failed to save license configuration.", "danger")
-        
-        return redirect(url_for("admin_license_config"))
-
-    @app.route("/client/license-config")
-    @login_required
-    def client_license_config():
-        """Deprecated â€” license management is now part of the Support page."""
-        return redirect(url_for("client_support"))
-
-    @app.route("/client/license-config/save", methods=["POST"])
-    @login_required
-    def client_save_license_config():
-        """Save client license configuration"""
-        user = get_user_by_id(session['user_id'])
-        if not user or user.get('role') != 'admin':
-            flash("Only client administrator accounts can configure a license.", "danger")
-            return redirect(url_for("client_support"))
-        license_key = request.form.get("license_key", "").strip()
-        
-        if not license_key:
-            flash("License key is required.", "danger")
-            return redirect(url_for("client_license_config"))
-        
-        try:
-            # Validate license against the licensing portal
-            config = get_license_config()
-            portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-            
-            # Call the licensing portal API to validate the license
-            import requests
-            try:
-                response = requests.post(
-                    f"{portal_url}/api/validate/{license_key}",
-                    headers=licensing_api_headers(),
-                    timeout=10
-                )
-                
-                if response.status_code != 200 or not response.json().get("valid"):
-                    flash("Invalid license key. Please check with your administrator.", "danger")
-                    return redirect(url_for("client_license_config"))
-            except Exception as e:
-                logger.error(f"Error validating license with portal: {e}")
-                flash("Unable to validate license. Please try again later.", "danger")
-                return redirect(url_for("client_license_config"))
-            
-            # If valid, save to user's account
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute(
-                "UPDATE users SET license_key = %s WHERE id = %s",
-                (license_key, session['user_id'])
-            )
-            
-            conn.commit()
-            conn.close()
-            
-            flash("License key configured successfully. You can now add stores.", "success")
-            log_audit(
-                entity_type="user",
-                entity_id=session['user_id'],
-                action="license_configured",
-                new_values=f"License key configured for user {session['user_id']}"
-            )
-        except Exception as e:
-            logger.error(f"Error saving client license config: {e}")
-            flash("Failed to configure license key.", "danger")
-        
-        return redirect(url_for("client_license_config"))
-
-    # â”€â”€ Client Support Portal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    def _user_license_key(user: Dict[str, Any]) -> Optional[str]:
-        """Return only the license assigned to this client account.
-
-        Never fall back to the system/global license: doing so would make
-        superadmins and view-only users share the same support thread.
-        """
-        if user and user.get('role') == 'admin':
-            return user.get('license_key') or None
-        return None
-
-    def _support_identity(user: Dict[str, Any]) -> str:
-        """Stable, private conversation identity for the signed-in account."""
-        return _user_license_key(user) or f"user:{int(user['id'])}"
-
-    @app.route("/client/support")
-    @login_required
-    def client_support():
-        """Client support page â€” renders instantly, data loads via AJAX"""
-        user = get_user_by_id(session['user_id'])
-        if user['role'] not in ('user', 'admin', 'superadmin'):
-            flash("Access denied.", "danger")
-            return redirect(url_for("admin_dashboard"))
-
-        license_key = _user_license_key(user)
-
-        return render_template("client/support.html",
-                               user=user, license_key=license_key or '')
-
-    @app.route("/api/support/status")
-    @login_required
-    def api_support_status():
-        """AJAX endpoint â€” fetch license status + tickets from portal"""
-        user = get_user_by_id(session['user_id'])
-        config = get_license_config()
-        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-        license_key = _user_license_key(user)
-
-        result = {"license_status": None, "license_error": None, "tickets": [], "renewals": []}
-
-        if not license_key:
-            return jsonify(result)
-
-        import requests as http_requests
-        # Fetch license status (short timeout)
-        try:
-            resp = http_requests.post(f"{portal_url}/api/validate/{license_key}", headers=licensing_api_headers(), timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                result["license_status"] = data
-                if not data.get('valid'):
-                    result["license_error"] = data.get('message', 'License validation failed')
-            else:
-                result["license_error"] = f"API error: {resp.status_code}"
-        except Exception as e:
-            logger.error(f"Error fetching license status: {e}")
-            result["license_error"] = "Unable to reach licensing portal"
-
-        # Fetch tickets (short timeout, best-effort)
-        try:
-            resp = http_requests.get(f"{portal_url}/api/tickets/{license_key}", headers=licensing_api_headers(), timeout=5)
-            if resp.status_code == 200:
-                result["tickets"] = resp.json().get('tickets', [])
-        except Exception:
-            pass
-
-        try:
-            resp = http_requests.get(f"{portal_url}/api/renewals/{license_key}", headers=licensing_api_headers(), timeout=5)
-            if resp.status_code == 200:
-                result["renewals"] = resp.json().get("renewals", [])
-        except Exception:
-            pass
-
-        return jsonify(result)
-
-    @app.route("/client/support/ticket", methods=["POST"])
-    @login_required
-    def client_submit_ticket():
-        """Submit a support ticket to the licensing portal"""
-        user = get_user_by_id(session['user_id'])
-        config = get_license_config()
-        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-
-        license_key = _user_license_key(user) or ""
-        subject = request.form.get("subject", "").strip()
-        message = request.form.get("message", "").strip()
-        ticket_type = request.form.get("ticket_type", "general")
-        contact_email = user.get('email', '') or user.get('username', '')
-
-        if not subject or not message:
-            flash("Subject and message are required.", "danger")
-            return redirect(url_for("client_support"))
-
-        try:
-            import requests as http_requests
-            resp = http_requests.post(f"{portal_url}/api/tickets/create", json={
-                "license_key": license_key,
-                "contact_email": contact_email,
-                "subject": subject,
-                "message": message,
-                "ticket_type": ticket_type
-            }, headers=licensing_api_headers(), timeout=10)
-            if resp.status_code in (200, 201):
-                flash("Ticket submitted successfully. We'll get back to you soon.", "success")
-            else:
-                flash("Failed to submit ticket. Please try again.", "danger")
-        except Exception as e:
-            logger.error(f"Error submitting ticket to portal: {e}")
-            flash("Unable to reach support. Please try again later.", "danger")
-
-        return redirect(url_for("client_support"))
-
-    @app.route("/client/support/renew", methods=["POST"])
-    @login_required
-    def client_request_renewal():
-        """Create an Admin-confirmed renewal request for Superadmin review."""
-        user = get_user_by_id(session['user_id'])
-        config = get_license_config()
-        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-
-        license_key = _user_license_key(user) or ""
-        contact_email = user.get('email', '') or user.get('username', '')
-
-        if not license_key:
-            flash("No license key found.", "danger")
-            return redirect(url_for("client_support"))
-
-        if request.form.get("admin_confirmed") != "yes":
-            flash("Please confirm that you want to submit a renewal request.", "warning")
-            return redirect(url_for("client_support"))
-
-        requested_plan = request.form.get("requested_plan", "Current plan").strip()
-        payment_reference = request.form.get("payment_reference", "").strip()
-        try:
-            requested_days = int(request.form.get("requested_days", "365"))
-        except ValueError:
-            requested_days = 365
-
-        try:
-            import requests as http_requests
-            resp = http_requests.post(f"{portal_url}/api/renewals", json={
-                "license_key": license_key,
-                "contact_email": contact_email,
-                "requested_plan": requested_plan,
-                "requested_days": requested_days,
-                "payment_reference": payment_reference,
-                "admin_confirmed": True,
-            }, headers=licensing_api_headers(), timeout=10)
-            if resp.status_code in (200, 201):
-                flash("Renewal request confirmed and sent for Superadmin approval. Your license has not been extended yet.", "success")
-            elif resp.status_code == 409:
-                flash("You already have a renewal request waiting for Superadmin approval.", "warning")
-            else:
-                flash("Failed to submit renewal request.", "danger")
-        except Exception as e:
-            logger.error(f"Error submitting renewal request: {e}")
-            flash("Unable to reach support. Please try again later.", "danger")
-
-        return redirect(url_for("client_support"))
-
-    @app.route("/client/support/renew/<int:request_id>/cancel", methods=["POST"])
-    @login_required
-    def client_cancel_renewal(request_id):
-        user = get_user_by_id(session['user_id'])
-        license_key = _user_license_key(user) or ""
-        try:
-            import requests as http_requests
-            resp = http_requests.post(f"{_get_portal_url()}/api/renewals/{request_id}/cancel",
-                json={"license_key": license_key}, headers=licensing_api_headers(), timeout=10)
-            flash("Renewal request cancelled." if resp.status_code == 200 else "This request can no longer be cancelled.",
-                  "success" if resp.status_code == 200 else "warning")
-        except Exception as exc:
-            logger.error("Unable to cancel renewal: %s", exc)
-            flash("Unable to cancel the renewal request.", "danger")
-        return redirect(url_for("client_support"))
-
-    # â”€â”€ Client Messaging System (proxies to licensing portal) â”€â”€â”€â”€â”€â”€â”€â”€
-    def _get_portal_url():
-        config = get_license_config()
-        return normalize_portal_url(config.get("licensing_portal_url") if config else None)
-
-    def _ensure_portal_conversation(client_identifier, license_key, contact_email, company_name=""):
-        """Ensure conversation exists on portal and return its ID"""
-        # Fallback contact_email if empty (portal requires it)
-        effective_email = contact_email or company_name or client_identifier or "client@unknown"
-        portal_url = _get_portal_url()
-        import requests as http_requests
-        try:
-            logger.info(f"Ensuring portal conversation at {portal_url} for {client_identifier}")
-            resp = http_requests.post(f"{portal_url}/api/conversations/create", json={
-                "client_identifier": client_identifier,
-                "license_key": license_key or "",
-                "contact_email": effective_email,
-                "company_name": company_name or effective_email
-            }, headers=licensing_api_headers(), timeout=10)
-            if resp.status_code in (200, 201):
-                conv_id = resp.json().get('conversation', {}).get('id')
-                logger.info(f"Portal conversation ID: {conv_id}")
-                return conv_id
-            logger.error(f"Portal create failed: {resp.status_code} - {resp.text}")
-        except Exception as e:
-            logger.error(f"Failed to ensure portal conversation: {e}")
-        return None
-
-    @app.route("/api/client/messages", methods=["GET"])
-    @login_required
-    def api_get_client_messages():
-        """Get messages for the current user from licensing portal"""
-        user = get_user_by_id(session['user_id'])
-        license_key = _user_license_key(user)
-        client_identifier = _support_identity(user)
-        contact_email = user.get('email', '') or user.get('username', '')
-
-        if not license_key and not contact_email:
-            return jsonify({"error": "No license key or email found"}), 400
-
-        # Ensure conversation exists on portal
-        conv_id = _ensure_portal_conversation(client_identifier, license_key, contact_email, user.get('username', ''))
-        if not conv_id:
-            return jsonify({"messages": [], "conversation_id": None, "error": "Portal unavailable"})
-
-        # Fetch messages from portal
-        portal_url = _get_portal_url()
-        try:
-            import requests as http_requests
-            resp = http_requests.get(f"{portal_url}/api/conversations/{conv_id}/messages?viewer=client", headers=licensing_api_headers(), timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                return jsonify({"messages": data.get('messages', []), "conversation_id": conv_id})
-        except Exception as e:
-            logger.error(f"Failed to fetch messages from portal: {e}")
-        return jsonify({"messages": [], "conversation_id": conv_id})
-
-    @app.route("/api/client/messages/send", methods=["POST"])
-    @login_required
-    def api_send_client_message():
-        """Send a client message directly to licensing portal"""
-        user = get_user_by_id(session['user_id'])
-        license_key = _user_license_key(user)
-        client_identifier = _support_identity(user)
-        contact_email = user.get('email', '') or user.get('username', '')
-
-        data = request.get_json() or {}
-        message = data.get("message", "").strip()
-        if not message:
-            return jsonify({"error": "Message is required"}), 400
-
-        # Ensure conversation exists on portal
-        conv_id = _ensure_portal_conversation(client_identifier, license_key, contact_email, user.get('username', ''))
-        if not conv_id:
-            return jsonify({"error": "Failed to reach licensing portal"}), 500
-
-        # Send message to portal
-        portal_url = _get_portal_url()
-        try:
-            import requests as http_requests
-            resp = http_requests.post(f"{portal_url}/api/conversations/{conv_id}/send", json={
-                "message": message,
-                "sender_type": "client",
-                "sender_name": contact_email or user.get('username', 'Client')
-            }, headers=licensing_api_headers(), timeout=10)
-            if resp.status_code in (200, 201):
-                return jsonify({"success": True})
-            logger.error(f"Failed to send message to portal: {resp.status_code} - {resp.text}")
-            return jsonify({"error": "Failed to send message"}), 500
-        except Exception as e:
-            logger.error(f"Error sending message to portal: {e}")
-            return jsonify({"error": "Failed to send message"}), 500
-
-    # â”€â”€ Admin Messaging Interface â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    @app.route("/admin/messages")
-    @login_required
-    @role_required('superadmin')
-    def admin_messages():
-        """Admin messages page - view all client conversations from licensing portal"""
-        # Fetch conversations from licensing portal
-        config = get_license_config()
-        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-        conversations = []
-        try:
-            import requests as http_requests
-            resp = http_requests.get(f"{portal_url}/api/conversations", headers=licensing_api_headers(), timeout=5)
-            if resp.status_code == 200:
-                conversations = resp.json().get('conversations', [])
-        except Exception as e:
-            logger.error(f"Failed to fetch conversations from portal: {e}")
-        return render_template("admin/messages.html", conversations=conversations)
-
-    @app.route("/api/admin/conversations")
-    @login_required
-    @role_required('superadmin')
-    def api_admin_get_conversations():
-        """API endpoint to get all conversations from licensing portal"""
-        config = get_license_config()
-        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-        try:
-            import requests as http_requests
-            logger.info(f"Fetching conversations from portal at {portal_url}")
-            resp = http_requests.get(f"{portal_url}/api/conversations", headers=licensing_api_headers(), timeout=5)
-            if resp.status_code == 200:
-                logger.info(f"Successfully fetched {len(resp.json().get('conversations', []))} conversations from portal")
-                return jsonify(resp.json())
-            logger.error(f"Failed to fetch conversations: {resp.status_code}")
-            return jsonify({"conversations": []})
-        except Exception as e:
-            logger.error(f"Failed to fetch conversations from portal: {e}")
-            return jsonify({"conversations": []})
-
-    @app.route("/api/admin/conversations/<int:conversation_id>/messages")
-    @login_required
-    @role_required('superadmin')
-    def api_admin_get_conversation_messages(conversation_id):
-        """API endpoint to get messages for a conversation from licensing portal"""
-        config = get_license_config()
-        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-        try:
-            import requests as http_requests
-            resp = http_requests.get(f"{portal_url}/api/conversations/{conversation_id}/messages", headers=licensing_api_headers(), timeout=5)
-            if resp.status_code == 200:
-                return jsonify(resp.json())
-            return jsonify({"messages": []})
-        except Exception as e:
-            logger.error(f"Failed to fetch messages from portal: {e}")
-            return jsonify({"messages": []})
-
-    @app.route("/api/admin/conversations/<int:conversation_id>/send", methods=["POST"])
-    @login_required
-    @role_required('superadmin')
-    def api_admin_send_message(conversation_id):
-        """API endpoint to send a message as admin to licensing portal"""
-        data = request.get_json() or {}
-        message = data.get("message", "").strip()
-        if not message:
-            return jsonify({"error": "Message is required"}), 400
-
-        config = get_license_config()
-        portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-        try:
-            import requests as http_requests
-            resp = http_requests.post(f"{portal_url}/api/conversations/{conversation_id}/send", json={
-                "message": message,
-                "sender_type": "admin",
-                "sender_name": "Support Team"
-            }, headers=licensing_api_headers(), timeout=5)
-            if resp.status_code in (200, 201):
-                return jsonify({"success": True})
-            return jsonify({"error": "Failed to send message"}), 500
-        except Exception as e:
-            logger.error(f"Error sending message to portal: {e}")
-            return jsonify({"error": "Failed to send message"}), 500
-
-    @app.route("/api/messages/unread-count")
-    @login_required
-    def api_message_unread_count():
-        """Return the private message unread total for the signed-in account."""
-        user = get_user_by_id(session["user_id"])
-        portal_url = _get_portal_url()
-        try:
-            import requests as http_requests
-            if user.get("role") == "superadmin":
-                resp = http_requests.get(f"{portal_url}/api/conversations", headers=licensing_api_headers(), timeout=5)
-                conversations = resp.json().get("conversations", []) if resp.status_code == 200 else []
-                return jsonify({"success": True, "count": sum(int(c.get("unread_count") or 0) for c in conversations)})
-
-            license_key = _user_license_key(user)
-            contact_email = user.get("email", "") or user.get("username", "")
-            conv_id = _ensure_portal_conversation(_support_identity(user), license_key, contact_email, user.get("username", ""))
-            if not conv_id:
-                return jsonify({"success": True, "count": 0})
-            resp = http_requests.get(f"{portal_url}/api/conversations/{conv_id}/messages?viewer=count", headers=licensing_api_headers(), timeout=5)
-            messages = resp.json().get("messages", []) if resp.status_code == 200 else []
-            unread = sum(1 for m in messages if m.get("sender_type") == "admin" and not bool(m.get("is_read", m.get("seen", False))))
-            return jsonify({"success": True, "count": unread})
-        except Exception as exc:
-            logger.warning("Unable to fetch message unread count: %s", exc)
-            return jsonify({"success": True, "count": 0})
-
-    @app.route("/admin/reset-database", methods=["POST"])
-    @role_required('superadmin')
-    def admin_reset_database():
-        """Reset all data in the database (keeps users)"""
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            # Disable foreign key checks temporarily
-            cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
-            
-            # Delete all data from tables (keeping users and schema)
-            tables_to_clear = [
-                "feedback",
-                "stores",
-                "questionnaires",
-                "questions",
-                "audit_logs",
-                "notifications"
-            ]
-            
-            for table in tables_to_clear:
-                try:
-                    cursor.execute(f"DELETE FROM {table}")
-                except Exception as e:
-                    logger.warning(f"Could not clear table {table}: {e}")
-            
-            # Re-enable foreign key checks
-            cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
-            
-            conn.commit()
-            conn.close()
-            
-            flash("Database reset successfully. All data cleared except users.", "success")
-            log_audit(
-                entity_type="database",
-                entity_id=0,
-                action="reset",
-                old_values="Database reset"
-            )
-        except Exception as e:
-            logger.error(f"Error resetting database: {e}")
-            flash(f"Failed to reset database: {e}", "danger")
-        
-        return redirect(url_for("admin_users"))
-
-    @app.route("/dashboard/staff-overall")
-    def staff_overall():
-        """Staff overall page showing all staff with ratings and performance metrics."""
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor(dictionary=True)
-
-            # Global average commendation rating (prior `m`); fall back to 4.0.
-            cursor.execute(
-                "SELECT AVG(rating) as global_avg FROM staff_commendations WHERE rating IS NOT NULL"
-            )
-            row = cursor.fetchone()
-            global_avg_rating = float(row['global_avg']) if row and row['global_avg'] is not None else 4.0
-
-            # Fetch all staff with their commendation ratings and metrics.
-            # `weighted_score` is the Bayesian average:
-            #   (C * m + sum_of_ratings) / (C + n)
-            cursor.execute(
-                """
-                SELECT s.id, s.first_name, s.last_name, s.email, s.phone, s.position, s.role, s.status, st.store_name, s.store_id,
-                       AVG(sc.rating) as avg_rating,
-                       COUNT(sc.id) as commendation_count,
-                       (
-                           (%s * %s) + COALESCE(SUM(sc.rating), 0)
-                       ) / (
-                           %s + COUNT(sc.rating)
-                       ) as weighted_score
-                FROM staff s
-                LEFT JOIN staff_commendations sc ON s.id = sc.staff_id
-                LEFT JOIN stores st ON s.store_id = st.id
-                GROUP BY s.id, s.first_name, s.last_name, s.email, s.phone, s.position, s.role, s.status, st.store_name, s.store_id
-                ORDER BY weighted_score DESC, s.last_name, s.first_name
-                """,
-                (BAYESIAN_C, global_avg_rating, BAYESIAN_C),
-            )
-            staff_data = cursor.fetchall()
-            
-            # Format the data
-            for staff in staff_data:
-                staff['avg_rating'] = float(staff['avg_rating']) if staff['avg_rating'] else 0.0
-                staff['commendation_count'] = int(staff['commendation_count']) if staff['commendation_count'] else 0
-                staff['weighted_score'] = float(staff['weighted_score']) if staff['weighted_score'] else 0.0
-            
-            conn.close()
-            return render_template("dashboard/staff_overall.html", staff_data=staff_data)
-        except Exception as e:
-            error_details = traceback.format_exc()
-            logger.error(f"Staff Overall Error: {e}\n{error_details}")
-            return f"Staff Overall Error: {e}<br><pre>{error_details}</pre>", 500
-
-    @app.route("/api/dashboard/analytics")
-    def api_dashboard_analytics():
-        """JSON endpoint for overall dashboard analytics (used by store filter)."""
-        try:
-            analytics = fetch_dashboard_analytics()
-            # Serialize for JSON
-            stores_data = analytics.get('stores_data', [])
-            overall = analytics.get('overall_stats', {})
-            recent = analytics.get('recent_activity', [])
-            top = analytics.get('top_stores', [])
-            best_store = analytics.get('best_overall_store')
-            best_staff = analytics.get('best_overall_staff')
-
-            # Format recent_activity dates
-            formatted_activity = []
-            for a in recent:
-                d = a.get('date')
-                formatted_activity.append({
-                    'date_label': d.strftime('%b %d') if d else '?',
-                    'responses': a.get('responses', 0)
-                })
-
-            return jsonify({
-                'stores_data': [
-                    {
-                        'id': s['id'],
-                        'store_name': s['store_name'],
-                        'address': s.get('address', ''),
-                        'city': s.get('city', ''),
-                        'total_responses': s.get('total_responses', 0),
-                        'avg_rating': float(s['avg_rating']) if s.get('avg_rating') else 0.0,
-                        'unique_users': s.get('unique_users', 0)
-                    } for s in stores_data
-                ],
-                'overall_stats': {
-                    'total_responses': overall.get('total_responses', 0),
-                    'total_stores': overall.get('total_stores', 0),
-                    'total_unique_users': overall.get('total_unique_users', 0),
-                    'overall_avg_rating': float(overall.get('overall_avg_rating', 0)),
-                    'total_questionnaires': overall.get('total_questionnaires', 0)
-                },
-                'recent_activity': formatted_activity,
-                'top_stores': [
-                    {'store_name': t['store_name'], 'response_count': t['response_count']}
-                    for t in top
-                ],
-                'best_overall_store': {
-                    'store_name': best_store['store_name'],
-                    'avg_rating': float(best_store['avg_rating'])
-                } if best_store else None,
-                'best_overall_staff': {
-                    'first_name': best_staff['first_name'],
-                    'last_name': best_staff['last_name'],
-                    'avg_rating': float(best_staff['avg_rating']) if best_staff.get('avg_rating') else 0.0
-                } if best_staff else None
-            })
-        except Exception as e:
-            logger.error(f"Dashboard API error: {e}")
-            return jsonify({'error': str(e)}), 500
-
-    @app.route("/admin/stores/performance")
-    def stores_performance():
-        analytics = fetch_dashboard_analytics()
-        return render_template(
-            "dashboard/store_performance.html",
-            stores_data=analytics.get("stores_data", []),
-            overall_stats=analytics.get("overall_stats", {}),
-        )
-
-    @app.route("/admin/stores", methods=["GET"])
-    @login_required
-    def stores_management():
-        user = get_user_by_id(session['user_id'])
-        # Role-based store visibility:
-        #   superadmin -> all stores
-        #   admin (client) -> own stores (filtered by user_id ownership)
-        #   user (view-only) -> only stores explicitly assigned via user_stores
-        if user['role'] == 'user':
-            assigned_ids = get_assigned_store_ids(session['user_id'])
-            logger.info(f"View-only user {session['user_id']} assigned to stores: {assigned_ids}")
-            stores = fetch_stores(assigned_store_ids=assigned_ids)
-            user_id = session['user_id']
-        else:
-            user_id = session['user_id'] if user['role'] == 'admin' else None
-            logger.info(f"User {session['user_id']} (role: {user['role']}) viewing stores. Filtering by user_id: {user_id}")
-            stores = fetch_stores(user_id=user_id)
-        logger.info(f"User {session['user_id']} sees {len(stores)} stores")
-
-        # Batch-load feedback + staff counts and (for non-clients) user info in 3 queries
-        # instead of running 2 queries per store + 1 per user.
-        store_ids = [s["id"] for s in stores]
-        feedback_counts = {}
-        staff_counts = {}
-        user_info = {}
-        if store_ids:
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor()
-                placeholders = ",".join(["%s"] * len(store_ids))
-                cursor.execute(
-                    f"SELECT store_id, COUNT(*) FROM responses WHERE store_id IN ({placeholders}) GROUP BY store_id",
-                    tuple(store_ids),
-                )
-                feedback_counts = {row[0]: int(row[1]) for row in cursor.fetchall()}
-                cursor.execute(
-                    f"SELECT store_id, COUNT(*) FROM staff WHERE store_id IN ({placeholders}) GROUP BY store_id",
-                    tuple(store_ids),
-                )
-                staff_counts = {row[0]: int(row[1]) for row in cursor.fetchall()}
-
-                if user['role'] == 'superadmin':
-                    user_ids = sorted({s.get("user_id") for s in stores if s.get("user_id")})
-                    if user_ids:
-                        uph = ",".join(["%s"] * len(user_ids))
-                        cursor2 = conn.cursor(dictionary=True)
-                        cursor2.execute(
-                            f"SELECT id, username, role FROM users WHERE id IN ({uph})",
-                            tuple(user_ids),
-                        )
-                        user_info = {u["id"]: u for u in cursor2.fetchall()}
-            finally:
-                conn.close()
-
-        # Enhance stores with counts (single pass)
-        enhanced_stores = []
-        for store in stores:
-            sid = store["id"]
-            store_with_counts = dict(store)
-            store_with_counts["feedback_count"] = feedback_counts.get(sid, 0)
-            store_with_counts["staff_count"] = staff_counts.get(sid, 0)
-            enhanced_stores.append(store_with_counts)
-
-        # Group enhanced stores by client (admin) for superadmin only
-        stores_by_user_enhanced = None
-        if user['role'] == 'superadmin' and enhanced_stores:
-            stores_by_user_enhanced = {}
-            for store in enhanced_stores:
-                uid = store.get("user_id") or "unassigned"
-                stores_by_user_enhanced.setdefault(uid, []).append(store)
-
-        selected_store_id_param = request.args.get("store_id")
-        selected_store_id = None
-        if selected_store_id_param:
-            try:
-                selected_store_id = int(selected_store_id_param)
-            except ValueError:
-                selected_store_id = None
-
-        selected_store = None
-        if selected_store_id is not None:
-            for store in stores:
-                if store["id"] == selected_store_id:
-                    selected_store = store
-                    break
-
-        public_url = None
-        qr_data_uri = None
-        if selected_store:
-            public_url = get_store_public_url(store_id=int(selected_store["id"]))
-            qr_data_uri = generate_qr_data_uri(public_url)
-
-        return render_template(
-            "manage_stores/stores.html",
-            stores=enhanced_stores if user['role'] != 'superadmin' else None,
-            all_stores=enhanced_stores,
-            stores_by_user=stores_by_user_enhanced if user['role'] == 'superadmin' else None,
-            user_info=user_info if user['role'] == 'superadmin' else None,
-            selected_store=selected_store,
-            public_url=public_url,
-            qr_data_uri=qr_data_uri,
-        )
-
-    def get_feedback_count_for_store(store_id: int) -> int:
-        """Get the total number of feedback responses for a store."""
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT COUNT(*) FROM responses WHERE store_id = %s",
-                (store_id,)
-            )
-            count = cursor.fetchone()[0]
-            return int(count) if count else 0
-        finally:
-            conn.close()
-
-    def get_staff_count_for_store(store_id: int) -> int:
-        """Get the total number of staff members for a store."""
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT COUNT(*) FROM staff WHERE store_id = %s",
-                (store_id,)
-            )
-            count = cursor.fetchone()[0]
-            return int(count) if count else 0
-        finally:
-            conn.close()
-
-    def get_staff_performance_for_store(store_id: int) -> List[Dict[str, Any]]:
-        """Get staff for a store ranked by Bayesian-average score.
-
-        Score = (C * m + sum_of_ratings) / (C + n), where m is the global
-        commendation rating and C is the smoothing constant (`BAYESIAN_C`).
-        """
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-
-            cursor.execute(
-                "SELECT AVG(rating) as global_avg FROM staff_commendations WHERE rating IS NOT NULL"
-            )
-            row = cursor.fetchone()
-            global_avg_rating = float(row['global_avg']) if row and row['global_avg'] is not None else 4.0
-
-            cursor.execute(
-                """
-                SELECT s.id, s.first_name, s.last_name, s.position, s.role,
-                       AVG(sc.rating) as avg_rating,
-                       COUNT(sc.id) as commendation_count,
-                       (
-                           (%s * %s) + COALESCE(SUM(sc.rating), 0)
-                       ) / (
-                           %s + COUNT(sc.rating)
-                       ) as weighted_score
-                FROM staff s
-                LEFT JOIN staff_commendations sc ON s.id = sc.staff_id
-                WHERE s.store_id = %s
-                GROUP BY s.id, s.first_name, s.last_name, s.position, s.role
-                ORDER BY weighted_score DESC
-                """,
-                (BAYESIAN_C, global_avg_rating, BAYESIAN_C, store_id),
-            )
-            return cursor.fetchall()
-        finally:
-            conn.close()
-
-    # API endpoint for store feedback data
-    @app.route("/api/stores/<int:store_id>/feedback", methods=["GET"])
-    @login_required
-    def api_store_feedback(store_id: int):
-        """API endpoint to get feedback data for a store."""
-        if not can_manage_store_staff(session['user_id'], store_id):
-            return jsonify({"error": "You can only view your assigned store."}), 403
-        store = fetch_store_by_id(store_id=store_id)
-        if not store:
-            return jsonify({"error": "Store not found"}), 404
-        
-        feedback = fetch_responses_for_store(store_id=store_id, limit=5)
-        return jsonify(feedback)
-
-    # API endpoint for store analytics data
-    @app.route("/api/stores/<int:store_id>/analytics", methods=["GET"])
-    @login_required
-    def api_store_analytics(store_id: int):
-        """API endpoint to get analytics data for a store."""
-        if not can_manage_store_staff(session['user_id'], store_id):
-            return jsonify({"error": "You can only view your assigned store."}), 403
-        store = fetch_store_by_id(store_id=store_id)
-        if not store:
-            return jsonify({"error": "Store not found"}), 404
-        
-        # Fetch all feedback for analytics
-        all_feedback = fetch_responses_for_store(store_id=store_id, limit=1000)
-        total_feedback = len(all_feedback)
-        
-        # Resolved / unresolved counts
-        resolved_count = sum(1 for f in all_feedback if f.get("status") == "resolved")
-        unresolved_count = total_feedback - resolved_count
-        resolution_rate = round((resolved_count / total_feedback * 100), 1) if total_feedback > 0 else 0
-        
-        # Calculate ratings
-        all_response_ids = [int(r["id"]) for r in all_feedback]
-        answers_by_response_id = fetch_answers_for_responses(all_response_ids) if all_feedback else {}
-        
-        # Rating distribution
-        rating_distribution = [0, 0, 0, 0, 0]  # 1-5 stars
-        total_ratings = 0
-        for response_id, answers in answers_by_response_id.items():
-            for answer in answers:
-                if answer.get("rating_value"):
-                    rating = int(float(answer["rating_value"]))
-                    if 1 <= rating <= 5:
-                        rating_distribution[rating - 1] += 1
-                        total_ratings += 1
-        
-        # Calculate percentages
-        five_star_count = rating_distribution[4]
-        four_star_count = rating_distribution[3]
-        
-        five_star_rate = round((five_star_count / total_ratings * 100), 1) if total_ratings > 0 else 0
-        four_plus_star_rate = round(((four_star_count + five_star_count) / total_ratings * 100), 1) if total_ratings > 0 else 0
-        
-        # Rating distribution percentages
-        rating_pcts = [round(c / total_ratings * 100, 1) if total_ratings > 0 else 0 for c in rating_distribution]
-        
-        # Quality score
-        quality_score = round(
-            (rating_distribution[0] * 1 + rating_distribution[1] * 2 + 
-             rating_distribution[2] * 3 + rating_distribution[3] * 4 + 
-             rating_distribution[4] * 5) / total_ratings, 1
-        ) if total_ratings > 0 else 0
-        
-        # Monthly feedback trend (last 6 months)
-        monthly_trend = defaultdict(int)
-        now = datetime.now()
-        for fb in all_feedback:
-            submitted = fb.get("submitted_at")
-            if submitted:
-                if isinstance(submitted, str):
-                    try:
-                        submitted = datetime.strptime(submitted, "%Y-%m-%d %H:%M:%S")
-                    except (ValueError, TypeError):
-                        continue
-                key = submitted.strftime("%Y-%m")
-                monthly_trend[key] += 1
-        
-        # Build last 6 months labels and values
-        trend_labels = []
-        trend_values = []
-        for i in range(5, -1, -1):
-            d = now - timedelta(days=i * 30)
-            key = d.strftime("%Y-%m")
-            label = d.strftime("%b")
-            trend_labels.append(label)
-            trend_values.append(monthly_trend.get(key, 0))
-        
-        # Staff commendations count + top staff
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            if all_response_ids:
-                placeholders = ','.join(['%s'] * len(all_response_ids))
-                cursor.execute(f"""
-                    SELECT COUNT(*) as cnt FROM staff_commendations 
-                    WHERE response_id IN ({placeholders})
-                """, all_response_ids)
-                total_commendations = cursor.fetchone()["cnt"]
-                
-                # Global average commendation rating (Bayesian prior `m`).
-                cursor.execute(
-                    "SELECT AVG(rating) as global_avg FROM staff_commendations WHERE rating IS NOT NULL"
-                )
-                grow = cursor.fetchone()
-                staff_global_avg = float(grow['global_avg']) if grow and grow['global_avg'] is not None else 4.0
-
-                # Top 5 commended staff ranked by Bayesian-average score.
-                cursor.execute(f"""
-                    SELECT s.first_name, s.last_name, s.position, s.role,
-                           AVG(sc.rating) as avg_rating,
-                           COUNT(sc.id) as commendation_count,
-                           (
-                               (%s * %s) + COALESCE(SUM(sc.rating), 0)
-                           ) / (
-                               %s + COUNT(sc.rating)
-                           ) as weighted_score
-                    FROM staff_commendations sc
-                    JOIN staff s ON s.id = sc.staff_id
-                    WHERE sc.response_id IN ({placeholders})
-                    GROUP BY s.id, s.first_name, s.last_name, s.position, s.role
-                    ORDER BY weighted_score DESC
-                    LIMIT 5
-                """, [BAYESIAN_C, staff_global_avg, BAYESIAN_C, *all_response_ids])
-                top_staff = cursor.fetchall()
-            else:
-                total_commendations = 0
-                top_staff = []
-        finally:
-            conn.close()
-        
-        formatted_top_staff = []
-        for s in top_staff:
-            formatted_top_staff.append({
-                "name": f"{s['first_name']} {s['last_name']}",
-                "position": s["position"] or (s["role"].title() if s["role"] else "Staff"),
-                "avg_rating": float(s["avg_rating"]) if s["avg_rating"] else 0.0
-            })
-        
-        return jsonify({
-            "overview": {
-                "total_feedback": total_feedback,
-                "resolved": resolved_count,
-                "unresolved": unresolved_count,
-                "resolution_rate": resolution_rate,
-                "total_ratings": total_ratings
-            },
-            "rating_metrics": {
-                "five_star_rate": five_star_rate,
-                "four_plus_star_rate": four_plus_star_rate,
-                "quality_score": quality_score,
-                "distribution": rating_distribution,
-                "distribution_pcts": rating_pcts
-            },
-            "trend": {
-                "labels": trend_labels,
-                "values": trend_values
-            },
-            "staff_metrics": {
-                "total_commendations": total_commendations,
-                "top_staff": formatted_top_staff
-            }
-        })
-
-    # API endpoint for store staff data
-    @app.route("/api/stores/<int:store_id>/staff", methods=["GET"])
-    @login_required
-    def api_store_staff(store_id: int):
-        """API endpoint to get staff data for a store."""
-        if not can_manage_store_staff(session['user_id'], store_id):
-            return jsonify({"error": "You can only view staff in your assigned store."}), 403
-        store = fetch_store_by_id(store_id=store_id)
-        if not store:
-            return jsonify({"error": "Store not found"}), 404
-        
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            
-            # Global average commendation rating (Bayesian prior `m`).
-            cursor.execute(
-                "SELECT AVG(rating) as global_avg FROM staff_commendations WHERE rating IS NOT NULL"
-            )
-            row = cursor.fetchone()
-            global_avg_rating = float(row['global_avg']) if row and row['global_avg'] is not None else 4.0
-
-            # Fetch staff with commendation ratings; `weighted_score` uses the
-            # Bayesian average so low-volume staff don't outrank high-volume
-            # staff just because of a single 5â˜… commendation.
-            cursor.execute(
-                """
-                SELECT s.id, s.first_name, s.last_name, s.email, s.phone, s.position, s.photo_url, s.role, s.status,
-                       AVG(sc.rating) as avg_rating,
-                       COUNT(sc.id) as commendation_count,
-                       (
-                           (%s * %s) + COALESCE(SUM(sc.rating), 0)
-                       ) / (
-                           %s + COUNT(sc.rating)
-                       ) as weighted_score
-                FROM staff s
-                LEFT JOIN staff_commendations sc ON s.id = sc.staff_id
-                WHERE s.store_id = %s
-                GROUP BY s.id
-                ORDER BY weighted_score DESC, s.last_name, s.first_name
-                """,
-                (BAYESIAN_C, global_avg_rating, BAYESIAN_C, store_id),
-            )
-            
-            staff_members = cursor.fetchall()
-            
-            # Format staff data
-            total_commendations = sum(s["commendation_count"] or 0 for s in staff_members) if staff_members else 0
-            max_commendations = max((s["commendation_count"] or 0 for s in staff_members), default=0)
-            formatted_staff = []
-            for staff in staff_members:
-                formatted_staff.append({
-                    "id": staff["id"],
-                    "name": f"{staff['first_name']} {staff['last_name']}",
-                    "first_name": staff["first_name"],
-                    "last_name": staff["last_name"],
-                    "position": staff["position"] or staff["role"].title(),
-                    "email": staff.get("email", "") or "",
-                    "phone": staff.get("phone", "") or "",
-                    "photo_url": staff.get("photo_url", "") or "",
-                    "role": staff["role"],
-                    "status": staff["status"],
-                    "avg_rating": float(staff["avg_rating"]) if staff["avg_rating"] else 0.0,
-                    "commendation_count": staff["commendation_count"] or 0,
-                    "store_id": store_id
-                })
-            
-            return jsonify(formatted_staff)
-        finally:
-            conn.close()
-
-    # -------------------------
-    # PUBLIC SURVEY
-    # -------------------------
-    @app.route("/dashboard", methods=["GET"])
-    def public_store_dashboard_subdomain():
-        # Extract subdomain from request host
-        host = request.host.split(':')[0]  # Remove port if present
-        parts = host.split('.')
-        
-        # Check if accessing via subdomain
-        if len(parts) >= 3:
-            subdomain = parts[0]
-            
-            # Validate subdomain and fetch store
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor(dictionary=True)
-                cursor.execute(
-                    """
-                    SELECT id, store_name, address, city, province, postal_code,
-                           contact_number, email, store_manager_name, manager_contact,
-                           store_type, status, logo_url
-                    FROM stores
-                    WHERE subdomain = %s
-                    LIMIT 1
-                    """,
-                    (subdomain,)
-                )
-                store = cursor.fetchone()
-            finally:
-                conn.close()
-
-            if store:
-                # Fetch store performance data
-                conn = get_db_connection()
-                try:
-                    cursor = conn.cursor(dictionary=True)
-
-                    # Total feedback count
-                    cursor.execute("SELECT COUNT(*) as total FROM responses WHERE store_id = %s", (store['id'],))
-                    total_feedback = cursor.fetchone()['total']
-
-                    # Average rating
-                    cursor.execute("SELECT AVG(a.rating_value) as avg_rating FROM answers a JOIN responses r ON a.response_id = r.id WHERE r.store_id = %s AND a.rating_value IS NOT NULL", (store['id'],))
-                    avg_rating = cursor.fetchone()['avg_rating']
-
-                    # Total commendations
-                    cursor.execute("SELECT COUNT(*) as total FROM staff_commendations sc JOIN responses r ON sc.response_id = r.id WHERE r.store_id = %s", (store['id'],))
-                    total_commendations = cursor.fetchone()['total']
-
-                    # Total staff
-                    cursor.execute("SELECT COUNT(*) as total FROM staff WHERE store_id = %s", (store['id'],))
-                    total_staff = cursor.fetchone()['total']
-
-                    # Staff performance
-                    cursor.execute(
-                        """
-                        SELECT s.id, s.first_name, s.last_name, s.position, s.role, s.status,
-                               AVG(sc.rating) as avg_rating,
-                               COUNT(sc.id) as commendation_count
-                        FROM staff s
-                        LEFT JOIN staff_commendations sc ON s.id = sc.staff_id
-                        LEFT JOIN responses r ON sc.response_id = r.id
-                        WHERE s.store_id = %s AND r.store_id = %s
-                        GROUP BY s.id, s.first_name, s.last_name, s.position, s.role, s.status
-                        ORDER BY avg_rating DESC
-                        """,
-                        (store['id'], store['id'])
-                    )
-                    staff_performance = cursor.fetchall()
-
-                    # Recent feedback
-                    cursor.execute(
-                        """
-                        SELECT a.rating_value as rating, a.answer_text as comment, r.created_at
-                        FROM responses r
-                        LEFT JOIN answers a ON r.id = a.response_id
-                        WHERE r.store_id = %s
-                        ORDER BY r.created_at DESC
-                        LIMIT 10
-                        """,
-                        (store['id'],)
-                    )
-                    recent_feedback = cursor.fetchall()
-
-                    # Fetch master questionnaire logo
-                    cursor.execute("SELECT logo_url FROM questionnaires WHERE is_template = 1 AND owner_user_id = %s AND license_key <=> %s LIMIT 1", (store['user_id'], store.get('license_key')))
-                    master_logo = cursor.fetchone()
-
-                finally:
-                    conn.close()
-
-                return render_template(
-                    "public/store_dashboard.html",
-                    store=store,
-                    master_logo=master_logo.get('logo_url') if master_logo else None,
-                    total_feedback=total_feedback,
-                    avg_rating=avg_rating,
-                    total_commendations=total_commendations,
-                    total_staff=total_staff,
-                    staff_performance=staff_performance,
-                    recent_feedback=recent_feedback
-                )
-        
-        # If no subdomain match, redirect to main domain or show error
-        return render_template("layout.html", error="Store not found or invalid subdomain"), 404
-
-    @app.route("/d/<access_token>", methods=["GET"])
-    def public_store_dashboard(access_token: str):
-        # Validate access token and fetch store
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute(
-                """
-                SELECT id, store_name, address, city, province, postal_code,
-                       contact_number, email, store_manager_name, manager_contact,
-                       store_type, status, logo_url
-                FROM stores
-                WHERE access_token = %s
-                LIMIT 1
-                """,
-                (access_token,)
-            )
-            store = cursor.fetchone()
-        finally:
-            conn.close()
-
-        if not store:
-            return render_template("layout.html", error="Invalid access token or store not found"), 404
-
-        # Fetch store performance data
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-
-            # Total feedback count
-            cursor.execute("SELECT COUNT(*) as total FROM responses WHERE store_id = %s", (store['id'],))
-            total_feedback = cursor.fetchone()['total']
-
-            # Average rating
-            cursor.execute("SELECT AVG(a.rating_value) as avg_rating FROM answers a JOIN responses r ON a.response_id = r.id WHERE r.store_id = %s AND a.rating_value IS NOT NULL", (store['id'],))
-            avg_rating = cursor.fetchone()['avg_rating']
-
-            # Total commendations
-            cursor.execute("SELECT COUNT(*) as total FROM staff_commendations sc JOIN responses r ON sc.response_id = r.id WHERE r.store_id = %s", (store['id'],))
-            total_commendations = cursor.fetchone()['total']
-
-            # Total staff
-            cursor.execute("SELECT COUNT(*) as total FROM staff WHERE store_id = %s", (store['id'],))
-            total_staff = cursor.fetchone()['total']
-
-            # Staff performance
-            cursor.execute(
-                """
-                SELECT s.id, s.first_name, s.last_name, s.position, s.role, s.status,
-                       AVG(sc.rating) as avg_rating,
-                       COUNT(sc.id) as commendation_count
-                FROM staff s
-                LEFT JOIN staff_commendations sc ON s.id = sc.staff_id
-                LEFT JOIN responses r ON sc.response_id = r.id
-                WHERE s.store_id = %s AND r.store_id = %s
-                GROUP BY s.id, s.first_name, s.last_name, s.position, s.role, s.status
-                ORDER BY avg_rating DESC
-                """,
-                (store['id'], store['id'])
-            )
-            staff_performance = cursor.fetchall()
-
-            # Recent feedback
-            cursor.execute(
-                """
-                SELECT a.rating_value as rating, a.answer_text as comment, r.created_at
-                FROM responses r
-                LEFT JOIN answers a ON r.id = a.response_id
-                WHERE r.store_id = %s
-                ORDER BY r.created_at DESC
-                LIMIT 10
-                """,
-                (store['id'],)
-            )
-            recent_feedback = cursor.fetchall()
-
-            # Fetch master questionnaire logo
-            cursor.execute("SELECT logo_url FROM questionnaires WHERE is_template = 1 AND owner_user_id = %s AND license_key <=> %s LIMIT 1", (store['user_id'], store.get('license_key')))
-            master_logo = cursor.fetchone()
-
-        finally:
-            conn.close()
-
-        return render_template(
-            "public/store_dashboard.html",
-            store=store,
-            master_logo=master_logo.get('logo_url') if master_logo else None,
-            total_feedback=total_feedback,
-            avg_rating=avg_rating,
-            total_commendations=total_commendations,
-            total_staff=total_staff,
-            staff_performance=staff_performance,
-            recent_feedback=recent_feedback
-        )
-
-    @app.route("/s/<int:store_id>", methods=["GET"])
-    def public_survey(store_id: int):
-        store = fetch_store_by_id(store_id=store_id)
-        if not store:
-            return render_template("survey_error.html", store=None, error="Page not found"), 404
-
-        # Check if master questionnaire is active
-        master_template = fetch_template_questionnaire(int(store['user_id']), store.get('license_key'))
-        if not master_template or not master_template.get("is_active"):
-            return render_template("survey_error.html", store=store, error="Sorry, the system is not accepting any feedbacks right now"), 404
-
-        questionnaire = fetch_questionnaire_by_store(store_id=store_id)
-        if not questionnaire:
-            return render_template(
-                "survey_error.html", store=store,
-                error="This store does not have a published questionnaire yet."
-            ), 404
-        if not questionnaire.get("is_active"):
-            return render_template("survey_error.html", store=store, error="Sorry, the system is not accepting any feedbacks right now"), 404
-
-        questions = fetch_questions_for_questionnaire(questionnaire_id=int(questionnaire["id"]))
-        question_ids = [int(q["id"]) for q in questions]
-        options_by_question_id = fetch_options_for_questions(question_ids=question_ids)
-
-        # The restaurant/store logo always wins over template branding.
-        master_logo = store.get('logo_url') or questionnaire.get('logo_url') or master_template.get('logo_url')
-        branding = fetch_tenant_branding(int(store['user_id']), store.get('license_key'))
-
-        # Fetch active staff for this store
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT id, first_name, last_name, position, role, photo_url
-            FROM staff
-            WHERE store_id = %s AND status = 'active'
-            ORDER BY role DESC, last_name, first_name
-        """, (store_id,))
-        staff_members = cursor.fetchall()
-        cursor.close()
-        conn.close()
-
-        return render_template(
-            "master_questionnaire/survey.html",
-            store=store,
-            master_logo=master_logo,
-            branding=branding,
-            questionnaire=questionnaire,
-            questions=questions,
-            options_by_question_id=options_by_question_id,
-            staff_members=staff_members,
-            staff_photo_map={str(member['id']): member.get('photo_url') for member in staff_members if member.get('photo_url')},
-        )
-
-    @app.route("/s/<int:store_id>/submit", methods=["POST"])
-    def submit_survey(store_id: int):
-        store = fetch_store_by_id(store_id=store_id)
-        if not store:
-            return render_template("survey_error.html", store=None, error="Page not found"), 404
-
-        # Check if master questionnaire is active
-        master_template = fetch_template_questionnaire(int(store['user_id']), store.get('license_key'))
-        if not master_template or not master_template.get("is_active"):
-            return render_template("survey_error.html", store=store, error="Sorry, the system is not accepting any feedbacks right now"), 404
-
-        questionnaire = fetch_questionnaire_by_store(store_id=store_id)
-        if not questionnaire or not questionnaire.get("is_active"):
-            return render_template("survey_error.html", store=store, error="Sorry, the system is not accepting any feedbacks right now"), 404
-
-        questions = fetch_questions_for_questionnaire(questionnaire_id=int(questionnaire["id"]))
-        options_by_question_id = fetch_options_for_questions([int(q["id"]) for q in questions])
-
-        # Get and validate receipt number
-        receipt_number = request.form.get("receipt_number", "").strip()
-        if not receipt_number:
-            flash("Receipt/Transaction number is required.", "danger")
-            return redirect(url_for("public_survey", store_id=store_id))
-        
-        # The SI/transaction number printed on the receipt is exactly 8 digits.
-        if not re.fullmatch(r'\d{8}', receipt_number):
-            flash("Receipt/Transaction number must contain exactly 8 digits.", "danger")
-            return redirect(url_for("public_survey", store_id=store_id))
-
-        # Get and validate email
-        user_email = request.form.get("user_email", "").strip()
-        if not user_email:
-            flash("Email address is required.", "danger")
-            return redirect(url_for("public_survey", store_id=store_id))
-        
-        # Basic email validation
-        if "@" not in user_email or "." not in user_email.split("@")[1]:
-            flash("Please enter a valid email address.", "danger")
-            return redirect(url_for("public_survey", store_id=store_id))
-
-        errors: List[str] = []
-        answers_to_save: List[Dict[str, Any]] = []
-
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("""SELECT id, role FROM staff
-                              WHERE store_id = %s AND status = 'active'""", (store_id,))
-            eligible_staff = {int(row['id']): row['role'] for row in cursor.fetchall()}
-        finally:
-            conn.close()
-
-        for q in questions:
-            qid = int(q["id"])
-            key = f"q_{qid}"
-            q_type = q["question_type"]
-            is_required = bool(q["is_required"])
-            target_scope = q.get("target_scope") or "overall"
-            target_staff_id = None
-            if target_scope in ("staff", "manager"):
-                raw_target = request.form.get(f"target_{qid}", "").strip()
-                if raw_target.isdigit():
-                    candidate_id = int(raw_target)
-                    candidate_role = eligible_staff.get(candidate_id)
-                    role_matches = (
-                        candidate_role == "manager" if target_scope == "manager"
-                        else candidate_role in ("staff", "supervisor")
-                    )
-                    if role_matches:
-                        target_staff_id = candidate_id
-                if target_staff_id is None and is_required:
-                    errors.append(f"Select a {target_scope}: {q['question_text']}")
-                    continue
-
-            if q_type == "rating":
-                raw = request.form.get(key, "").strip()
-                if not raw:
-                    if is_required:
-                        errors.append(f"Rating required: {q['question_text']}")
-                    continue
-                try:
-                    rating_value = int(raw)
-                except ValueError:
-                    errors.append(f"Invalid rating: {q['question_text']}")
-                    continue
-                if rating_value < 1 or rating_value > 5:
-                    errors.append(f"Rating must be 1-5: {q['question_text']}")
-                    continue
-                comment = request.form.get(f"{key}_comment", "").strip()
-                answers_to_save.append(
-                    {"question_id": qid, "staff_id": target_staff_id, "answer_text": comment if comment else None, "rating_value": rating_value}
-                )
-
-            elif q_type == "text":
-                text = request.form.get(key, "")
-                text = text.strip()
-                if not text:
-                    if is_required:
-                        errors.append(f"Answer required: {q['question_text']}")
-                    continue
-                answers_to_save.append({"question_id": qid, "staff_id": target_staff_id, "answer_text": text, "rating_value": None})
-
-            elif q_type == "multiple_choice":
-                raw = request.form.get(key, "").strip()
-                if not raw:
-                    if is_required:
-                        errors.append(f"Choice required: {q['question_text']}")
-                    continue
-
-                try:
-                    selected_option_id = int(raw)
-                except ValueError:
-                    errors.append(f"Invalid choice: {q['question_text']}")
-                    continue
-
-                options = options_by_question_id.get(qid, [])
-                selected_text = None
-                for opt in options:
-                    if int(opt["id"]) == selected_option_id:
-                        selected_text = opt["option_text"]
-                        break
-
-                if not selected_text:
-                    errors.append(f"Invalid choice: {q['question_text']}")
-                    continue
-
-                answers_to_save.append(
-                    {"question_id": qid, "staff_id": target_staff_id, "answer_text": selected_text, "rating_value": None}
-                )
-            else:
-                errors.append(f"Unsupported question type: {q_type}")
-
-        if errors:
-            for e in errors[:5]:
-                flash(e, "danger")
-            return redirect(url_for("public_survey", store_id=store_id))
-
-        overall_question_ids = {int(q["id"]) for q in questions
-                                if (q.get("target_scope") or "overall") == "overall"}
-        rating_values = [float(a["rating_value"]) for a in answers_to_save
-                         if a.get("rating_value") is not None
-                         and int(a["question_id"]) in overall_question_ids]
-        average_rating = (sum(rating_values) / len(rating_values)) if rating_values else 0
-        reward_claim_token = None
-
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            # Use Philippine time (UTC+08:00)
-            ph_tz = timezone(timedelta(hours=8))
-            now_ph = datetime.now(ph_tz).strftime("%Y-%m-%d %H:%M:%S")
-            try:
-                cursor.execute(
-                    """INSERT INTO global_receipt_usages (receipt_number, store_id, used_at)
-                       VALUES (%s, %s, %s)""",
-                    (receipt_number, store_id, now_ph),
-                )
-            except mysql.connector.IntegrityError as exc:
-                conn.rollback()
-                if exc.errno == 1062:
-                    flash("This Receipt/Transaction Number can only be used once across all branches and has already been submitted.", "danger")
-                    return redirect(url_for("public_survey", store_id=store_id))
-                raise
-            cursor.execute(
-                """
-                INSERT INTO responses (questionnaire_id, store_id, user_email, receipt_number, submitted_at)
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (int(questionnaire["id"]), store_id, user_email, receipt_number, now_ph),
-            )
-            response_id = int(cursor.lastrowid)
-            cursor.execute(
-                """UPDATE global_receipt_usages SET response_id = %s
-                   WHERE receipt_number = %s""",
-                (response_id, receipt_number),
-            )
-
-            show_google_review = average_rating >= 4 and bool(store.get("google_review_url"))
-            if (show_google_review and store.get("google_review_mode") == "reward" and user_email):
-                reward_claim_token = secrets.token_urlsafe(32)
-                cursor.execute(
-                    """INSERT INTO review_rewards
-                       (response_id, store_id, owner_user_id, license_key,
-                        customer_email, claim_token, reward_type, status)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')""",
-                    (response_id, store_id, int(store["user_id"]), store.get("license_key"),
-                     user_email, reward_claim_token,
-                     store.get("reward_type") or "Store Reward or Discount"),
-                )
-
-            for a in answers_to_save:
-                cursor.execute(
-                    """
-                    INSERT INTO answers (response_id, question_id, staff_id, answer_text, rating_value)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (response_id, a["question_id"], a.get("staff_id"), a["answer_text"], a["rating_value"]),
-                )
-                if a.get("staff_id") and a.get("rating_value") is not None:
-                    cursor.execute(
-                        """INSERT INTO staff_commendations
-                           (response_id, staff_id, rating, commendation_type, comment)
-                           VALUES (%s, %s, %s, 'excellent_service', %s)""",
-                        (response_id, a["staff_id"], int(a["rating_value"]), a.get("answer_text")),
-                    )
-
-            # Handle staff commendation if provided
-            staff_commendation = request.form.get("staff_commendation", "").strip()
-            if staff_commendation and staff_commendation.isdigit():
-                staff_id = int(staff_commendation)
-                commendation_type = request.form.get("commendation_type", "excellent_service")
-                commendation_comment = request.form.get("commendation_comment", "").strip()
-                commendation_rating = request.form.get("commendation_rating", "5").strip()
-                if not commendation_rating or not commendation_rating.isdigit():
-                    commendation_rating = 5
-                commendation_rating = int(commendation_rating)
-                
-                # Verify staff exists and belongs to this store
-                cursor.execute("SELECT id FROM staff WHERE id = %s AND store_id = %s", (staff_id, store_id))
-                if cursor.fetchone():
-                    cursor.execute("""
-                        INSERT INTO staff_commendations (response_id, staff_id, rating, commendation_type, comment)
-                        VALUES (%s, %s, %s, %s, %s)
-                    """, (response_id, staff_id, commendation_rating, commendation_type, commendation_comment if commendation_comment else None))
-
-            conn.commit()
-        finally:
-            conn.close()
-
-        if reward_claim_token:
-            return redirect(url_for("survey_thank_you", store_id=store_id,
-                                    claim=reward_claim_token, review=1))
-        return redirect(url_for("survey_thank_you", store_id=store_id,
-                                review=1 if show_google_review else None))
-
-    @app.route("/s/<int:store_id>/thanks", methods=["GET"])
-    def survey_thank_you(store_id: int):
-        store = fetch_store_by_id(store_id=store_id)
-        if not store:
-            return render_template("layout.html", store=None, error="Page not found"), 404
-        claim_token = request.args.get("claim", "").strip()
-        reward = None
-        if claim_token:
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor(dictionary=True)
-                cursor.execute(
-                    """SELECT rr.id, rr.status, rr.reward_code, rr.reward_type,
-                              r.receipt_number
-                       FROM review_rewards rr
-                       JOIN responses r ON r.id = rr.response_id
-                       WHERE rr.store_id = %s AND rr.claim_token = %s""",
-                    (store_id, claim_token),
-                )
-                reward = cursor.fetchone()
-            finally:
-                conn.close()
-        show_google_review = request.args.get("review") == "1" and bool(store.get("google_review_url"))
-        return render_template("master_questionnaire/thank_you.html", store=store,
-                               reward=reward, claim_token=claim_token,
-                               show_google_review=show_google_review)
-
-    @app.route("/s/<int:store_id>/review-reward/<claim_token>", methods=["POST"])
-    def claim_review_reward(store_id: int, claim_token: str):
-        """Issue a reward only after uploaded proof passes OCR text validation."""
-        review_file = request.files.get("google_review_proof")
-        review_ocr_text = request.form.get("review_ocr_text", "").strip()[:12000]
-
-        def validated_image_data(upload):
-            if not upload or not upload.filename:
-                return None
-            if upload.mimetype not in {"image/jpeg", "image/png", "image/webp"}:
-                return None
-            content = upload.read(2 * 1024 * 1024 + 1)
-            if not content or len(content) > 2 * 1024 * 1024:
-                return None
-            return f"data:{upload.mimetype};base64,{base64.b64encode(content).decode('ascii')}"
-
-        review_proof = validated_image_data(review_file)
-        if not review_proof:
-            flash("Upload a clear Google Review screenshot (PNG, JPG, or WEBP; maximum 2 MB).", "danger")
-            return redirect(url_for("survey_thank_you", store_id=store_id, claim=claim_token))
-
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute(
-                """SELECT rr.*, s.store_name, r.receipt_number
-                   FROM review_rewards rr
-                   JOIN stores s ON s.id = rr.store_id
-                   JOIN responses r ON r.id = rr.response_id
-                   WHERE rr.store_id = %s AND rr.claim_token = %s FOR UPDATE""",
-                (store_id, claim_token),
-            )
-            reward = cursor.fetchone()
-            if not reward:
-                return "Invalid or expired reward claim", 404
-            if reward["status"] == "pending":
-                review_text_lower = review_ocr_text.lower()
-                review_matches = ("review" in review_text_lower and
-                                  any(term in review_text_lower for term in ("done", "point", "posted", "contribute", "published")))
-                if not review_matches:
-                    conn.rollback()
-                    flash("OCR verification failed. Upload a clear full screenshot showing the completed Google Review.", "danger")
-                    return redirect(url_for("survey_thank_you", store_id=store_id, claim=claim_token))
-
-                code = "RWD-" + secrets.token_hex(5).upper()
-                cursor.execute(
-                    """UPDATE review_rewards SET reward_code = %s, status = 'issued',
-                       google_review_proof = %s, review_ocr_text = %s,
-                       proof_verified_at = NOW(), issued_at = NOW()
-                       WHERE id = %s AND status = 'pending'""",
-                    (code, review_proof, review_ocr_text, int(reward["id"])),
-                )
-                conn.commit()
-                reward["reward_code"] = code
-                reward["status"] = "issued"
-            else:
-                conn.commit()
-        finally:
-            conn.close()
-
-        if reward["status"] == "issued" and not reward.get("email_sent"):
-            message = (f"Thank you for reviewing {reward['store_name']} on Google. "
-                       f"Your unique reward code is {reward['reward_code']}. "
-                       f"Reward: {reward['reward_type']}. Bring your original receipt and a screenshot "
-                       f"of this code to the store for verification. This code can only be redeemed once.")
-            success, email_message = email_config.send_feedback_reply(
-                to_email=reward["customer_email"],
-                customer_name=reward["customer_email"].split("@")[0].replace(".", " ").title(),
-                reply_message=message,
-                store_name=reward["store_name"],
-                feedback_summary="Google Review Reward",
-                template_type="appreciation",
-            )
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE review_rewards SET email_sent = %s, email_error = %s WHERE id = %s",
-                    (bool(success), None if success else str(email_message)[:1000], int(reward["id"])),
-                )
-                conn.commit()
-            finally:
-                conn.close()
-        return redirect(url_for("survey_thank_you", store_id=store_id, claim=claim_token, issued=1))
-
-    @app.route("/admin/rewards", methods=["GET"])
-    @role_required('user', 'admin', 'superadmin')
-    def admin_rewards():
-        user = get_user_by_id(session["user_id"])
-        search = request.args.get("search", "").strip()[:100]
-        status_filter = request.args.get("status", "").strip().lower()
-        store_filter = request.args.get("store", "").strip()
-        try:
-            per_page = int(request.args.get("per_page", 20))
-        except (TypeError, ValueError):
-            per_page = 20
-        if per_page not in (20, 50, 100):
-            per_page = 20
-        try:
-            page = max(1, int(request.args.get("page", 1)))
-        except (TypeError, ValueError):
-            page = 1
-
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            if user["role"] == "superadmin":
-                cursor.execute("SELECT * FROM stores ORDER BY store_name")
-                stores = cursor.fetchall()
-                scope_sql = "1 = 1"
-                scope_params = []
-            elif user["role"] == "user":
-                assigned_store_ids = get_assigned_store_ids(user["id"])
-                if assigned_store_ids:
-                    placeholders = ",".join(["%s"] * len(assigned_store_ids))
-                    cursor.execute(
-                        f"SELECT * FROM stores WHERE id IN ({placeholders}) ORDER BY store_name",
-                        tuple(assigned_store_ids),
-                    )
-                    stores = cursor.fetchall()
-                    scope_sql = f"rr.store_id IN ({placeholders})"
-                    scope_params = list(assigned_store_ids)
-                else:
-                    stores = []
-                    scope_sql = "1 = 0"
-                    scope_params = []
-            else:
-                cursor.execute("SELECT * FROM stores WHERE user_id = %s ORDER BY store_name", (user["id"],))
-                stores = cursor.fetchall()
-                scope_sql = "rr.owner_user_id = %s AND rr.license_key <=> %s"
-                scope_params = [user["id"], user.get("license_key")]
-
-            filters = [scope_sql]
-            params = list(scope_params)
-            if search:
-                term = f"%{search}%"
-                filters.append("(rr.reward_code LIKE %s OR rr.customer_email LIKE %s OR s.store_name LIKE %s OR rr.reward_type LIKE %s)")
-                params.extend([term, term, term, term])
-            if status_filter in {"pending", "issued", "used"}:
-                filters.append("rr.status = %s")
-                params.append(status_filter)
-            if store_filter.isdigit():
-                filters.append("rr.store_id = %s")
-                params.append(int(store_filter))
-
-            where_sql = " AND ".join(filters)
-            cursor.execute(f"""SELECT COUNT(*) AS total
-                               FROM review_rewards rr
-                               JOIN stores s ON s.id = rr.store_id
-                               WHERE {where_sql}""", tuple(params))
-            total_rewards = int(cursor.fetchone()["total"])
-            total_pages = max(1, (total_rewards + per_page - 1) // per_page)
-            page = min(page, total_pages)
-            start_page = max(1, page - 2)
-            end_page = min(total_pages, page + 2)
-            offset = (page - 1) * per_page
-            cursor.execute(f"""SELECT rr.*, s.store_name, s.google_review_url
-                               FROM review_rewards rr
-                               JOIN stores s ON s.id = rr.store_id
-                               WHERE {where_sql}
-                               ORDER BY rr.created_at DESC
-                               LIMIT %s OFFSET %s""", tuple(params + [per_page, offset]))
-            rewards = cursor.fetchall()
-        finally:
-            conn.close()
-        return render_template(
-            "admin/rewards.html", stores=stores, rewards=rewards,
-            search=search, status_filter=status_filter, store_filter=store_filter,
-            per_page=per_page, page=page, total_pages=total_pages,
-            total_rewards=total_rewards, start_page=start_page, end_page=end_page,
-        )
-
-    @app.route("/admin/stores/<int:store_id>/reward-settings", methods=["POST"])
-    @role_required('admin', 'superadmin')
-    def save_reward_settings(store_id: int):
-        if not can_manage_store(session["user_id"], store_id):
-            flash("You don't have permission to update this store.", "danger")
-            return redirect(url_for("admin_rewards"))
-        reward_type = request.form.get("reward_type", "").strip()
-        google_review_mode = request.form.get("google_review_mode", "reward").strip()
-        if google_review_mode not in {"review_only", "reward"}:
-            google_review_mode = "reward"
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE stores SET reward_type = %s, google_review_mode = %s WHERE id = %s",
-                           (reward_type or "Store Reward or Discount", google_review_mode, store_id))
-            conn.commit()
-        finally:
-            conn.close()
-        flash("Google Review option saved.", "success")
-        return redirect(url_for("admin_rewards"))
-
-    @app.route("/admin/rewards/<int:reward_id>/use", methods=["POST"])
-    @role_required('user', 'admin', 'superadmin')
-    def use_review_reward(reward_id: int):
-        user = get_user_by_id(session["user_id"])
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            if user["role"] == "superadmin":
-                cursor.execute("UPDATE review_rewards SET status='used', used_at=NOW() WHERE id=%s AND status='issued'", (reward_id,))
-            elif user["role"] == "user":
-                cursor.execute(
-                    """UPDATE review_rewards rr
-                       SET rr.status='used', rr.used_at=NOW()
-                       WHERE rr.id=%s AND rr.status='issued'
-                         AND EXISTS (
-                           SELECT 1 FROM user_stores us
-                           WHERE us.user_id=%s AND us.store_id=rr.store_id
-                         )""",
-                    (reward_id, user["id"]),
-                )
-            else:
-                cursor.execute("""UPDATE review_rewards SET status='used', used_at=NOW()
-                                  WHERE id=%s AND owner_user_id=%s AND license_key <=> %s AND status='issued'""",
-                               (reward_id, user["id"], user.get("license_key")))
-            conn.commit()
-        finally:
-            conn.close()
-        flash("Reward code marked as used.", "success")
-        return redirect(url_for("admin_rewards"))
-
-    @app.route("/admin/stores/add", methods=["POST"])
-    @login_required
-    def add_store():
-        store_name = request.form.get("store_name", "").strip()
-        address = request.form.get("address", "").strip()
-        city = request.form.get("city", "").strip()
-        province = request.form.get("province", "").strip()
-        postal_code = request.form.get("postal_code", "").strip()
-        contact_number = request.form.get("contact_number", "").strip()
-        email = request.form.get("email", "").strip()
-        store_manager_name = request.form.get("store_manager_name", "").strip()
-        manager_contact = request.form.get("manager_contact", "").strip()
-        store_type = request.form.get("store_type", "").strip()
-        status = request.form.get("status", "active")
-        google_review_url = request.form.get("google_review_url", "").strip()
-        google_review_mode = request.form.get("google_review_mode", "reward").strip()
-        if google_review_mode not in {"review_only", "reward"}:
-            google_review_mode = "reward"
-
-        if not store_name:
-            flash("Store name is required.", "danger")
-            return redirect(url_for("stores_management"))
-
-        # Basic email validation if provided
-        if email and ("@" not in email or "." not in email.split("@")[1]):
-            flash("Please enter a valid email address.", "danger")
-            return redirect(url_for("stores_management"))
-        if google_review_url and not google_review_url.startswith("https://"):
-            flash("Google Review Link must start with https://", "danger")
-            return redirect(url_for("stores_management"))
-
-        # Check store limit based on user role and membership
-        user = get_user_by_id(session['user_id'])
-        
-        if user['role'] == 'admin':
-            # Client account - check if license is configured
-            if not user.get('license_key'):
-                flash("Please configure your license key first. Contact your administrator for your license key.", "danger")
-                return redirect(url_for("client_license_config"))
-            
-            # Validate license against portal and get max_stores
-            config = get_license_config()
-            portal_url = normalize_portal_url(config.get("licensing_portal_url") if config else None)
-            
-            try:
-                import requests
-                response = requests.post(
-                    f"{portal_url}/api/validate/{user['license_key']}",
-                    headers=licensing_api_headers(),
-                    timeout=10
-                )
-                
-                logger.info(f"License validation response status: {response.status_code}")
-                
-                if response.status_code != 200 or not response.json().get("valid"):
-                    flash("Invalid license. Please contact your administrator.", "danger")
-                    return redirect(url_for("client_license_config"))
-                
-                license_data = response.json()
-                max_stores = license_data.get("max_stores", 0)
-                logger.info(f"License data: {license_data}")
-                
-                if max_stores > 0:
-                    conn = get_db_connection()
-                    try:
-                        cursor = conn.cursor()
-                        cursor.execute("SELECT COUNT(*) FROM stores WHERE user_id = %s", (session['user_id'],))
-                        current_count = cursor.fetchone()[0]
-                        
-                        cursor.execute("SELECT COUNT(*) FROM stores")
-                        total_stores = cursor.fetchone()[0]
-                        
-                        if current_count >= max_stores:
-                            flash(f"Your license limit reached. You can only create up to {max_stores} stores. Contact support to upgrade.", "danger")
-                            return redirect(url_for("stores_management"))
-                    finally:
-                        conn.close()
-            except Exception as e:
-                logger.error(f"Error validating license: {e}")
-                flash("Unable to validate license. Please try again later.", "danger")
-                return redirect(url_for("stores_management"))
-        elif user['role'] != 'superadmin':
-            flash("You don't have permission to add stores.", "danger")
-            return redirect(url_for("stores_management"))
-
-        # Handle logo upload
-        logo_url = None
-        if 'logo' in request.files:
-            logo_file = request.files['logo']
-            if logo_file and logo_file.filename:
-                # Validate file type
-                allowed_extensions = {'png', 'jpg', 'jpeg'}
-                if '.' not in logo_file.filename or logo_file.filename.rsplit('.', 1)[1].lower() not in allowed_extensions:
-                    flash("Invalid file type. Only PNG, JPG, and JPEG files are allowed.", "danger")
-                    return redirect(url_for("stores_management"))
-                
-                # Validate file size (5MB max)
-                logo_file.seek(0, os.SEEK_END)
-                file_size = logo_file.tell()
-                logo_file.seek(0)
-                if file_size > 5 * 1024 * 1024:
-                    flash("File size exceeds 5MB limit.", "danger")
-                    return redirect(url_for("stores_management"))
-                
-                import base64
-                ext = logo_file.filename.rsplit('.', 1)[1].lower()
-                mime = "image/jpeg" if ext in ('jpg', 'jpeg') else "image/png"
-                logo_url = f"data:{mime};base64,{base64.b64encode(logo_file.read()).decode('utf-8')}"
-
-        new_store_id = create_store(
-            store_name=store_name,
-            address=address if address else None,
-            city=city if city else None,
-            province=province if province else None,
-            postal_code=postal_code if postal_code else None,
-            contact_number=contact_number if contact_number else None,
-            email=email if email else None,
-            store_manager_name=store_manager_name if store_manager_name else None,
-            manager_contact=manager_contact if manager_contact else None,
-            store_type=store_type if store_type else None,
-            status=status,
-            logo_url=logo_url,
-            google_review_url=google_review_url or None,
-            google_review_mode=google_review_mode,
-            user_id=session.get('user_id'),
-            license_key=user.get('license_key')
-        )
-        
-        logger.info(f"Created store {new_store_id} for user {session.get('user_id')}")
-        
-        # Log the store addition
-        log_audit(
-            entity_type="store",
-            entity_id=new_store_id,
-            action="created",
-            new_values=f"Store Name: {store_name}, Address: {address}, City: {city}, Status: {status}"
-        )
-        
-        flash(f"Store \"{store_name}\" added Successfully", "success")
-        return redirect(url_for("stores_management"))
-
-    def update_store(
-        store_id: int,
-        store_name: str,
-        store_type: str | None,
-        address: str | None,
-        city: str | None,
-        province: str | None,
-        postal_code: str | None,
-        contact_number: str | None,
-        email: str | None,
-        store_manager_name: str | None,
-        manager_contact: str | None,
-        status: str,
-        logo_url: str | None = None,
-        google_review_url: str | None = None,
-        google_review_mode: str = "reward"
-    ) -> bool:
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                UPDATE stores
-                SET store_name = %s, store_type = %s, address = %s, city = %s,
-                    province = %s, postal_code = %s, contact_number = %s,
-                    email = %s, store_manager_name = %s, manager_contact = %s,
-                    status = %s, logo_url = COALESCE(%s, logo_url), google_review_url = %s,
-                    google_review_mode = %s
-                WHERE id = %s
-                """,
-                (
-                    store_name,
-                    store_type,
-                    address,
-                    city,
-                    province,
-                    postal_code,
-                    contact_number,
-                    email,
-                    store_manager_name,
-                    manager_contact,
-                    status,
-                    logo_url,
-                    google_review_url,
-                    google_review_mode,
-                    store_id,
-                ),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
-        finally:
-            conn.close()
-
-    @app.route("/admin/stores/<int:store_id>/upload-logo", methods=["POST"])
-    @login_required
-    def upload_store_logo(store_id: int):
-        if not can_manage_store(session['user_id'], store_id):
-            flash("You don't have permission to update this store.", "danger")
-            return redirect(url_for("stores_management"))
-        # Handle logo upload only
-        logo_url = None
-        if 'logo' in request.files:
-            logo_file = request.files['logo']
-            if logo_file and logo_file.filename:
-                # Validate file type
-                allowed_extensions = {'png', 'jpg', 'jpeg'}
-                if '.' not in logo_file.filename or logo_file.filename.rsplit('.', 1)[1].lower() not in allowed_extensions:
-                    flash("Invalid file type. Only PNG, JPG, and JPEG files are allowed.", "danger")
-                    return redirect(url_for("store_details", store_id=store_id))
-                
-                # Validate file size (5MB max)
-                logo_file.seek(0, os.SEEK_END)
-                file_size = logo_file.tell()
-                logo_file.seek(0)
-                if file_size > 5 * 1024 * 1024:
-                    flash("File size exceeds 5MB limit.", "danger")
-                    return redirect(url_for("store_details", store_id=store_id))
-                
-                import base64
-                ext = logo_file.filename.rsplit('.', 1)[1].lower()
-                mime = "image/jpeg" if ext in ('jpg', 'jpeg') else "image/png"
-                logo_url = f"data:{mime};base64,{base64.b64encode(logo_file.read()).decode('utf-8')}"
-
-        # Update only the logo_url in the database
-        if logo_url:
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor()
-                cursor.execute("UPDATE stores SET logo_url = %s WHERE id = %s", (logo_url, store_id))
-                conn.commit()
-                flash("Logo uploaded successfully", "success")
-            except Exception as e:
-                logger.error(f"Error uploading logo: {e}")
-                flash(f"Error uploading logo: {e}", "danger")
-            finally:
-                conn.close()
-        else:
-            flash("No file selected", "warning")
-
-        return redirect(url_for("store_details", store_id=store_id))
-
-    @app.route("/admin/stores/<int:store_id>/edit", methods=["POST"])
-    @login_required
-    def edit_store(store_id: int):
-        if not can_manage_store(session['user_id'], store_id):
-            flash("You don't have permission to edit this store.", "danger")
-            return redirect(url_for("stores_management"))
-        store_name = request.form.get("store_name", "").strip()
-        store_type = request.form.get("store_type", "").strip() or None
-        address = request.form.get("address", "").strip() or None
-        city = request.form.get("city", "").strip() or None
-        province = request.form.get("province", "").strip() or None
-        postal_code = request.form.get("postal_code", "").strip() or None
-        contact_number = request.form.get("contact_number", "").strip() or None
-        email = request.form.get("email", "").strip() or None
-        store_manager_name = request.form.get("store_manager_name", "").strip() or None
-        manager_contact = request.form.get("manager_contact", "").strip() or None
-        status = request.form.get("status", "active")
-        google_review_url = request.form.get("google_review_url", "").strip()
-        google_review_mode = request.form.get("google_review_mode", "reward").strip()
-        if google_review_mode not in {"review_only", "reward"}:
-            google_review_mode = "reward"
-
-        if not store_name:
-            flash("Store name is required.", "danger")
-            return redirect(url_for("stores_management"))
-        if google_review_url and not google_review_url.startswith("https://"):
-            flash("Google Review Link must start with https://", "danger")
-            return redirect(url_for("stores_management"))
-
-        # Handle logo upload
-        logo_url = None
-        if 'logo' in request.files:
-            logo_file = request.files['logo']
-            if logo_file and logo_file.filename:
-                # Validate file type
-                allowed_extensions = {'png', 'jpg', 'jpeg'}
-                if '.' not in logo_file.filename or logo_file.filename.rsplit('.', 1)[1].lower() not in allowed_extensions:
-                    flash("Invalid file type. Only PNG, JPG, and JPEG files are allowed.", "danger")
-                    return redirect(url_for("stores_management"))
-                
-                # Validate file size (5MB max)
-                logo_file.seek(0, os.SEEK_END)
-                file_size = logo_file.tell()
-                logo_file.seek(0)
-                if file_size > 5 * 1024 * 1024:
-                    flash("File size exceeds 5MB limit.", "danger")
-                    return redirect(url_for("stores_management"))
-                
-                import base64
-                ext = logo_file.filename.rsplit('.', 1)[1].lower()
-                mime = "image/jpeg" if ext in ('jpg', 'jpeg') else "image/png"
-                logo_url = f"data:{mime};base64,{base64.b64encode(logo_file.read()).decode('utf-8')}"
-
-        success = update_store(
-            store_id=store_id,
-            store_name=store_name,
-            store_type=store_type,
-            address=address,
-            city=city,
-            province=province,
-            postal_code=postal_code,
-            contact_number=contact_number,
-            email=email,
-            store_manager_name=store_manager_name,
-            manager_contact=manager_contact,
-            status=status,
-            logo_url=logo_url,
-            google_review_url=google_review_url or None,
-            google_review_mode=google_review_mode
-        )
-
-        if success:
-            # Log the store edit
-            log_audit(
-                entity_type="store",
-                entity_id=store_id,
-                action="updated",
-                new_values=f"Store Name: {store_name}, Address: {address}, City: {city}, Status: {status}"
-            )
-            flash(f"Store \"{store_name}\" Edited", "success")
-        else:
-            flash("Store not found or update failed.", "danger")
-
-        return redirect(url_for("stores_management", store_id=store_id))
-
-    @app.route("/admin/stores/<int:store_id>/delete", methods=["POST"])
-    @role_required('admin', 'superadmin')
-    def delete_store_route(store_id: int):
-        if not can_manage_store(session['user_id'], store_id):
-            flash("You don't have permission to delete this store.", "danger")
-            return redirect(url_for("stores_management"))
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            # Fetch store name before deletion for the notification
-            cursor.execute("SELECT store_name FROM stores WHERE id = %s", (store_id,))
-            store_row = cursor.fetchone()
-            store_name = store_row[0] if store_row else "Unknown"
-
-            if not store_row:
-                flash("Store not found.", "warning")
-                return redirect(url_for("stores_management"))
-
-            # These receipt tables intentionally have no foreign keys, so
-            # remove their store-scoped records before deleting the store.
-            cursor.execute("DELETE FROM receipt_usages WHERE store_id = %s", (store_id,))
-            cursor.execute("DELETE FROM global_receipt_usages WHERE store_id = %s", (store_id,))
-
-            # Cascading delete: delete staff_commendations first
-            cursor.execute("""
-                DELETE sc FROM staff_commendations sc
-                JOIN responses r ON sc.response_id = r.id
-                WHERE r.store_id = %s
-            """, (store_id,))
-
-            # Delete answers
-            cursor.execute("""
-                DELETE a FROM answers a
-                JOIN responses r ON a.response_id = r.id
-                WHERE r.store_id = %s
-            """, (store_id,))
-            
-            # Delete responses
-            cursor.execute("DELETE FROM responses WHERE store_id = %s", (store_id,))
-
-            # Delete staff
-            cursor.execute("DELETE FROM staff WHERE store_id = %s", (store_id,))
-            
-            # Delete question options for store's questionnaires
-            cursor.execute("""
-                DELETE qo FROM question_options qo
-                JOIN questions q ON qo.question_id = q.id
-                JOIN questionnaires qn ON q.questionnaire_id = qn.id
-                WHERE qn.store_id = %s
-            """, (store_id,))
-            
-            # Delete questions
-            cursor.execute("""
-                DELETE q FROM questions q
-                JOIN questionnaires qn ON q.questionnaire_id = qn.id
-                WHERE qn.store_id = %s
-            """, (store_id,))
-            
-            # Delete questionnaires
-            cursor.execute("DELETE FROM questionnaires WHERE store_id = %s", (store_id,))
-            
-            # Delete store itself
-            cursor.execute("DELETE FROM stores WHERE id = %s", (store_id,))
-            
-            conn.commit()
-            
-            # Log the store deletion
-            log_audit(
-                entity_type="store",
-                entity_id=store_id,
-                action="deleted",
-                old_values=f"Store Name: {store_name}"
-            )
-            
-            flash(f"Store \"{store_name}\" Deleted", "success")
-        except Exception as e:
-            logger.error(f"Error deleting store: {e}")
-            flash(f"Error deleting store: {e}", "danger")
-        finally:
-            conn.close()
-            
-        return redirect(url_for("stores_management"))
-
-    @app.route("/admin/history")
-    @role_required('superadmin')
-    def history():
-        # Run automatic pruning of old logs (90 days retention)
-        try:
-            prune_audit_logs(days=90)
-        except Exception as e:
-            logger.error(f"Error pruning audit logs: {e}")
-        
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("""
-                SELECT id, entity_type, entity_id, action, old_values, new_values, user_id, created_at
-                FROM audit_logs
-                ORDER BY created_at DESC
-                LIMIT 100
-            """)
-            logs = cursor.fetchall()
-        finally:
-            conn.close()
-        
-        return render_template("history.html", logs=logs)
-
-    @app.route("/admin/history/clear", methods=["POST"])
-    @role_required('superadmin')
-    def clear_history():
-        deleted_count = prune_audit_logs(days=0)  # Delete all logs
-        flash(f"Cleared {deleted_count} history entries", "success")
-        return redirect(url_for("history"))
-
-    @app.route("/admin/clear-feedback", methods=["POST"])
-    def clear_feedback_route():
-        """Clear all feedback data while preserving stores and their configuration."""
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-
-            # Count before deletion for feedback
-            cursor.execute("SELECT COUNT(*) FROM responses")
-            responses_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM answers")
-            answers_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM staff_commendations")
-            commendations_count = cursor.fetchone()[0]
-
-            # Delete in correct order (respecting foreign keys)
-            # 1. Delete staff_commendations
-            cursor.execute("DELETE FROM staff_commendations")
-
-            # 2. Delete answers
-            cursor.execute("DELETE FROM answers")
-
-            # 3. Delete responses
-            cursor.execute("DELETE FROM responses")
-
-            conn.commit()
-
-            flash(f"Cleared {responses_count} responses, {answers_count} answers, and {commendations_count} commendations. Stores and configurations preserved.", "success")
-        except Exception as e:
-            logger.error(f"Error clearing feedback data: {e}")
-            flash(f"Error clearing feedback data: {e}", "danger")
-        finally:
-            conn.close()
-
-        return redirect(url_for("stores_management"))
-
-    @app.route("/admin/backup/csv", methods=["GET"])
-    def backup_csv_route():
-        """Export all data to a CSV organized by store.
-
-        Layout:
-          # FEEDBACK SYSTEM BACKUP
-          # Generated: <timestamp>
-          # Total stores: N
-
-          === STORES SUMMARY ===
-          <stores table>
-
-          === STORE: <name> (id=<id>) ===
-            -- Staff --
-            <staff for this store>
-            -- Feedback --
-            <responses joined with answers, one row per question>
-            -- Commendations --
-            <commendations for this store>
-          (repeat per store)
-        """
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-
-            cursor.execute("SELECT * FROM stores ORDER BY id")
-            stores = cursor.fetchall()
-
-            output = io.StringIO()
-            # UTF-8 BOM so Excel opens it correctly with special characters
-            output.write('\ufeff')
-            writer = csv.writer(output)
-
-            timestamp_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            writer.writerow(["# FEEDBACK SYSTEM BACKUP"])
-            writer.writerow([f"# Generated: {timestamp_human}"])
-            writer.writerow([f"# Total stores: {len(stores)}"])
-            writer.writerow([])
-
-            # ---- Stores summary ----
-            writer.writerow(["=== STORES SUMMARY ==="])
-            if stores:
-                # Counts per store for quick overview
-                cursor.execute("SELECT store_id, COUNT(*) AS cnt FROM responses GROUP BY store_id")
-                resp_counts = {r['store_id']: r['cnt'] for r in cursor.fetchall()}
-                cursor.execute("SELECT store_id, COUNT(*) AS cnt FROM staff GROUP BY store_id")
-                staff_counts = {r['store_id']: r['cnt'] for r in cursor.fetchall()}
-
-                summary_cols = list(stores[0].keys()) + ["total_responses", "total_staff"]
-                writer.writerow(summary_cols)
-                for s in stores:
-                    row = list(s.values()) + [
-                        resp_counts.get(s['id'], 0),
-                        staff_counts.get(s['id'], 0),
-                    ]
-                    writer.writerow(row)
-            else:
-                writer.writerow(["(no stores)"])
-            writer.writerow([])
-            writer.writerow([])
-
-            # ---- Per-store sections ----
-            for store in stores:
-                store_id = store['id']
-                store_name = store.get('store_name') or f"Store #{store_id}"
-
-                writer.writerow([f"=== STORE: {store_name} (id={store_id}) ==="])
-
-                # Staff
-                cursor.execute("SELECT * FROM staff WHERE store_id = %s ORDER BY id", (store_id,))
-                staff_rows = cursor.fetchall()
-                writer.writerow(["-- Staff --"])
-                if staff_rows:
-                    writer.writerow(staff_rows[0].keys())
-                    for r in staff_rows:
-                        writer.writerow(r.values())
-                else:
-                    writer.writerow(["(no staff)"])
-                writer.writerow([])
-
-                # Feedback (responses joined with answers)
-                cursor.execute(
-                    """
-                    SELECT r.id AS response_id,
-                           r.user_email,
-                           r.submitted_at,
-                           r.is_read,
-                           r.status,
-                           a.id AS answer_id,
-                           a.question_id,
-                           a.answer_text,
-                           a.rating_value
-                    FROM responses r
-                    LEFT JOIN answers a ON a.response_id = r.id
-                    WHERE r.store_id = %s
-                    ORDER BY r.submitted_at DESC, r.id, a.id
-                    """,
-                    (store_id,)
-                )
-                feedback_rows = cursor.fetchall()
-                writer.writerow(["-- Feedback --"])
-                if feedback_rows:
-                    writer.writerow(feedback_rows[0].keys())
-                    for r in feedback_rows:
-                        writer.writerow(r.values())
-                else:
-                    writer.writerow(["(no feedback)"])
-                writer.writerow([])
-
-                # Commendations for this store's staff
-                cursor.execute(
-                    """
-                    SELECT c.*
-                    FROM staff_commendations c
-                    JOIN staff s ON c.staff_id = s.id
-                    WHERE s.store_id = %s
-                    ORDER BY c.id
-                    """,
-                    (store_id,)
-                )
-                commend_rows = cursor.fetchall()
-                writer.writerow(["-- Commendations --"])
-                if commend_rows:
-                    writer.writerow(commend_rows[0].keys())
-                    for r in commend_rows:
-                        writer.writerow(r.values())
-                else:
-                    writer.writerow(["(no commendations)"])
-                writer.writerow([])
-                writer.writerow([])
-
-            output.seek(0)
-            csv_data = output.getvalue()
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"feedback_system_backup_{timestamp}.csv"
-
-            return send_file(
-                io.BytesIO(csv_data.encode('utf-8')),
-                mimetype='text/csv',
-                as_attachment=True,
-                download_name=filename
-            )
-        except Exception as e:
-            logger.error(f"Error creating CSV backup: {e}")
-            flash(f"Error creating backup: {e}", "danger")
-            return redirect(url_for("stores_management"))
-        finally:
-            conn.close()
-
-    @app.route("/admin/seed-feedback", methods=["POST"])
-    def seed_feedback_route():
-        """Seed sample feedback data for each store with answers and staff commendations."""
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-
-            # Fetch all stores
-            cursor.execute("SELECT * FROM stores WHERE user_id = %s", (session['user_id'],))
-            stores = cursor.fetchall()
-
-            # Fetch template questionnaire
-            user = get_user_by_id(session['user_id'])
-            cursor.execute("SELECT * FROM questionnaires WHERE is_template = TRUE AND owner_user_id = %s AND license_key <=> %s LIMIT 1", (session['user_id'], user.get('license_key') if user else None))
-            template_questionnaire = cursor.fetchone()
-
-            if not template_questionnaire:
-                flash("No template questionnaire found. Please create one first.", "danger")
-                return redirect(url_for("stores_management"))
-
-            # Fetch questions from template questionnaire
-            cursor.execute("SELECT * FROM questions WHERE questionnaire_id = %s", (template_questionnaire["id"],))
-            template_questions = cursor.fetchall()
-
-            total_responses = 0
-            total_answers = 0
-            total_commendations = 0
-
-            # Sample data for feedback
-            sample_emails = [
-                "customer1@example.com", "customer2@example.com", "customer3@example.com",
-                "customer4@example.com", "customer5@example.com", "customer6@example.com",
-                "customer7@example.com", "customer8@example.com", "customer9@example.com",
-                "customer10@example.com"
-            ]
-
-            sample_receipts = [
-                "REC-001", "REC-002", "REC-003", "REC-004", "REC-005",
-                "REC-006", "REC-007", "REC-008", "REC-009", "REC-010"
-            ]
-
-            sample_answers_text = [
-                "Great service!", "Very satisfied", "Excellent experience",
-                "Good quality", "Friendly staff", "Quick service",
-                "Clean environment", "Helpful team", "Professional",
-                "Will return again"
-            ]
-
-            for store in stores:
-                store_id = int(store["id"])
-
-                # Fetch or create store-specific questionnaire
-                cursor.execute("SELECT * FROM questionnaires WHERE store_id = %s", (store_id,))
-                store_questionnaire = cursor.fetchone()
-
-                if not store_questionnaire:
-                    # Create a new questionnaire for this store from template
-                    cursor.execute(
-                        """
-                        INSERT INTO questionnaires (title, store_id, is_active, is_template)
-                        VALUES (%s, %s, %s, %s)
-                        """,
-                        (template_questionnaire["title"], store_id, True, False),
-                    )
-                    store_questionnaire_id = int(cursor.lastrowid)
-
-                    # Copy questions from template to store questionnaire
-                    for template_q in template_questions:
-                        cursor.execute(
-                            """
-                            INSERT INTO questions (questionnaire_id, question_text, question_type, is_required, min_label, max_label, allow_comment, question_order)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                            """,
-                            (store_questionnaire_id, template_q["question_text"], template_q["question_type"],
-                             template_q["is_required"], template_q["min_label"], template_q["max_label"],
-                             template_q["allow_comment"], template_q["question_order"]),
-                        )
-                        new_question_id = int(cursor.lastrowid)
-
-                        # Copy options if it's a multiple choice question
-                        if template_q["question_type"] == "multiple_choice":
-                            cursor.execute("SELECT * FROM question_options WHERE question_id = %s", (template_q["id"],))
-                            options = cursor.fetchall()
-                            for opt in options:
-                                cursor.execute(
-                                    """
-                                    INSERT INTO question_options (question_id, option_text)
-                                    VALUES (%s, %s)
-                                    """,
-                                    (new_question_id, opt["option_text"]),
-                                )
-                else:
-                    store_questionnaire_id = int(store_questionnaire["id"])
-
-                # Fetch questions for this store's questionnaire
-                cursor.execute("SELECT * FROM questions WHERE questionnaire_id = %s", (store_questionnaire_id,))
-                questions = cursor.fetchall()
-
-                # Fetch staff for this store
-                cursor.execute("SELECT * FROM staff WHERE store_id = %s", (store_id,))
-                staff_list = cursor.fetchall()
-
-                # Determine number of feedbacks for this store (5-15)
-                num_feedbacks = random.randint(5, 15)
-
-                for i in range(num_feedbacks):
-                    # Use Philippine time
-                    ph_tz = timezone(timedelta(hours=8))
-                    now_ph = datetime.now(ph_tz).strftime("%Y-%m-%d %H:%M:%S")
-
-                    # Create response
-                    cursor.execute(
-                        """
-                        INSERT INTO responses (questionnaire_id, store_id, user_email, receipt_number, submitted_at, status)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        """,
-                        (store_questionnaire_id, store_id, sample_emails[i % len(sample_emails)],
-                         sample_receipts[i % len(sample_receipts)], now_ph, random.choice(['resolved', 'unresolved'])),
-                    )
-                    response_id = int(cursor.lastrowid)
-                    total_responses += 1
-
-                    # Add answers for each question
-                    for question in questions:
-                        question_type = question["question_type"]
-
-                        if question_type == "rating":
-                            # Random rating 1-5
-                            rating = str(random.randint(1, 5))
-                            cursor.execute(
-                                """
-                                INSERT INTO answers (response_id, question_id, rating_value)
-                                VALUES (%s, %s, %s)
-                                """,
-                                (response_id, question["id"], rating),
-                            )
-                            total_answers += 1
-                        elif question_type == "text":
-                            # Random text answer
-                            answer_text = sample_answers_text[random.randint(0, len(sample_answers_text) - 1)]
-                            cursor.execute(
-                                """
-                                INSERT INTO answers (response_id, question_id, answer_text)
-                                VALUES (%s, %s, %s)
-                                """,
-                                (response_id, question["id"], answer_text),
-                            )
-                            total_answers += 1
-                        elif question_type == "multiple_choice":
-                            # Fetch options for this question
-                            cursor.execute("SELECT * FROM question_options WHERE question_id = %s", (question["id"],))
-                            options = cursor.fetchall()
-                            if options:
-                                selected_option = random.choice(options)
-                                cursor.execute(
-                                    """
-                                    INSERT INTO answers (response_id, question_id, answer_text)
-                                    VALUES (%s, %s, %s)
-                                    """,
-                                    (response_id, question["id"], selected_option["option_text"]),
-                                )
-                                total_answers += 1
-
-                    # Add staff commendations (if staff exists and rating was good)
-                    if staff_list and random.random() > 0.5:  # 50% chance
-                        num_commendations = random.randint(1, min(3, len(staff_list)))
-                        commended_staff = random.sample(staff_list, num_commendations)
-                        for staff in commended_staff:
-                            cursor.execute(
-                                """
-                                INSERT INTO staff_commendations (response_id, staff_id)
-                                VALUES (%s, %s)
-                                """,
-                                (response_id, staff["id"]),
-                            )
-                            total_commendations += 1
-
-            conn.commit()
-            flash(f"Seeded {total_responses} feedback responses, {total_answers} answers, and {total_commendations} staff commendations across {len(stores)} stores.", "success")
-            logger.info(f"Seeded feedback data: {total_responses} responses, {total_answers} answers, {total_commendations} commendations")
-        except Exception as e:
-            logger.error(f"Error seeding feedback data: {e}")
-            flash(f"Error seeding feedback data: {e}", "danger")
-        finally:
-            conn.close()
-
-        return redirect(url_for("stores_management"))
-
-    # -------------------------
-    # STAFF MANAGEMENT
-    # -------------------------
-
-    def _uploaded_staff_photo(field_name: str = "photo") -> Optional[str]:
-        photo = request.files.get(field_name)
-        if not photo or not photo.filename:
-            return None
-        if '.' not in photo.filename or photo.filename.rsplit('.', 1)[1].lower() not in {'png', 'jpg', 'jpeg'}:
-            raise ValueError("Staff photo must be a PNG or JPG image.")
-        photo.seek(0, os.SEEK_END)
-        file_size = photo.tell()
-        photo.seek(0)
-        if file_size > 5 * 1024 * 1024:
-            raise ValueError("Staff photo must be 5MB or smaller.")
-        ext = photo.filename.rsplit('.', 1)[1].lower()
-        mime = "image/jpeg" if ext in ('jpg', 'jpeg') else "image/png"
-        return f"data:{mime};base64,{base64.b64encode(photo.read()).decode('utf-8')}"
-
-    @app.route("/admin/stores/<int:store_id>/staff")
-    @role_required('user', 'admin', 'superadmin')
-    def staff_management(store_id: int):
-        if not can_manage_store_staff(session['user_id'], store_id):
-            flash("You can only manage staff in your assigned store.", "danger")
-            return redirect(url_for("stores_management"))
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            
-            # Get store information
-            cursor.execute("SELECT * FROM stores WHERE id = %s", (store_id,))
-            store = cursor.fetchone()
-            
-            if not store:
-                flash("Store not found", "danger")
-                return redirect(url_for("stores_management"))
-            
-            # Get staff for this store
-            cursor.execute("""
-                SELECT * FROM staff 
-                WHERE store_id = %s 
-                ORDER BY role DESC, last_name, first_name
-            """, (store_id,))
-            staff = cursor.fetchall()
-            
-            # Generate QR code for the store
-            public_url = get_store_public_url(store_id=store_id)
-            qr_data_uri = generate_qr_data_uri(public_url)
-            
-            return render_template("manage_staff/staff.html", store=store, staff=staff, public_url=public_url, qr_data_uri=qr_data_uri)
-        except Exception as e:
-            logger.error(f"Error loading staff management: {e}")
-            flash(f"Error loading staff: {e}", "danger")
-            return redirect(url_for("stores_management"))
-        finally:
-            conn.close()
-
-    @app.route("/admin/stores/<int:store_id>/staff/add", methods=["POST"])
-    @role_required('user', 'admin', 'superadmin')
-    def add_staff(store_id: int):
-        if not can_manage_store_staff(session['user_id'], store_id):
-            flash("You can only add staff to your assigned store.", "danger")
-            return redirect(url_for("stores_management"))
-        first_name = request.form.get("first_name", "").strip()
-        last_name = request.form.get("last_name", "").strip()
-        email = request.form.get("email", "").strip() or None
-        phone = request.form.get("phone", "").strip() or None
-        position = request.form.get("position", "").strip() or None
-        role = request.form.get("role", "staff")
-        hire_date = request.form.get("hire_date", "").strip() or None
-        try:
-            photo_url = _uploaded_staff_photo()
-        except ValueError as exc:
-            flash(str(exc), "danger")
-            return redirect(url_for("staff_management", store_id=store_id))
-        
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            
-            # Verify store exists
-            cursor.execute("SELECT id FROM stores WHERE id = %s", (store_id,))
-            if not cursor.fetchone():
-                flash("Store not found", "danger")
-                return redirect(url_for("stores_management"))
-            
-            # Insert new staff member
-            cursor.execute("""
-                INSERT INTO staff (store_id, first_name, last_name, email, phone, position, photo_url, role, hire_date)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (store_id, first_name, last_name, email, phone, position, photo_url, role, hire_date))
-            
-            new_staff_id = cursor.lastrowid
-            conn.commit()
-            
-            # Log the staff addition
-            log_audit(
-                entity_type="staff",
-                entity_id=new_staff_id,
-                action="created",
-                new_values=f"Name: {first_name} {last_name}, Position: {position}, Role: {role}, Store ID: {store_id}"
-            )
-            
-            flash(f"Staff member \"{first_name} {last_name}\" added successfully", "success")
-        except Exception as e:
-            logger.error(f"Error adding staff: {e}")
-            flash(f"Error adding staff: {e}", "danger")
-        finally:
-            conn.close()
-            
-        return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-
-    @app.route("/admin/stores/<int:store_id>/staff/import-template", methods=["GET"])
-    @role_required('user', 'admin', 'superadmin')
-    def staff_import_template(store_id: int):
-        if not can_manage_store_staff(session['user_id'], store_id):
-            flash("You can only manage staff in your assigned store.", "danger")
-            return redirect(url_for("stores_management"))
-
-        output = io.StringIO(newline='')
-        writer = csv.writer(output)
-        writer.writerow(["first_name", "last_name", "email", "phone", "position", "role", "hire_date", "status"])
-        writer.writerow(["Juan", "Dela Cruz", "juan@example.com", "09171234567", "Sales Associate", "staff", "2026-09-01", "active"])
-        payload = io.BytesIO(output.getvalue().encode("utf-8-sig"))
-        payload.seek(0)
-        return send_file(
-            payload,
-            mimetype="text/csv; charset=utf-8",
-            as_attachment=True,
-            download_name=f"staff_import_template_store_{store_id}.csv",
-        )
-
-    @app.route("/admin/stores/<int:store_id>/staff/import", methods=["POST"])
-    @role_required('user', 'admin', 'superadmin')
-    def import_staff(store_id: int):
-        """Bulk-import staff from CSV or XLSX. Photos remain manual per staff profile."""
-        if not can_manage_store_staff(session['user_id'], store_id):
-            flash("You can only import staff into your assigned store.", "danger")
-            return redirect(url_for("stores_management"))
-
-        upload = request.files.get("staff_file")
-        if not upload or not upload.filename:
-            flash("Please choose a CSV or Excel (.xlsx) file.", "danger")
-            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-
-        filename = upload.filename.lower()
-        if not filename.endswith((".csv", ".xlsx")):
-            flash("Unsupported file type. Please upload a .csv or .xlsx file.", "danger")
-            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-
-        raw = upload.read(5 * 1024 * 1024 + 1)
-        if len(raw) > 5 * 1024 * 1024:
-            flash("Staff import file must be 5MB or smaller.", "danger")
-            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-
-        def normalize_header(value: Any) -> str:
-            return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
-
-        aliases = {
-            "firstname": "first_name", "first": "first_name",
-            "lastname": "last_name", "last": "last_name", "surname": "last_name",
-            "mobile": "phone", "phone_number": "phone", "contact_number": "phone",
-            "job_title": "position", "designation": "position",
-            "date_hired": "hire_date", "hired_date": "hire_date",
-        }
-
-        try:
-            if filename.endswith(".csv"):
-                text_stream = io.StringIO(raw.decode("utf-8-sig"))
-                csv_rows = list(csv.reader(text_stream))
-                if not csv_rows:
-                    raise ValueError("The uploaded file is empty.")
-                headers = [aliases.get(normalize_header(h), normalize_header(h)) for h in csv_rows[0]]
-                rows = [dict(zip(headers, row)) for row in csv_rows[1:]]
-            else:
-                from openpyxl import load_workbook
-                workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
-                worksheet = workbook.active
-                values = worksheet.iter_rows(values_only=True)
-                first_row = next(values, None)
-                if not first_row:
-                    raise ValueError("The uploaded workbook is empty.")
-                headers = [aliases.get(normalize_header(h), normalize_header(h)) for h in first_row]
-                rows = [dict(zip(headers, row)) for row in values]
-                workbook.close()
-        except (UnicodeDecodeError, ValueError) as exc:
-            flash(f"Unable to read staff file: {exc}", "danger")
-            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-        except Exception as exc:
-            logger.error("Staff import parsing failed: %s", exc)
-            flash("Unable to read the file. Check that it is a valid CSV or .xlsx workbook.", "danger")
-            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-
-        if "first_name" not in headers or "last_name" not in headers:
-            flash("Missing required columns: first_name and last_name.", "danger")
-            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-        if len(rows) > 1000:
-            flash("A single import can contain up to 1,000 staff rows.", "danger")
-            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-
-        valid_roles = {"staff", "manager", "supervisor"}
-        valid_statuses = {"active", "inactive"}
-        prepared = []
-        errors = []
-        for row_number, row in enumerate(rows, start=2):
-            cleaned = {key: str(value).strip() if value is not None else "" for key, value in row.items()}
-            if not any(cleaned.values()):
-                continue
-            first_name = cleaned.get("first_name", "")
-            last_name = cleaned.get("last_name", "")
-            email = cleaned.get("email", "")
-            role = cleaned.get("role", "staff").lower() or "staff"
-            status = cleaned.get("status", "active").lower() or "active"
-            hire_date = row.get("hire_date")
-
-            if not first_name or not last_name:
-                errors.append(f"Row {row_number}: first_name and last_name are required")
-                continue
-            if email and ("@" not in email or "." not in email.rsplit("@", 1)[-1]):
-                errors.append(f"Row {row_number}: invalid email")
-                continue
-            if role not in valid_roles:
-                errors.append(f"Row {row_number}: role must be staff, manager, or supervisor")
-                continue
-            if status not in valid_statuses:
-                errors.append(f"Row {row_number}: status must be active or inactive")
-                continue
-            if isinstance(hire_date, datetime):
-                hire_date = hire_date.date().isoformat()
-            elif isinstance(hire_date, date):
-                hire_date = hire_date.isoformat()
-            elif hire_date:
-                hire_date = str(hire_date).strip()
-                try:
-                    datetime.strptime(hire_date, "%Y-%m-%d")
-                except ValueError:
-                    errors.append(f"Row {row_number}: hire_date must use YYYY-MM-DD")
-                    continue
-            else:
-                hire_date = None
-
-            prepared.append((
-                store_id, first_name, last_name, email or None,
-                cleaned.get("phone") or None, cleaned.get("position") or None,
-                role, status, hire_date,
-            ))
-
-        if not prepared:
-            detail = errors[0] if errors else "No staff rows were found."
-            flash(f"No staff imported. {detail}", "danger")
-            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id FROM stores WHERE id = %s", (store_id,))
-            if not cursor.fetchone():
-                flash("Store not found.", "danger")
-                return redirect(url_for("stores_management"))
-            cursor.executemany(
-                """INSERT INTO staff
-                   (store_id, first_name, last_name, email, phone, position, role, status, hire_date)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                prepared,
-            )
-            conn.commit()
-        except Exception as exc:
-            conn.rollback()
-            logger.error("Staff bulk import failed: %s", exc)
-            flash("Staff import failed. No new rows were saved.", "danger")
-            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-        finally:
-            conn.close()
-
-        try:
-            log_audit(
-                entity_type="staff",
-                entity_id=store_id,
-                action="bulk_imported",
-                new_values=f"Imported {len(prepared)} staff; skipped {len(errors)} invalid rows; Store ID: {store_id}",
-            )
-        except Exception:
-            pass
-
-        message = f"Imported {len(prepared)} staff member(s) successfully. Add profile pictures manually using Edit Staff."
-        if errors:
-            message += f" Skipped {len(errors)} invalid row(s): " + "; ".join(errors[:3])
-        flash(message, "warning" if errors else "success")
-        return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-
-    @app.route("/admin/stores/<int:store_id>/staff/<int:staff_id>/edit", methods=["POST"])
-    @role_required('user', 'admin', 'superadmin')
-    def edit_staff(store_id: int, staff_id: int):
-        if not can_manage_store_staff(session['user_id'], store_id):
-            flash("You can only edit staff in your assigned store.", "danger")
-            return redirect(url_for("stores_management"))
-        first_name = request.form.get("first_name", "").strip()
-        last_name = request.form.get("last_name", "").strip()
-        email = request.form.get("email", "").strip() or None
-        phone = request.form.get("phone", "").strip() or None
-        position = request.form.get("position", "").strip() or None
-        role = request.form.get("role", "staff")
-        status = request.form.get("status", "active")
-        hire_date = request.form.get("hire_date", "").strip() or None
-        try:
-            photo_url = _uploaded_staff_photo()
-        except ValueError as exc:
-            flash(str(exc), "danger")
-            return redirect(url_for("staff_management", store_id=store_id))
-        
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-
-            # MySQL reports rowcount=0 when submitted values are unchanged, so
-            # verify the staff row explicitly instead of treating rowcount as existence.
-            cursor.execute(
-                "SELECT 1 FROM staff WHERE id = %s AND store_id = %s LIMIT 1",
-                (staff_id, store_id),
-            )
-            if not cursor.fetchone():
-                flash("Staff member not found", "danger")
-                return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-            
-            # Update staff member
-            cursor.execute("""
-                UPDATE staff 
-                SET first_name = %s, last_name = %s, email = %s, phone = %s,
-                    position = %s, photo_url = COALESCE(%s, photo_url), role = %s, status = %s, hire_date = %s
-                WHERE id = %s AND store_id = %s
-            """, (first_name, last_name, email, phone, position, photo_url, role, status, hire_date, staff_id, store_id))
-            
-            conn.commit()
-
-            # Log the staff edit
-            log_audit(
-                entity_type="staff",
-                entity_id=staff_id,
-                action="updated",
-                new_values=f"Name: {first_name} {last_name}, Position: {position}, Role: {role}, Status: {status}, Store ID: {store_id}"
-            )
-
-            flash(f"Staff member \"{first_name} {last_name}\" updated successfully", "success")
-        except Exception as e:
-            logger.error(f"Error updating staff: {e}")
-            flash(f"Error updating staff: {e}", "danger")
-        finally:
-            conn.close()
-            
-        return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-
-    @app.route("/admin/stores/<int:store_id>/staff/<int:staff_id>/delete", methods=["POST"])
-    @role_required('user', 'admin', 'superadmin')
-    def delete_staff(store_id: int, staff_id: int):
-        if not can_manage_store_staff(session['user_id'], store_id):
-            flash("You can only delete staff in your assigned store.", "danger")
-            return redirect(url_for("stores_management"))
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            
-            # Get staff member name for flash message
-            cursor.execute("SELECT first_name, last_name FROM staff WHERE id = %s AND store_id = %s", (staff_id, store_id))
-            staff = cursor.fetchone()
-            
-            if not staff:
-                flash("Staff member not found", "danger")
-                return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-            
-            # Delete staff member
-            cursor.execute("DELETE FROM staff WHERE id = %s AND store_id = %s", (staff_id, store_id))
-            conn.commit()
-            
-            # Log the staff deletion
-            log_audit(
-                entity_type="staff",
-                entity_id=staff_id,
-                action="deleted",
-                old_values=f"Name: {staff[0]} {staff[1]}, Store ID: {store_id}"
-            )
-            
-            flash(f"Staff member \"{staff[0]} {staff[1]}\" deleted successfully", "success")
-        except Exception as e:
-            logger.error(f"Error deleting staff: {e}")
-            flash(f"Error deleting staff: {e}", "danger")
-        finally:
-            conn.close()
-            
-        return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
-
-    @app.route("/admin/responses/<int:response_id>/delete", methods=["POST"])
-    def delete_response_route(response_id: int):
-        store_id = request.args.get("store_id")
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            # Delete answers first
-            cursor.execute("DELETE FROM answers WHERE response_id = %s", (response_id,))
-            # Delete response
-            cursor.execute("DELETE FROM responses WHERE id = %s", (response_id,))
-            conn.commit()
-            flash("Feedback Deleted", "success")
-        except Exception as e:
-            logger.error(f"Error deleting response: {e}")
-            flash(f"Error deleting response: {e}", "danger")
-        finally:
-            conn.close()
-            
-        if store_id:
-            return redirect(url_for("store_feedback", store_id=store_id))
-        return redirect(url_for("admin_dashboard"))
-
-    # -------------------------
-    # QUESTION ORDER MANAGEMENT
-    # -------------------------
-    @app.route("/admin/questions/<int:question_id>/order", methods=["POST"])
-    def update_question_order(question_id: int):
-        if request.method == "POST":
-            try:
-                data = request.get_json()
-                new_order = int(data.get("question_order", 0))
-                template = ensure_template_questionnaire()
-                
-                conn = get_db_connection()
-                try:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        """
-                        UPDATE questions 
-                        SET question_order = %s 
-                        WHERE id = %s AND questionnaire_id = %s AND is_template = TRUE
-                        """,
-                        (new_order, question_id, int(template['id'])),
-                    )
-                    conn.commit()
-                    if cursor.rowcount == 0:
-                        return {"success": False, "error": "Question does not belong to this license"}, 403
-                    return {"success": True, "message": "Question order updated"}
-                finally:
-                    conn.close()
-                    
-            except Exception as e:
-                return {"success": False, "error": str(e)}, 400
-                
-        return {"success": False, "error": "Method not allowed"}, 405
-
-    # -------------------------
-    # FEEDBACK VIEWER (ADMIN)
-    # -------------------------
-    def fetch_responses_for_store(store_id: int, limit: int = 50, status: str = None) -> List[Dict[str, Any]]:
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            
-            if status == "unresolved":
-                cursor.execute(
-                    """
-                    SELECT id, questionnaire_id, store_id, user_email, receipt_number, submitted_at, status
-                    FROM responses
-                    WHERE store_id = %s AND status = 'unresolved'
-                    ORDER BY submitted_at DESC, id DESC
-                    LIMIT %s
-                    """,
-                    (store_id, limit),
-                )
-            elif status == "resolved":
-                cursor.execute(
-                    """
-                    SELECT id, questionnaire_id, store_id, user_email, receipt_number, submitted_at, status
-                    FROM responses
-                    WHERE store_id = %s AND status = 'resolved'
-                    ORDER BY submitted_at DESC, id DESC
-                    LIMIT %s
-                    """,
-                    (store_id, limit),
-                )
-            else:
-                cursor.execute(
-                    """
-                    SELECT id, questionnaire_id, store_id, user_email, receipt_number, submitted_at, status
-                    FROM responses
-                    WHERE store_id = %s
-                    ORDER BY submitted_at DESC, id DESC
-                    LIMIT %s
-                    """,
-                    (store_id, limit),
-                )
-            rows = cursor.fetchall()
-        finally:
-            conn.close()
-        return rows
-
-    def fetch_answers_for_responses(response_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
-        if not response_ids:
-            return {}
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-            placeholders = ", ".join(["%s"] * len(response_ids))
-            cursor.execute(
-                f"""
-                SELECT a.response_id, a.question_id, a.answer_text, a.rating_value, q.question_text, q.question_type
-                FROM answers a
-                JOIN questions q ON q.id = a.question_id
-                WHERE a.response_id IN ({placeholders})
-                ORDER BY a.response_id ASC, q.question_order ASC, a.id ASC
-                """,
-                tuple(response_ids),
-            )
-            rows = cursor.fetchall()
-        finally:
-            conn.close()
-
-        by_response: Dict[int, List[Dict[str, Any]]] = {}
-        for r in rows:
-            rid = int(r["response_id"])
-            by_response.setdefault(rid, []).append(r)
-        return by_response
-
-    @app.route("/admin/stores/<int:store_id>/details", methods=["GET"])
-    def store_details(store_id: int):
-        store = fetch_store_by_id(store_id=store_id)
-        if not store:
-            flash("Store not found.", "danger")
-            return redirect(url_for("admin_dashboard"))
-
-        # Fetch recent feedback
-        recent_feedback = fetch_responses_for_store(store_id=store_id, limit=5)
-        
-        # Calculate analytics data
-        all_feedback = fetch_responses_for_store(store_id=store_id, limit=1000)
-        total_feedback = len(all_feedback)
-        
-        # Calculate average rating
-        avg_rating = 0
-        answers_by_response_id = {}
-        if all_feedback:
-            all_response_ids = [int(r["id"]) for r in all_feedback]
-            answers_by_response_id = fetch_answers_for_responses(all_response_ids)
-            all_ratings = []
-            for response_id, answers in answers_by_response_id.items():
-                for answer in answers:
-                    if answer.get("rating_value"):
-                        all_ratings.append(float(answer["rating_value"]))
-            if all_ratings:
-                avg_rating = sum(all_ratings) / len(all_ratings)
-        
-        # Enhanced 5-star rating analytics
-        rating_distribution = [0, 0, 0, 0, 0]  # 1-5 stars
-        total_ratings = 0
-        for response_id, answers in answers_by_response_id.items():
-            for answer in answers:
-                if answer.get("rating_value"):
-                    rating = int(float(answer["rating_value"]))
-                    if 1 <= rating <= 5:
-                        rating_distribution[rating - 1] += 1
-                        total_ratings += 1
-        
-        # Calculate 5-star specific metrics
-        five_star_count = rating_distribution[4]  # 5 stars
-        four_star_count = rating_distribution[3]  # 4 stars
-        three_star_count = rating_distribution[2]  # 3 stars
-        two_star_count = rating_distribution[1]   # 2 stars
-        one_star_count = rating_distribution[0]    # 1 star
-        
-        # Calculate percentages
-        five_star_percentage = (five_star_count / total_ratings * 100) if total_ratings > 0 else 0
-        four_plus_star_percentage = ((four_star_count + five_star_count) / total_ratings * 100) if total_ratings > 0 else 0
-        three_plus_star_percentage = ((three_star_count + four_star_count + five_star_count) / total_ratings * 100) if total_ratings > 0 else 0
-        
-        # Rating quality score (weighted average)
-        rating_quality_score = (
-            (one_star_count * 1) +
-            (two_star_count * 2) +
-            (three_star_count * 3) +
-            (four_star_count * 4) +
-            (five_star_count * 5)
-        ) / total_ratings if total_ratings > 0 else 0
-        
-        # Fetch staff members
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT id, first_name, last_name, email, phone, position, role, status
-            FROM staff 
-            WHERE store_id = %s
-            ORDER BY role DESC, last_name, first_name
-        """, (store_id,))
-        staff_members = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        
-        total_staff = len(staff_members)
-        
-        # Fetch commendations
-        commendations_by_response_id = {}
-        commendations = []
-        if all_feedback:
-            conn = get_db_connection()
-            cursor = conn.cursor(dictionary=True)
-            response_ids = [int(r["id"]) for r in all_feedback]
-            placeholders = ','.join(['%s'] * len(response_ids))
-            cursor.execute(f"""
-                SELECT sc.*, s.first_name, s.last_name, s.position, s.role
-                FROM staff_commendations sc
-                JOIN staff s ON sc.staff_id = s.id
-                WHERE sc.response_id IN ({placeholders})
-                ORDER BY sc.created_at DESC
-            """, response_ids)
-            commendations = cursor.fetchall()
-            cursor.close()
-            conn.close()
-            
-            for commendation in commendations:
-                response_id = commendation['response_id']
-                if response_id not in commendations_by_response_id:
-                    commendations_by_response_id[response_id] = []
-                commendations_by_response_id[response_id].append(commendation)
-        
-        total_commendations = sum(len(comms) for comms in commendations_by_response_id.values())
-        
-        # Staff analytics - commendations per staff
-        staff_commendations = {}
-        if commendations:
-            for commendation in commendations:
-                staff_id = commendation['staff_id']
-                if staff_id not in staff_commendations:
-                    staff_commendations[staff_id] = {
-                        'staff_name': f"{commendation['first_name']} {commendation['last_name']}",
-                        'staff_position': commendation['position'] or commendation['role'].title(),
-                        'total_commendations': 0,
-                        'rating_sum': 0,
-                        'commendation_types': {},
-                        'comments': []
-                    }
-                
-                staff_commendations[staff_id]['total_commendations'] += 1
-                staff_commendations[staff_id]['rating_sum'] += (commendation['rating'] or 5)
-                
-                # Count by type
-                c_type = commendation['commendation_type']
-                if c_type not in staff_commendations[staff_id]['commendation_types']:
-                    staff_commendations[staff_id]['commendation_types'][c_type] = 0
-                staff_commendations[staff_id]['commendation_types'][c_type] += 1
-                
-                # Collect comments
-                if commendation['comment']:
-                    staff_commendations[staff_id]['comments'].append(commendation['comment'])
-        
-        # Calculate avg_rating and weighted_score for each staff, sort by weighted_score
-        for staff_id in staff_commendations:
-            if staff_commendations[staff_id]['total_commendations'] > 0:
-                staff_commendations[staff_id]['avg_rating'] = staff_commendations[staff_id]['rating_sum'] / staff_commendations[staff_id]['total_commendations']
-                staff_commendations[staff_id]['weighted_score'] = staff_commendations[staff_id]['avg_rating'] * (staff_commendations[staff_id]['total_commendations'] ** 0.5)
-            else:
-                staff_commendations[staff_id]['avg_rating'] = 0
-                staff_commendations[staff_id]['weighted_score'] = 0
-        top_staff = sorted(staff_commendations.values(), key=lambda x: x['weighted_score'], reverse=True)
-        
-        # Identify staff with potential issues (low or no commendations)
-        staff_performance = []
-        for staff_member in staff_members:
-            staff_id = staff_member['id']
-            staff_name = f"{staff_member['first_name']} {staff_member['last_name']}"
-            staff_position = staff_member['position'] or staff_member['role'].title()
-            
-            commendation_count = staff_commendations.get(staff_id, {}).get('total_commendations', 0)
-            
-            # Calculate performance score based on commendations
-            performance_score = 'excellent'
-            if commendation_count == 0:
-                performance_score = 'needs_attention'
-            elif commendation_count < 3:
-                performance_score = 'average'
-            
-            staff_performance.append({
-                'staff_id': staff_id,
-                'staff_name': staff_name,
-                'staff_position': staff_position,
-                'commendation_count': commendation_count,
-                'performance_score': performance_score,
-                'role': staff_member['role']
-            })
-        
-        # Sort by performance (those needing attention first)
-        staff_performance.sort(key=lambda x: (x['performance_score'] != 'needs_attention', x['commendation_count']))
-        
-        # Calculate metrics (mock data for now)
-        resolution_rate = 85 if total_feedback > 0 else 0
-        response_time = 2.5
-        commendation_rate = round((total_commendations / total_feedback * 100) if total_feedback > 0 else 0)
-        repeat_rate = 42
-        
-        # Feedback trend data (mock data for now)
-        feedback_trend_labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun']
-        feedback_trend_data = [12, 19, 15, 25, 22, 30]
-        
-        # Generate QR code for the store
-        public_url = get_store_public_url(store_id=store['id'])
-        qr_data_uri = generate_qr_data_uri(public_url)
-        
-        return render_template(
-            "manage_stores/store_details.html",
-            store=store,
-            recent_feedback=recent_feedback,
-            total_feedback=total_feedback,
-            avg_rating=avg_rating,
-            rating_distribution=rating_distribution,
-            staff_members=staff_members,
-            total_staff=total_staff,
-            total_commendations=total_commendations,
-            resolution_rate=resolution_rate,
-            response_time=response_time,
-            commendation_rate=commendation_rate,
-            repeat_rate=repeat_rate,
-            feedback_trend_labels=feedback_trend_labels,
-            feedback_trend_data=feedback_trend_data,
-            public_url=public_url,
-            qr_data_uri=qr_data_uri,
-            top_staff=top_staff,
-            staff_performance=staff_performance,
-            staff_commendations=staff_commendations,
-            # Enhanced 5-star rating analytics
-            total_ratings=total_ratings,
-            five_star_count=five_star_count,
-            five_star_percentage=five_star_percentage,
-            four_plus_star_percentage=four_plus_star_percentage,
-            three_plus_star_percentage=three_plus_star_percentage,
-            rating_quality_score=rating_quality_score,
-        )
-
-    @app.route("/admin/stores/<int:store_id>/feedback", methods=["GET"])
-    @login_required
-    def store_feedback(store_id: int):
-        if not can_manage_store_staff(session['user_id'], store_id):
-            flash("You can only access your assigned store.", "danger")
-            return redirect(url_for("stores_management"))
-        # Handle marking a specific notification as read if requested
-        mark_read_id = request.args.get('mark_read')
-        if mark_read_id:
-            try:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("UPDATE responses SET is_read = TRUE WHERE id = %s", (int(mark_read_id),))
-                conn.commit()
-                conn.close()
-            except Exception as e:
-                logger.error(f"Error marking specific notification as read: {e}")
-
-        store = fetch_store_by_id(store_id=store_id)
-        if not store:
-            flash("Store not found.", "danger")
-            return redirect(url_for("admin_dashboard"))
-
-        status = request.args.get('status', 'all')
-        responses = fetch_responses_for_store(store_id=store_id, limit=50, status=status)
-        answers_by_response_id = fetch_answers_for_responses([int(r["id"]) for r in responses])
-        
-        # Fetch staff commendations for these responses
-        commendations_by_response_id = {}
-        if responses:
-            conn = get_db_connection()
-            cursor = conn.cursor(dictionary=True)
-            response_ids = [int(r["id"]) for r in responses]
-            placeholders = ','.join(['%s'] * len(response_ids))
-            cursor.execute(f"""
-                SELECT sc.*, s.first_name, s.last_name, s.position, s.role
-                FROM staff_commendations sc
-                JOIN staff s ON sc.staff_id = s.id
-                WHERE sc.response_id IN ({placeholders})
-                ORDER BY sc.created_at DESC
-            """, response_ids)
-            commendations = cursor.fetchall()
-            cursor.close()
-            conn.close()
-            
-            for commendation in commendations:
-                response_id = commendation['response_id']
-                if response_id not in commendations_by_response_id:
-                    commendations_by_response_id[response_id] = []
-                commendations_by_response_id[response_id].append(commendation)
-
-        # Calculate staff count and average rating
-        staff_count = get_staff_count_for_store(store_id)
-        staff_performance = get_staff_performance_for_store(store_id)
-        
-        # Calculate average rating from responses
-        avg_ratings = []
-        for response in responses:
-            response_answers = answers_by_response_id.get(response["id"], [])
-            rating_answers = [a for a in response_answers if a.get("question_type") == "rating"]
-            if rating_answers:
-                avg_rating = sum(a.get("rating_value", 0) for a in rating_answers) / len(rating_answers)
-                avg_ratings.append(avg_rating)
-        
-        average_rating = round(sum(avg_ratings) / len(avg_ratings), 1) if avg_ratings else 0.0
-
-        return render_template(
-            "manage_stores/feedback.html",
-            store=store,
-            responses=responses,
-            answers_by_response_id=answers_by_response_id,
-            commendations_by_response_id=commendations_by_response_id,
-            current_status=status,
-            staff_count=staff_count,
-            staff_performance=staff_performance,
-            average_rating=average_rating,
-        )
-
-    @app.route("/admin/responses/<int:response_id>/status", methods=["POST"])
-    def update_response_status(response_id: int):
-        try:
-            data = request.get_json()
-            new_status = data.get('status')
-            
-            if new_status not in ['resolved', 'unresolved']:
-                return {"success": False, "error": "Invalid status"}, 400
-            
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE responses SET status = %s WHERE id = %s",
-                    (new_status, response_id)
-                )
-                conn.commit()
-                flash(f"Feedback marked as {new_status}", "success")
-                return {"success": True}
-            finally:
-                conn.close()
-                
-        except Exception as e:
-            return {"success": False, "error": str(e)}, 500
-
-    @app.route("/api/notifications/unread")
-    @login_required
-    def get_unread_notifications():
-        """Fetch feedback notifications for the bell icon, combining feedback and system notifications.
-
-        Query params:
-          - status: 'unseen' (default returns both for initial load) | 'seen' to fetch a page of seen
-          - seen_offset: int, offset into the seen list (default 0)
-          - seen_limit: int, page size for seen (default 20, max 50)
-        """
-        try:
-            status = request.args.get('status', 'all')
-            seen_offset = max(int(request.args.get('seen_offset', 0)), 0)
-            seen_limit = min(max(int(request.args.get('seen_limit', 20)), 1), 50)
-        except ValueError:
-            status = 'all'
-            seen_offset = 0
-            seen_limit = 20
-
-        def _format(rows):
-            for n in rows:
-                if n.get('created_at'):
-                    n['created_at'] = n['created_at'].strftime('%b %d, %H:%M')
-                else:
-                    n['created_at'] = 'N/A'
-                if n.get('notification_type') == 'system':
-                    n['system_id'] = n['id']
-                    n['id'] = None
-            return rows
-
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor(dictionary=True)
-
-            unseen = []
-            seen = []
-            seen_total = 0
-
-            # Get user's assigned stores (applies to all users except superadmin)
-            user_id = session.get('user_id')
-            user_role = session.get('role')
-            assigned_store_ids = []
-            if user_id and user_role != 'superadmin':
-                # Get stores assigned via user_stores table
-                cursor.execute(
-                    "SELECT store_id FROM user_stores WHERE user_id = %s",
-                    (user_id,)
-                )
-                assigned_store_ids = [row['store_id'] for row in cursor.fetchall()]
-
-                # Also include stores where the user is the owner (stores.user_id)
-                cursor.execute(
-                    "SELECT id FROM stores WHERE user_id = %s",
-                    (user_id,)
-                )
-                owned_store_ids = [row['id'] for row in cursor.fetchall()]
-                # Combine and deduplicate
-                assigned_store_ids = list(set(assigned_store_ids + owned_store_ids))
-
-            # Build WHERE clause for store filtering
-            store_filter = ""
-            if assigned_store_ids:
-                placeholders = ','.join(['%s'] * len(assigned_store_ids))
-                store_filter = f"AND r.store_id IN ({placeholders})"
-            elif user_role != 'superadmin':
-                # Non-superadmin with no assigned stores - show no feedback notifications
-                store_filter = "AND 1=0"
-
-            if status in ('all', 'unseen'):
-                # Fetch ALL unseen feedback responses (no cap so user always sees them)
-                query = f"""
-                    SELECT r.id, r.user_email, r.submitted_at as created_at, s.store_name, s.id as store_id, r.is_read, 'feedback' as notification_type, NULL as message, NULL as type,
-                           (SELECT AVG(a.rating_value) FROM answers a WHERE a.response_id = r.id AND a.rating_value IS NOT NULL) as avg_rating
-                    FROM responses r
-                    JOIN stores s ON r.store_id = s.id
-                    WHERE s.store_name IS NOT NULL AND r.is_read = FALSE {store_filter}
-                    ORDER BY r.submitted_at DESC
-                    """
-                if assigned_store_ids:
-                    cursor.execute(query, assigned_store_ids)
-                else:
-                    cursor.execute(query)
-                unseen_feedback = cursor.fetchall()
-
-                cursor.execute(
-                    """
-                    SELECT id, message, type, created_at, is_read, 'system' as notification_type, NULL as user_email, NULL as store_name, NULL as store_id
-                    FROM system_notifications
-                    WHERE is_read = FALSE
-                    ORDER BY created_at DESC
-                    """
-                )
-                unseen_system = cursor.fetchall()
-
-                unseen = sorted(
-                    unseen_feedback + unseen_system,
-                    key=lambda x: x['created_at'] or datetime.min,
-                    reverse=True,
-                )
-                _format(unseen)
-
-            if status in ('all', 'seen'):
-                # Optional cutoff: hide seen notifications submitted at or before this time
-                cleared_at = session.get('notifications_cleared_at')
-                cleared_dt = None
-                if cleared_at:
-                    try:
-                        cleared_dt = datetime.fromisoformat(cleared_at)
-                    except (ValueError, TypeError):
-                        cleared_dt = None
-
-                # Total seen count (for "load more" UI), respecting cleared cutoff
-                if cleared_dt:
-                    if assigned_store_ids:
-                        placeholders = ','.join(['%s'] * len(assigned_store_ids))
-                        cursor.execute(
-                            f"SELECT COUNT(*) as count FROM responses r JOIN stores s ON r.store_id = s.id WHERE s.store_name IS NOT NULL AND r.is_read = TRUE AND r.submitted_at > %s AND r.store_id IN ({placeholders})",
-                            [cleared_dt] + assigned_store_ids
-                        )
-                    else:
-                        cursor.execute(
-                            "SELECT COUNT(*) as count FROM responses r JOIN stores s ON r.store_id = s.id WHERE s.store_name IS NOT NULL AND r.is_read = TRUE AND r.submitted_at > %s" + (" AND 1=0" if user_role != 'superadmin' else ""),
-                            (cleared_dt,)
-                        )
-                else:
-                    if assigned_store_ids:
-                        placeholders = ','.join(['%s'] * len(assigned_store_ids))
-                        cursor.execute(
-                            f"SELECT COUNT(*) as count FROM responses r JOIN stores s ON r.store_id = s.id WHERE s.store_name IS NOT NULL AND r.is_read = TRUE AND r.store_id IN ({placeholders})",
-                            assigned_store_ids
-                        )
-                    else:
-                        cursor.execute(
-                            "SELECT COUNT(*) as count FROM responses r JOIN stores s ON r.store_id = s.id WHERE s.store_name IS NOT NULL AND r.is_read = TRUE" + (" AND 1=0" if user_role != 'superadmin' else "")
-                        )
-                seen_feedback_total = cursor.fetchone()['count']
-
-                if cleared_dt:
-                    cursor.execute(
-                        "SELECT COUNT(*) as count FROM system_notifications WHERE is_read = TRUE AND created_at > %s",
-                        (cleared_dt,)
-                    )
-                else:
-                    cursor.execute("SELECT COUNT(*) as count FROM system_notifications WHERE is_read = TRUE")
-                seen_system_total = cursor.fetchone()['count']
-                seen_total = seen_feedback_total + seen_system_total
-
-                # Fetch a window of seen notifications. Over-fetch from each table then merge,
-                # so the merged page reflects true chronological order across both sources.
-                window = seen_limit + 1  # fetch one extra to detect if there's more
-
-                # Fetch seen feedback responses with store filter
-                if cleared_dt:
-                    try:
-                        cleared_dt_parsed = datetime.fromisoformat(cleared_at)
-                        query = f"""
-                            SELECT r.id, r.user_email, r.submitted_at as created_at, s.store_name, s.id as store_id, r.is_read, 'feedback' as notification_type, NULL as message, NULL as type,
-                                   (SELECT AVG(a.rating_value) FROM answers a WHERE a.response_id = r.id AND a.rating_value IS NOT NULL) as avg_rating
-                            FROM responses r
-                            JOIN stores s ON r.store_id = s.id
-                            WHERE s.store_name IS NOT NULL AND r.is_read = TRUE AND r.submitted_at > %s {store_filter}
-                            ORDER BY r.submitted_at DESC
-                            LIMIT %s
-                            """
-                        if assigned_store_ids:
-                            cursor.execute(query, [cleared_dt_parsed] + assigned_store_ids + [window])
-                        else:
-                            cursor.execute(query, [cleared_dt_parsed, window])
-                    except ValueError:
-                        cleared_dt = None
-                        query = f"""
-                            SELECT r.id, r.user_email, r.submitted_at as created_at, s.store_name, s.id as store_id, r.is_read, 'feedback' as notification_type, NULL as message, NULL as type,
-                                   (SELECT AVG(a.rating_value) FROM answers a WHERE a.response_id = r.id AND a.rating_value IS NOT NULL) as avg_rating
-                            FROM responses r
-                            JOIN stores s ON r.store_id = s.id
-                            WHERE s.store_name IS NOT NULL AND r.is_read = TRUE {store_filter}
-                            ORDER BY r.submitted_at DESC
-                            LIMIT %s
-                            """
-                        if assigned_store_ids:
-                            cursor.execute(query, assigned_store_ids + [window])
-                        else:
-                            cursor.execute(query, [window])
-                else:
-                    query = f"""
-                        SELECT r.id, r.user_email, r.submitted_at as created_at, s.store_name, s.id as store_id, r.is_read, 'feedback' as notification_type, NULL as message, NULL as type,
-                               (SELECT AVG(a.rating_value) FROM answers a WHERE a.response_id = r.id AND a.rating_value IS NOT NULL) as avg_rating
-                        FROM responses r
-                        JOIN stores s ON r.store_id = s.id
-                        WHERE s.store_name IS NOT NULL AND r.is_read = TRUE {store_filter}
-                        ORDER BY r.submitted_at DESC
-                        LIMIT %s
-                        """
-                    if assigned_store_ids:
-                        cursor.execute(query, assigned_store_ids + [window])
-                    else:
-                        cursor.execute(query, [window])
-                seen_feedback = cursor.fetchall()
-
-                cursor.execute(
-                    """
-                    SELECT id, message, type, created_at, is_read, 'system' as notification_type, NULL as user_email, NULL as store_name, NULL as store_id
-                    FROM system_notifications
-                    WHERE is_read = TRUE
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                    """,
-                    (window,)
-                )
-                seen_system = cursor.fetchall()
-
-                merged_seen = sorted(
-                    seen_feedback + seen_system,
-                    key=lambda x: x['created_at'] or datetime.min,
-                    reverse=True,
-                )
-                seen = merged_seen[seen_offset:seen_offset + seen_limit]
-                _format(seen)
-
-            # Total unread count (always returned) - filter by assigned stores for view-only users
-            if assigned_store_ids:
-                placeholders = ','.join(['%s'] * len(assigned_store_ids))
-                cursor.execute(
-                    f"SELECT COUNT(*) as count FROM responses r JOIN stores s ON r.store_id = s.id WHERE s.store_name IS NOT NULL AND r.is_read = FALSE AND r.store_id IN ({placeholders})",
-                    assigned_store_ids
-                )
-            elif user_role != 'superadmin':
-                cursor.execute(
-                    "SELECT COUNT(*) as count FROM responses r JOIN stores s ON r.store_id = s.id WHERE s.store_name IS NOT NULL AND r.is_read = FALSE AND 1=0"
-                )
-            else:
-                cursor.execute(
-                    "SELECT COUNT(*) as count FROM responses r JOIN stores s ON r.store_id = s.id WHERE s.store_name IS NOT NULL AND r.is_read = FALSE"
-                )
-            unread_feedback_count = cursor.fetchone()['count']
-            cursor.execute("SELECT COUNT(*) as count FROM system_notifications WHERE is_read = FALSE")
-            unread_system_count = cursor.fetchone()['count']
-            total_unread = unread_feedback_count + unread_system_count
-
-            seen_has_more = (seen_offset + len(seen)) < seen_total
-
-            return jsonify({
-                "success": True,
-                "unseen": unseen,
-                "seen": seen,
-                "seen_total": seen_total,
-                "seen_has_more": seen_has_more,
-                "total_unread": total_unread,
-                # Backwards-compat: combined list (unseen first, then seen page)
-                "notifications": unseen + seen,
-            })
-        except Exception as e:
-            logger.error(f"Error fetching notifications: {e}")
-            return jsonify({"success": False, "error": str(e)}), 500
-        finally:
-            conn.close()
-
-    @app.route("/api/notifications/clear-seen", methods=["POST"])
-    def clear_seen_notifications():
-        """Clear (hide) all currently seen notifications for this session.
-        Stores a cutoff timestamp; any seen notifications with created_at <= cutoff
-        are excluded from the seen list returned by /api/notifications/unread."""
-        try:
-            session['notifications_cleared_at'] = datetime.now().isoformat()
-            return jsonify({"success": True})
-        except Exception as e:
-            logger.error(f"Error clearing seen notifications: {e}")
-            return jsonify({"success": False, "error": str(e)}), 500
-
-    @app.route("/admin/responses/<int:response_id>/reply", methods=["POST"])
-    def reply_to_feedback(response_id: int):
-        try:
-            data = request.get_json()
-            reply_message = data.get('message', '').strip()
-            template_type = data.get('template_type', 'standard')
-            cc_emails = data.get('cc_emails', [])
-            bcc_emails = data.get('bcc_emails', [])
-            
-            if not reply_message:
-                return {"success": False, "error": "Reply message cannot be empty"}, 400
-            
-            if template_type not in ['standard', 'apology', 'appreciation', 'follow_up']:
-                template_type = 'standard'
-            
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor(dictionary=True)
-                
-                # Get response details including customer email and store info
-                cursor.execute("""
-                    SELECT r.user_email, r.submitted_at, s.store_name,
-                           (SELECT GROUP_CONCAT(a.answer_text SEPARATOR ' ') 
-                            FROM answers a 
-                            WHERE a.response_id = r.id 
-                            AND a.answer_text IS NOT NULL 
-                            LIMIT 3) as feedback_summary,
-                           (SELECT AVG(a.rating_value) 
-                            FROM answers a 
-                            WHERE a.response_id = r.id 
-                            AND a.rating_value IS NOT NULL) as avg_rating
-                    FROM responses r
-                    JOIN stores s ON r.store_id = s.id
-                    WHERE r.id = %s
-                """, (response_id,))
-                
-                response = cursor.fetchone()
-                
-                if not response:
-                    return {"success": False, "error": "Response not found"}, 404
-                
-                if not response['user_email']:
-                    return {"success": False, "error": "No email address found for this feedback"}, 400
-                
-                # Extract customer name from email
-                customer_name = response['user_email'].split('@')[0].replace('.', ' ').title()
-                
-                # Auto-select template based on rating if not specified
-                if template_type == 'standard' and response['avg_rating'] is not None:
-                    try:
-                        avg_rating = float(response['avg_rating'])
-                        if avg_rating <= 2:
-                            template_type = 'apology'
-                        elif avg_rating >= 4:
-                            template_type = 'appreciation'
-                        else:
-                            template_type = 'follow_up'
-                    except (ValueError, TypeError):
-                        template_type = 'standard'
-                
-                # Send email using API or SMTP
-                try:
-                    success, message = email_config.send_feedback_reply(
-                        to_email=response['user_email'],
-                        customer_name=customer_name,
-                        reply_message=reply_message,
-                        store_name=response['store_name'],
-                        feedback_summary=response['feedback_summary'],
-                        template_type=template_type
-                    )
-                    if success:
-                        return {"success": True, "message": "Reply sent successfully", "template_used": template_type}
-                    else:
-                        return {"success": False, "error": message}, 500
-                except Exception as e:
-                    logger.error(f"Email sending failed: {str(e)}")
-                    return {"success": False, "error": str(e)}, 500
-                    
-            finally:
-                conn.close()
-                
-        except Exception as e:
-            return {"success": False, "error": str(e)}, 500
-    
-    @app.route("/admin/email/statistics", methods=["GET"])
-    def email_statistics():
-        """Get email sending statistics"""
-        try:
-            stats = email_config.get_email_statistics()
-            return jsonify(stats)
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
-    @app.route("/api/system_notifications/<int:notification_id>/read", methods=["POST"])
-    def mark_system_notification_read(notification_id: int):
-        """Mark a single system notification as read."""
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE system_notifications SET is_read = TRUE WHERE id = %s", (notification_id,))
-            conn.commit()
-            return jsonify({"success": True})
-        except Exception as e:
-            logger.error(f"Error marking system notification as read: {e}")
-            return jsonify({"success": False, "error": str(e)}), 500
-        finally:
-            conn.close()
-    
-    @app.route("/admin/email/bulk-reply", methods=["POST"])
-    def bulk_reply_to_feedback():
-        """Send bulk email replies to multiple feedback responses"""
-        try:
-            data = request.get_json()
-            response_ids = data.get('response_ids', [])
-            reply_message = data.get('message', '').strip()
-            template_type = data.get('template_type', 'standard')
-            
-            if not response_ids:
-                return {"success": False, "error": "No response IDs provided"}, 400
-            
-            if not reply_message:
-                return {"success": False, "error": "Reply message cannot be empty"}, 400
-            
-            if template_type not in ['standard', 'apology', 'appreciation', 'follow_up']:
-                template_type = 'standard'
-            
-            conn = get_db_connection()
-            try:
-                cursor = conn.cursor(dictionary=True)
-                
-                # Get all response details
-                placeholders = ", ".join(["%s"] * len(response_ids))
-                cursor.execute(f"""
-                    SELECT r.id, r.user_email, s.store_name,
-                           (SELECT GROUP_CONCAT(a.answer_text SEPARATOR ' ') 
-                            FROM answers a 
-                            WHERE a.response_id = r.id 
-                            AND a.answer_text IS NOT NULL 
-                            LIMIT 3) as feedback_summary
-                    FROM responses r
-                    JOIN stores s ON r.store_id = s.id
-                    WHERE r.id IN ({placeholders}) AND r.user_email IS NOT NULL
-                """, tuple(response_ids))
-                
-                responses = cursor.fetchall()
-                
-                if not responses:
-                    return {"success": False, "error": "No valid responses found"}, 404
-                
-                # Prepare data for bulk email
-                email_list = [r['user_email'] for r in responses]
-                customer_names = [r['user_email'].split('@')[0].replace('.', ' ').title() for r in responses]
-                feedback_summaries = [r['feedback_summary'] or "No text feedback provided" for r in responses]
-                store_name = responses[0]['store_name']  # Use first store name (assuming same store)
-                
-                # Send bulk emails
-                results = email_config.send_bulk_feedback_reply(
-                    email_list=email_list,
-                    customer_names=customer_names,
-                    reply_message=reply_message,
-                    store_name=store_name,
-                    feedback_summaries=feedback_summaries,
-                    template_type=template_type
-                )
-                
-                # Mark responses as resolved
-                successful_emails = [r['email'] for r in results if r['success']]
-                if successful_emails:
-                    placeholders = ", ".join(["%s"] * len(successful_emails))
-                    cursor.execute(f"""
-                        UPDATE responses 
-                        SET status = 'resolved' 
-                        WHERE user_email IN ({placeholders})
-                    """, tuple(successful_emails))
-                    conn.commit()
-                
-                return {
-                    "success": True,
-                    "message": f"Bulk reply completed. {len(successful_emails)} of {len(results)} emails sent successfully.",
-                    "results": results
-                }
-                
-            finally:
-                conn.close()
-                
-        except Exception as e:
-            return {"success": False, "error": str(e)}, 500
-
-    return app
-
-
-if __name__ == "__main__":
-    app = create_app()
-    # Railway provides the port via the PORT environment variable
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, debug=False)
-else:
-    # This is used by gunicorn (web: gunicorn "app:create_app()")
-    app = create_app()
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×n9×„èµ©hºÚn¶X§zÍZ[\ÜÜÂš[\ÜÜÝ‚š[\Ü˜\ÙMš[\Ü[Âš[\Ü\›X‹œ\œÙBš[\ÜÙÙÚ[™Âš[\ÜÞ\Âš[\Ü[YBš[\Ü˜XÙX˜XÚÂš[\ÜÛØÚÙ]š[\ÜœÛÛ‚š[\Ü™Bš[\ÜÙXÜ™]Âš[\Ü^\Ü[˜ÛÛ›™XÝÜ‚™œ›ÛH^\Ü[˜ÛÛ›™XÝÜˆ[\Ü^TÔSÛÛ›™XÝ[Û‹\œ›Ü‚™œ›ÛH›\ÚÈ[\Ü›\ÚË™[™\—Ý[\]K™\]Y\Ý™Y\™XÝ\›Ù›Ü‹›\ÚœÛÛšYžKÙ\ÜÚ[Û‹Ù[™Ùš[B™œ›ÛH›\Ú×ÛXZ[[\ÜXZ[Y\ÜØYÙBš[\Ü\˜ÛÙB™œ›ÛH[XZ[ØÛÛ™šYÈ[\Ü[XZ[ÛÛ™šYÂ™œ›ÛHÛÛXÝ[ÛœÈ[\ÜY˜][XÝ™œ›ÛH\[™È[\Ü\ÝXÝ[žKÜ[Û˜[™œ›ÛHœˆ[\Ü”‚™œ›ÛHÝ[ˆ[\ÜØYÙÝ[‚™œ›ÛH]][YH[\Ü]K]][YK[YY[K[Y^›Û™Bš[\Ü˜Üž\™œ›ÛH[˜ÝÛÛÈ[\ÜÜ˜\Â‚‚›ØYÙÝ[Š
+B‚‚ˆÈY˜][XÙ[œÚ[™ÈÜ[T“Ú[ˆ›ÝÛÛ™šYÝ\™Y[ˆˆÜˆ[‚‘QUSÔÔ•SÕT“HÜË™Ù][Šˆ“PÑS”ÒS‘×ÔÔ•SÕT“‹ˆšÎ‹ËÙ™YY˜XÚÛXÙ[œÚ[™Ë\›ÙXÝ[Û‹XÎLÎ\œ˜Z[Ø^K˜\‹ŠKœœÝš\
+‹ÈŠB“QÐPÖWÔÔ•SÕT“ÈHÂˆšÎ‹ËÙ™YY˜XÚÛXÙ[œÚ[™Ë\›ÙXÝ[Û‹\œ˜Z[Ø^K˜\‹ˆšÎ‹ËÙ™YY˜XÚÛXÙ[œÚ[™Ë\›ÙXÝ[Û‹\œ˜Z[Ø^K˜\È‹ŸB‚‚™YˆÜ™X]WØ\
+
+HOˆ›\ÚÎ‚ˆ\H›\ÚÊ×Û˜[YW×ÊB‚ˆÈKKHÑÑÒS‘ÈÑUTKKBˆÙÙÚ[™Ë˜˜\ÚXÐÛÛ™šYÊˆ]™[[ÙÙÚ[™Ë’S‘“Ëˆ›Ü›X]IÉJ\ØÝ[YJ\ÈÉJ]™[˜[YJ\×H	JY\ÜØYÙJ\ÉËˆ[™\œÏVÛÙÙÚ[™Ë”Ý™X[R[™\ŠÞ\ËœÝÝ]
+WBˆ
+BˆÙÙÙ\ˆHÙÙÚ[™Ë™Ù]ÙÙÙ\Š×Û˜[YW×ÊB‚ˆÙÙÙ\‹š[™›ÊˆURSP“HS•ˆT”ÎˆÛ\Ý
+ÜË™[š\›Û‹šÙ^\Ê
+J_HŠB‚ˆÈKKHS•’T“Ó“QS•ÓÓ‘’QÈKKBˆ\˜ÛÛ™šYÖÈ”ÑPÔ‘UÒÑVH—HHÜË™Ù][Š”ÑPÔ‘UÒÑVHŠHÜˆÙXÜ™]ËÚÙ[—Ú^
+ÌŠBˆ\˜ÛÛ™šYË\]JˆÑTÔÒSÓ—ÐÓÓÒÒQWÒÓ“OUYKˆÑTÔÒSÓ—ÐÓÓÒÒQWÔÐSQTÒUOH“^‹ˆÑTÔÒSÓ—ÐÓÓÒÒQWÔÑPÕT‘O[ÜË™Ù][Š”RSÐVWÑS•’T“Ó“QS•ŠH\È›Ý›Û™Kˆ
+B‚ˆÈ]X˜\ÙHÛÛ™šYÝ\˜][Ûˆ[™[™ÂˆÈ’SÔ’UNˆKˆ˜Z[Ø^H[™]šYX[˜\šXX›\È
+[ÜÝ™[XX›JBˆÈ‹ˆVTÔSÕT“ÛÛ›™XÝ[ÛˆÝš[™ÂˆÈËˆØØ[[š\›Û›Y[ÈY˜][ÂˆˆYˆÜË™Ù][Š“VTÔSÔÕŠN‚ˆÙÙÙ\‹š[™›Ê”˜Z[Ø^H[™]šYX[˜\šXX›\È]XÝY\Ú[™È[H›ÜˆˆÛÛ™šYËˆŠBˆ\˜ÛÛ™šYÖÈ‘—ÐÓÓ‘’QÈ—HHÂˆšÜÝŽˆÜË™Ù][Š“VTÔSÔÕŠKˆ\Ù\ˆŽˆÜË™Ù][Š“VTÔSTÑTˆŠKˆœ\ÜÝÛÜ™ŽˆÜË™Ù][Š“VTÔSTÔÕÓÔ‘ŠKˆ™]X˜\ÙHŽˆÜË™Ù][Š“VTÔSUPTÑHŠKˆœÜŽˆ[
+ÜË™Ù][Š“VTÔSÔ•‹ÌÌŠJKˆBˆ[YˆÜË™Ù][Š“VTÔSÕT“ŠN‚ˆ^\Ü[Ý\›HÜË™Ù][Š“VTÔSÕT“ŠBˆÙÙÙ\‹š[™›Ê“VTÔSÕT“]XÝY\œÚ[™ÈÛÛ›™XÝ[ÛˆÝš[™Ë‹‹ˆŠBˆžN‚ˆÈÛX[ˆ\HT“ˆ^\Ü[Ý\›H^\Ü[Ý\›œÝš\
+
+Bˆ\œÙYH\›X‹œ\œÙK\›\œÙJ^\Ü[Ý\›
+Bˆ\˜ÛÛ™šYÖÈ‘—ÐÓÓ‘’QÈ—HHÂˆšÜÝŽˆ\œÙYšÜÝ˜[YKˆ\Ù\ˆŽˆ\œÙY\Ù\›˜[YKˆœ\ÜÝÛÜ™Žˆ\œÙYœ\ÜÝÛÜ™ˆ™]X˜\ÙHŽˆ\œÙYœ]›Ýš\
+	ËÉÊKˆœÜŽˆ\œÙYœÜÜˆÌÌ‹ˆBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆÔ’UPÐSˆ˜Z[YÈ\œÙHVTÔSÕT“ˆÙ_HŠBˆ\˜ÛÛ™šYÖÈ‘—ÐÓÓ‘’QÈ—HHÈšÜÝŽˆ›ØØ[ÜÝ‹œÜŽˆÌÌŸBˆ[ÙN‚ˆÙÙÙ\‹š[™›Ê“›È›ÙXÝ[Ûˆ˜\šXX›\È›Ý[™˜[[™È˜XÚÈÈØØ[™[ˆÜˆY˜][ËˆŠBˆ\˜ÛÛ™šYÖÈ‘—ÐÓÓ‘’QÈ—HHÂˆšÜÝŽˆÜË™Ù][Š‘—ÒÔÕ‹›ØØ[ÜÝŠKˆ\Ù\ˆŽˆÜË™Ù][Š‘—ÕTÑTˆ‹œ›ÛÝŠKˆœ\ÜÝÛÜ™ŽˆÜË™Ù][Š‘—ÔTÔÕÓÔ‘‹ˆŠKˆ™]X˜\ÙHŽˆÜË™Ù][Š‘—ÓSQH‹™™YY˜XÚ×ÜÞ\Ý[HŠKˆœÜŽˆ[
+ÜË™Ù][Š‘—ÔÔ•‹ŒÌÌˆŠJKˆB‚ˆ—ÚÜÝH\˜ÛÛ™šYÖÈ‘—ÐÓÓ‘’QÈ—K™Ù]
+šÜÝŠBˆ—ÜÜH\˜ÛÛ™šYÖÈ‘—ÐÓÓ‘’QÈ—K™Ù]
+œÜŠBˆ—Û˜[YHH\˜ÛÛ™šYÖÈ‘—ÐÓÓ‘’QÈ—K™Ù]
+™]X˜\ÙHŠBˆÙÙÙ\‹š[™›Êˆ‘ˆÓÓ‘’QÈ’SSV‘QˆÜÝ^Ù—ÚÜÝKÜ^Ù—ÜÜK]X˜\ÙO^Ù—Û˜[Y_HŠB‚ˆÈ“ÔÑHRSYˆÜÝ\ÈÝ[ØØ[ÜÝÛˆ˜Z[Ø^BˆYˆÜË™Ù][Š”RSÐVWÑS•’T“Ó“QS•ŠH[™—ÚÜÝOH›ØØ[ÜÝŽ‚ˆÙÙÙ\‹˜Üš]XØ[
+‘USˆ\\È[›š[™ÈÛˆ˜Z[Ø^H]ÜÝ\ÈÝ[	ÛØØ[ÜÝ	ËˆÚXÚÈ˜\šXX›\ÈHŠB‚ˆYˆÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+HOˆ^TÔSÛÛ›™XÝ[ÛŽ‚ˆžN‚ˆ™]\›ˆ^\Ü[˜ÛÛ›™XÝÜ‹˜ÛÛ›™XÝ
+
+Š˜\˜ÛÛ™šYÖÈ‘—ÐÓÓ‘’QÈ—JBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ‘˜Z[YÈÛÛ›™XÝÈ]X˜\ÙNˆÙ_HŠBˆ˜Z\ÙB‚ˆYˆ›Ü›X[^™WÜÜ[Ý\›
+˜[YNˆÜ[Û˜[ÜÝ—JHOˆÝŽ‚ˆØ[™Y]HH
+˜[YHÜˆˆŠKœÝš\
+
+BˆYˆ›ÝØ[™Y]HÜˆØ[™Y]H[ˆQÐPÖWÔÔ•SÕT“Î‚ˆØ[™Y]HHQUSÔÔ•SÕT“ˆ™]\›ˆØ[™Y]KœœÝš\
+‹ÈŠB‚ˆYˆXÙ[œÚ[™×Ø\WÚXY\œÊ
+HOˆXÝÜÝ‹Ý—N‚ˆ™]\›ˆÈ–SXÙ[œÚ[™ËPTKRÙ^HŽˆÜË™Ù][Š“PÑS”ÒS‘×ÐTWÒÑVH‹ˆŠ_B‚ˆœ›ÛHÛÛ^Xˆ[\ÜÛÛ^X[˜YÙ\‚‚ˆÛÛ^X[˜YÙ\‚ˆYˆÙ]Ù—ØÛÛ›™XÝ[Û—ÝÚ]Ý˜[œØXÝ[ÛŠ
+N‚ˆˆˆÛÛ^X[˜YÙ\ˆ›Üˆ]X˜\ÙHÛÛ›™XÝ[ÛœÈÚ]]]ÛX]XÈ›Û˜XÚÈÛˆ\œ›Ü‹ˆˆˆ‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆZY[ÛÛ›‚ˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÛÛ›‹œ›Û˜XÚÊ
+Bˆ˜Z\ÙBˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆYˆÙ×Ø]Y]
+[]WÝ\NˆÝ‹[]WÚYˆ[XÝ[ÛŽˆÝ‹ÛÝ˜[Y\ÎˆÝˆH›Û™K™]×Ý˜[Y\ÎˆÝˆH›Û™K\Ù\—ÚYˆÝˆH›Û™JHOˆ›Û™N‚ˆˆˆ“ÙÈ[ˆ]Y][žH›Üˆ˜XÚÚ[™ÈÚ[™Ù\Èˆˆ‚ˆÚ]Ù]Ù—ØÛÛ›™XÝ[Û—ÝÚ]Ý˜[œØXÝ[ÛŠ
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È]Y]ÛÙÜÈ
+[]WÝ\K[]WÚYXÝ[Û‹ÛÝ˜[Y\Ë™]×Ý˜[Y\Ë\Ù\—ÚY
+BˆSQTÈ
+	\Ë	\Ë	\Ë	\Ë	\Ë	\ÊBˆˆˆ‹ˆ
+[]WÝ\K[]WÚYXÝ[Û‹ÛÝ˜[Y\Ë™]×Ý˜[Y\Ë\Ù\—ÚY
+Kˆ
+B‚ˆYˆ[™WØ]Y]ÛÙÜÊ^\Îˆ[HL
+HOˆ[‚ˆˆˆ‘[]H]Y]ÙÜÈÛ\ˆ[ˆÜXÚYšYY^\Èˆˆ‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆSUH”“ÓH]Y]ÛÙÜÂˆÒT‘HÜ™X]YØ]UWÔÕPŠ“ÕÊ
+KS•T•S	\ÈVJBˆˆˆ‹ˆ
+^\Ë
+Kˆ
+Bˆ[]YØÛÝ[HÝ\œÛÜ‹œ›ÝØÛÝ[ˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ™]\›ˆ[]YØÛÝ[ˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆÈXÙ[œÙH˜[Y][Ûˆ[˜Ý[ÛœÂˆYˆÙ]ÛXÙ[œÙWØÛÛ™šYÊ
+HOˆÜ[Û˜[ÑXÝÜÝ‹[žWWN‚ˆˆˆ‘Ù]XÙ[œÙHÛÛ™šYÝ\˜][Ûˆœ›ÛH]X˜\ÙHˆˆ‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÈÜ™X]HX›HYˆ]Ù\Û‰Ý^\ÝˆÝ\œÛÜ‹™^XÝ]JÔ‘PUHP“HQˆ“ÕVTÕÈXÙ[œÙWØÛÛ™šYÈ
+YS•UU×ÒSÔ‘SQS•’SPT–HÑVKXÙ[œÙWÚÙ^HTÒTŠMJH“Õ•S\WÚÙ^HTÒTŠMJH“Õ•SXÙ[œÚ[™×ÜÜ[Ý\›TÒTŠMJHQUS	ÚÎ‹ËÙ™YY˜XÚÛXÙ[œÚ[™Ë\›ÙXÝ[Û‹XÎLÎ\œ˜Z[Ø^K˜\	ËXZ[—ÜÞ\Ý[WÝ\›TÒTŠMJH•SÜ™X]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕST\]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTÓˆTUHÕT”‘S•ÕSQTÕST
+HŠBˆÈÚXÚÈYˆXZ[—ÜÞ\Ý[WÝ\›ÛÛ[[ˆ^\ÝÂˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓHXÙ[œÙWØÛÛ™šYÈRÑH	ÛXZ[—ÜÞ\Ý[WÝ\›	ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÝ\œÛÜ‹™^XÝ]JSTˆP“HXÙ[œÙWØÛÛ™šYÈQÓÓSSˆXZ[—ÜÞ\Ý[WÝ\›TÒTŠMJH•SQ•TˆXÙ[œÚ[™×ÜÜ[Ý\›ŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕ
+ˆ”“ÓHXÙ[œÙWØÛÛ™šYÈÔ‘Tˆ–HYTÐÈSRUHŠBˆ™]\›ˆÝ\œÛÜ‹™™]ÚÛ™J
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆYˆ˜[Y]WÛXÙ[œÙWÙœ›ÛWÜÜ[
+
+HOˆXÝÜÝ‹[žWN‚ˆˆˆ•˜[Y]HXÙ[œÙHžHØ[[™ÈHXÙ[œÚ[™ÈÜ[THˆˆ‚ˆ[\Ü™\]Y\ÝÂˆœ›ÛH™\]Y\ÝË™^Ù\[ÛœÈ[\Ü™\]Y\Ý^Ù\[Û‹[Y[Ý]ˆˆÛÛ™šYÈHÙ]ÛXÙ[œÙWØÛÛ™šYÊ
+BˆYˆ›ÝÛÛ™šYÎ‚ˆ™]\›ˆÈ˜[YŽˆ˜[ÙK™\œ›ÜˆŽˆ“›ÈXÙ[œÙHÛÛ™šYÝ\™YŸBˆˆžN‚ˆÜ[Ý\›H›Ü›X[^™WÜÜ[Ý\›
+ÛÛ™šYË™Ù]
+›XÙ[œÚ[™×ÜÜ[Ý\›ŠJBˆ™\ÜÛœÙHH™\]Y\ÝËœÜÝ
+ˆˆžÜÜ[Ý\›KØ\KÝ˜[Y]KÞØÛÛ™šYÖÉÛXÙ[œÙWÚÙ^I×_H‹ˆXY\œÏ[XÙ[œÚ[™×Ø\WÚXY\œÊ
+K[Y[Ý]LLˆ
+BˆˆYˆ™\ÜÛœÙKœÝ]\×ØÛÙHOHŒ‚ˆ™]\›ˆ™\ÜÛœÙKšœÛÛŠ
+Bˆ[ÙN‚ˆÙÙÙ\‹™\œ›ÜŠˆ“XÙ[œÙH˜[Y][Ûˆ˜Z[YˆÜ™\ÜÛœÙKœÝ]\×ØÛÙ_HŠBˆ™]\›ˆÈ˜[YŽˆ˜[ÙK™\œ›ÜˆŽˆ“XÙ[œÙH˜[Y][Ûˆ˜Z[YŸBˆ^Ù\[Y[Ý]‚ˆÙÙÙ\‹™\œ›ÜŠ“XÙ[œÙH˜[Y][Ûˆ™\]Y\Ý[YYÝ]ŠBˆ™]\›ˆÈ˜[YŽˆ˜[ÙK™\œ›ÜˆŽˆ”™\]Y\Ý[YYÝ]ŸBˆ^Ù\™\]Y\Ý^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ“XÙ[œÙH˜[Y][Ûˆ™]ÛÜšÈ\œ›ÜŽˆÙ_HŠBˆ™]\›ˆÈ˜[YŽˆ˜[ÙK™\œ›ÜˆŽˆ“™]ÛÜšÈ\œ›ÜˆŸBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ•[™^XÝY\œ›Üˆ˜[Y][™ÈXÙ[œÙNˆÙ_HŠBˆ™]\›ˆÈ˜[YŽˆ˜[ÙK™\œ›ÜˆŽˆÝŠJ_B‚ˆXÙ[œÙWÜÝ]\×ØØXÚNˆXÝÜÝ‹XÝÜÝ‹[žWWHHßB‚ˆYˆÜ\œÙWÛXÙ[œÙWÙ^\žJ]NˆXÝÜÝ‹[žWJHOˆ]][YH›Û™N‚ˆ˜]ÈH
+]K™Ù]
+™^\žWÙ]HŠHÜˆ]K™Ù]
+™^\™\×Ø]ŠBˆÜˆ]K™Ù]
+™^\˜][Û—Ù]HŠHÜˆ]K™Ù]
+™^\žHŠJBˆYˆ›Ý˜]Î‚ˆ™]\›ˆ›Û™BˆžN‚ˆ˜[YHHÝŠ˜]ÊKœÝš\
+
+Bˆ]WÛÛ›HH[Š˜[YJHOHLˆ\œÙYH]][YK™œ›ÛZ\ÛÙ›Ü›X]
+˜[YKœ™\XÙJ–ˆ‹ŠÌŒŠJBˆYˆ\œÙYš[™›È\È›Û™N‚ˆ\œÙYH\œÙYœ™\XÙJš[™›Ï][Y^›Û™K]ÊBˆYˆ]WÛÛ›N‚ˆ\œÙYH\œÙYœ™\XÙJÝ\LŒËZ[]OMNKÙXÛÛ™MNJBˆ™]\›ˆ\œÙY˜\Ý[Y^›Û™J[Y^›Û™K]ÊBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆÙÙÙ\‹Ø\›š[™Ê•[˜X›HÈ\œÙHXÙ[œÙH^\žH˜[YNˆ	\ˆ‹˜]ÊBˆ™]\›ˆ›Û™B‚ˆYˆÛXÙ[œÙWÚ\×Ù^\™Y
+]NˆXÝÜÝ‹[žWJHOˆ›ÛÛ‚ˆ^\žHHÜ\œÙWÛXÙ[œÙWÙ^\žJ]JBˆYˆ^\žH[™^\žHH]][YK››ÝÊ[Y^›Û™K]ÊN‚ˆ™]\›ˆYBˆY\ÜØYÙHHÝŠ]K™Ù]
+›Y\ÜØYÙHŠHÜˆ]K™Ù]
+™\œ›ÜˆŠHÜˆˆŠK›ÝÙ\Š
+Bˆ™]\›ˆ›ÛÛ
+]K™Ù]
+™^\™YŠHÜˆ™^\™Yˆ[ˆY\ÜØYÙJB‚ˆYˆ˜[Y]WÝ[˜[ÛXÙ[œÙJXÙ[œÙWÚÙ^NˆÝ‹›Ü˜ÙNˆ›ÛÛH˜[ÙJHOˆXÝÜÝ‹[žWN‚ˆˆˆ•˜[Y]HÛ™HÛY[XÙ[œÙH][ÜÝÛ˜ÙH\ˆÝ\ˆ\ˆÙXˆÛÜšÙ\‹ˆˆˆ‚ˆYˆ›ÝXÙ[œÙWÚÙ^N‚ˆ™]\›ˆÈ˜[YŽˆ˜[ÙK™\œ›ÜˆŽˆ“›ÈXÙ[œÙHÛÛ™šYÝ\™YŸBˆØXÚYHXÙ[œÙWÜÝ]\×ØØXÚK™Ù]
+XÙ[œÙWÚÙ^JBˆYˆØXÚY[™›Ý›Ü˜ÙH[™[YK[YJ
+HHØXÚYÈ˜ÚXÚÙYØ]—HÍŒ‚ˆ™]\›ˆØXÚYÈ™]H—BˆÛÛ™šYÈHÙ]ÛXÙ[œÙWØÛÛ™šYÊ
+BˆÜ[Ý\›H›Ü›X[^™WÜÜ[Ý\›
+ÛÛ™šYË™Ù]
+›XÙ[œÚ[™×ÜÜ[Ý\›ŠHYˆÛÛ™šYÈ[ÙH›Û™JBˆžN‚ˆ[\Ü™\]Y\ÝÈ\ÈÜ™\]Y\ÝÂˆ™\ÜÛœÙHHÜ™\]Y\ÝËœÜÝ
+ˆˆžÜÜ[Ý\›KØ\KÝ˜[Y]KÞÛXÙ[œÙWÚÙ^_H‹ˆXY\œÏ[XÙ[œÚ[™×Ø\WÚXY\œÊ
+K[Y[Ý]LLˆ
+Bˆ]HH™\ÜÛœÙKšœÛÛŠ
+HYˆ™\ÜÛœÙK˜ÛÛ[[ÙHßBˆYˆ™\ÜÛœÙKœÝ]\×ØÛÙHOHŒ[™›Ý]N‚ˆ]HHÈ˜[YŽˆ˜[ÙK™\œ›ÜˆŽˆˆ“XÙ[œÙHTH\œ›ÜŽˆÜ™\ÜÛœÙKœÝ]\×ØÛÙ_HŸBˆXÙ[œÙWÜÝ]\×ØØXÚVÛXÙ[œÙWÚÙ^WHHÈ˜ÚXÚÙYØ]Žˆ[YK[YJ
+K™]HŽˆ]_Bˆ™]\›ˆ]Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™\œ›ÜŠ•[˜X›HÈ˜[Y]H[˜[XÙ[œÙH	\Îˆ	\È‹XÙ[œÙWÚÙ^VÎŽK^ÊBˆÈH[\Ü˜\žHÜ[Û™]ÛÜšÈ˜Z[\™H]\Ý›ÝØÚÈÝ]HÛY[‚ˆ™]\›ˆØXÚYÈ™]H—HYˆØXÚY[ÙHÈ˜[YŽˆ›Û™K™\œ›ÜˆŽˆ“XÙ[œÙHÙ\šXÙH[˜]˜Z[X›HŸB‚ˆYˆÝ\Ù\—ÛXÙ[œÙWÚÙ^\×Ù›Ü—ØXØÙ\ÜÊ\Ù\ŽˆXÝÜÝ‹[žWJHOˆ\ÝÜÝ—N‚ˆYˆ›Ý\Ù\ˆÜˆ\Ù\‹™Ù]
+œ›ÛHŠHOHœÝ\\˜YZ[ˆŽ‚ˆ™]\›ˆ×BˆYˆ\Ù\‹™Ù]
+œ›ÛHŠHOH˜YZ[ˆŽ‚ˆ™]\›ˆÝ\Ù\–È›XÙ[œÙWÚÙ^H—WHYˆ\Ù\‹™Ù]
+›XÙ[œÙWÚÙ^HŠH[ÙH×BˆYˆ\Ù\‹™Ù]
+œ›ÛHŠHOH\Ù\ˆŽ‚ˆ™]\›ˆ×BˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ”ÑSPÕTÕSÕÝÛ™\‹›XÙ[œÙWÚÙ^Bˆ”“ÓH\Ù\—ÜÝÜ™\È\Âˆ“ÒSˆÝÜ™\ÈÈÓˆËšYH\ËœÝÜ™WÚYˆ“ÒSˆ\Ù\œÈÝÛ™\ˆÓˆÝÛ™\‹šYHË\Ù\—ÚYˆÒT‘H\Ë\Ù\—ÚYH	\ÈS‘ÝÛ™\‹›XÙ[œÙWÚÙ^HTÈ“Õ•Sˆˆ‹ˆ
+[
+\Ù\–ÈšY—JK
+Kˆ
+Bˆ™]\›ˆÜ›ÝÖÌH›Üˆ›ÝÈ[ˆÝ\œÛÜ‹™™]Ú[
+
+HYˆ›ÝÖÌWBˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆYˆÙ^\™YÛXÙ[œÙWÙ›Ü—Ý\Ù\Š\Ù\ŽˆXÝÜÝ‹[žWK›Ü˜ÙNˆ›ÛÛH˜[ÙJHOˆÝˆ›Û™N‚ˆ›ÜˆÙ^H[ˆÝ\Ù\—ÛXÙ[œÙWÚÙ^\×Ù›Ü—ØXØÙ\ÜÊ\Ù\ŠN‚ˆYˆÛXÙ[œÙWÚ\×Ù^\™Y
+˜[Y]WÝ[˜[ÛXÙ[œÙJÙ^K›Ü˜ÙOY›Ü˜ÙJJN‚ˆ™]\›ˆÙ^Bˆ™]\›ˆ›Û™B‚ˆ\˜ÛÛ^Ü›ØÙ\ÜÛÜ‚ˆYˆ[š™XÝÛXÙ[œÙWÙ^\žWÝØ\›š[™Ê
+N‚ˆYˆÙ\ÜÚ[Û‹™Ù]
+œ›ÛHŠHOH˜YZ[ˆˆÜˆ\Ù\—ÚYˆ›Ý[ˆÙ\ÜÚ[ÛŽ‚ˆ™]\›ˆßBˆ\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+Ù\ÜÚ[Û–È\Ù\—ÚY—JBˆYˆ›Ý\Ù\ˆÜˆ›Ý\Ù\‹™Ù]
+›XÙ[œÙWÚÙ^HŠN‚ˆ™]\›ˆßBˆÝ]\ÈH˜[Y]WÝ[˜[ÛXÙ[œÙJ\Ù\–È›XÙ[œÙWÚÙ^H—JBˆ^\žHHÜ\œÙWÛXÙ[œÙWÙ^\žJÝ]\ÊBˆYˆ›Ý^\žN‚ˆ™]\›ˆßBˆÙXÛÛ™×ÛYH[
+
+^\žHH]][YK››ÝÊ[Y^›Û™K]ÊJKÝ[ÜÙXÛÛ™Ê
+JBˆYˆÙXÛÛ™×ÛYHÜˆÙXÛÛ™×ÛYˆÌ
+ˆ
+ˆŒ
+ˆŒ‚ˆ™]\›ˆßBˆ™]\›ˆÈ›XÙ[œÙWÙ^\žWÝØ\›š[™ÈŽˆÂˆ™^\™\×Ø]Žˆ^\žKš\ÛÙ›Ü›X]
+
+Kˆ™^\žWÙ]HŽˆ^\žKœÝ™[YJ‰Pˆ	Y	VHŠKˆ_B‚ˆYˆÚXÚ×ÜÝÜ™WÛ[Z]
+
+HOˆ›ÛÛ‚ˆˆˆÚXÚÈYˆHÝ\œ™[ÝÜ™HÛÝ[\ÈÚ][ˆHXÙ[œÙH[Z]ˆˆ‚ˆÛÛ™šYÈHÙ]ÛXÙ[œÙWØÛÛ™šYÊ
+BˆˆÈYˆ›ÈXÙ[œÙH\ÈÛÛ™šYÝ\™Y›ØÚÈÝÜ™HÜ™X][Û‚ˆYˆ›ÝÛÛ™šYÈÜˆ›ÝÛÛ™šYË™Ù]
+›XÙ[œÙWÚÙ^HŠN‚ˆ™]\›ˆ˜[ÙBˆˆXÙ[œÙWÜÝ]\ÈH˜[Y]WÛXÙ[œÙWÙœ›ÛWÜÜ[
+
+BˆˆÈYˆXÙ[œÙH˜[Y][Ûˆ˜Z[È
+[˜[YÙ^K]ËŠK›ØÚÈÝÜ™HÜ™X][Û‚ˆYˆ›ÝXÙ[œÙWÜÝ]\Ë™Ù]
+˜[YŠN‚ˆ™]\›ˆ˜[ÙBˆˆX^ÜÝÜ™\ÈHXÙ[œÙWÜÝ]\Ë™Ù]
+›X^ÜÝÜ™\È‹
+BˆYˆX^ÜÝÜ™\ÈOH‚ˆ™]\›ˆYHÈYX[œÈ[›[Z]YˆˆÈÛÝ[Ý\œ™[ÝÜ™\ÂˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕÓÕS•
+
+ŠH”“ÓHÝÜ™\ÈŠBˆÝ\œ™[ØÛÝ[HÝ\œÛÜ‹™™]ÚÛ™J
+VÌBˆ™]\›ˆÝ\œ™[ØÛÝ[X^ÜÝÜ™\Âˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆÈ]][XØ][Ûˆ[\ˆ[˜Ý[ÛœÂˆYˆÙ]Ý\Ù\—ØžWÝ\Ù\›˜[YJ\Ù\›˜[YNˆÝŠHOˆÜ[Û˜[ÑXÝÜÝ‹[žWWN‚ˆˆˆ‘Ù]\Ù\ˆžH\Ù\›˜[YHˆˆ‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕ
+ˆ”“ÓH\Ù\œÈÒT‘H\Ù\›˜[YHH	\È‹
+\Ù\›˜[YK
+JBˆ™]\›ˆÝ\œÛÜ‹™™]ÚÛ™J
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆYˆÙ]Ý\Ù\—ØžWÚY
+\Ù\—ÚYˆ[
+HOˆÜ[Û˜[ÑXÝÜÝ‹[žWWN‚ˆˆˆ‘Ù]\Ù\ˆžHQˆˆ‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕ
+ˆ”“ÓH\Ù\œÈÒT‘HYH	\È‹
+\Ù\—ÚY
+JBˆ™]\›ˆÝ\œÛÜ‹™™]ÚÛ™J
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆYˆ™\šYžWÜ\ÜÝÛÜ™
+\ÜÝÛÜ™ˆÝ‹\ÜÝÛÜ™Ú\ÚˆÝŠHOˆ›ÛÛ‚ˆˆˆ•™\šYžHH\ÜÝÛÜ™YØZ[œÝ]È\Úˆˆ‚ˆ™]\›ˆ˜Üž\˜ÚXÚÜÊ\ÜÝÛÜ™™[˜ÛÙJ	Ý]‹N	ÊK\ÜÝÛÜ™Ú\Ú™[˜ÛÙJ	Ý]‹N	ÊJB‚ˆYˆ\ÚÜ\ÜÝÛÜ™
+\ÜÝÛÜ™ˆÝŠHOˆÝŽ‚ˆˆˆ’\ÚH\ÜÝÛÜ™ˆˆ‚ˆ™]\›ˆ˜Üž\š\ÚÊ\ÜÝÛÜ™™[˜ÛÙJ	Ý]‹N	ÊK˜Üž\™Ù[œØ[
+
+JK™XÛÙJ	Ý]‹N	ÊB‚ˆYˆÙÚ[—Ü™\]Z\™Y
+ŠN‚ˆˆˆ‘XÛÜ˜]ÜˆÈ™\]Z\™HÙÚ[ˆˆˆ‚ˆÜ˜\ÊŠBˆYˆXÛÜ˜]YÙ[˜Ý[ÛŠ
+˜\™ÜË
+ŠšÝØ\™ÜÊN‚ˆYˆ	Ý\Ù\—ÚY	È›Ý[ˆÙ\ÜÚ[ÛŽ‚ˆ›\Ú
+”X\ÙHÙÈ[ˆÈXØÙ\ÜÈ\ÈYÙKˆ‹Ø\›š[™ÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ	ÛÙÚ[‰ÊJBˆ™]\›ˆŠ
+˜\™ÜË
+ŠšÝØ\™ÜÊBˆ™]\›ˆXÛÜ˜]YÙ[˜Ý[Û‚‚ˆYˆ›ÛWÜ™\]Z\™Y
+
+˜[ÝÙYÜ›Û\ÊN‚ˆˆˆ‘XÛÜ˜]ÜˆÈ™\]Z\™HÜXÚYšXÈ›ÛHˆˆ‚ˆYˆXÛÜ˜]ÜŠŠN‚ˆÜ˜\ÊŠBˆYˆXÛÜ˜]YÙ[˜Ý[ÛŠ
+˜\™ÜË
+ŠšÝØ\™ÜÊN‚ˆYˆ	Ý\Ù\—ÚY	È›Ý[ˆÙ\ÜÚ[ÛŽ‚ˆ›\Ú
+”X\ÙHÙÈ[ˆÈXØÙ\ÜÈ\ÈYÙKˆ‹Ø\›š[™ÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ	ÛÙÚ[‰ÊJBˆˆ\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+Ù\ÜÚ[Û–ÉÝ\Ù\—ÚY	×JBˆYˆ›Ý\Ù\ˆÜˆ›Ý\Ù\–ÉÚ\×ØXÝ]™I×N‚ˆÙ\ÜÚ[Û‹˜ÛX\Š
+Bˆ›\Ú
+–[Ý\ˆXØÛÝ[\È™Y[ˆXXÝ]˜]Yˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ	ÛÙÚ[‰ÊJBˆˆYˆ\Ù\–ÉÜ›ÛI×H›Ý[ˆ[ÝÙYÜ›Û\Î‚ˆ›\Ú
+–[ÝHÛ‰Ý]™H\›Z\ÜÚ[ÛˆÈXØÙ\ÜÈ\ÈYÙKˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ	ØYZ[—Ù\Ú›Ø\™	ÊJBˆˆ™]\›ˆŠ
+˜\™ÜË
+ŠšÝØ\™ÜÊBˆ™]\›ˆXÛÜ˜]YÙ[˜Ý[Û‚ˆ™]\›ˆXÛÜ˜]Ü‚‚ˆÈ8¥ 8¥ ÛØ˜[Üš]KX›ØÚÈ›ÜˆšY]Ë[Û›H\Ù\œÈ8¥ 8¥ ˆÈ	Ý\Ù\‰È›ÛH\È™XY[Û›Kˆ›ØÚÈ[žH›Û‹QÑU™\]Y\ÝË^Ù\HÛX[ˆÈÚ][\ÝÙˆØY™HÙ[‹\Ù\šXÙH[™Ú[È
+ÙÛÝ]\ÜÝÛÜ™Ú[™ÙJK‚ˆ‘PQÓ“WÕTÑT—ÕÒUSTÕHÂˆ	ÛÙÛÝ]	Ëˆ	ÛÙÚ[‰Ëˆ	ØXØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™	ËˆÈ\ÜÚYÛ™Yœ˜[˜ÚšY]Ù\œÈXÝ\È\™XHX[˜YÙ\œÈ›ÜˆÝY™ˆ™XÛÜ™ÈÛ›K‚ˆ	ØYÜÝY™‰Ëˆ	Ú[\ÜÜÝY™‰Ëˆ	ÙY]ÜÝY™‰Ëˆ	Ù[]WÜÝY™‰ËˆÈ\ÜÚYÛ™Yœ˜[˜ÚX[˜YÙ\œÈX^H™YY[HÛÙ\È\ÜÝYYžHZ\ˆÝÜ™K‚ˆ	Ý\ÙWÜ™]šY]×Ü™]Ø\™	ËˆÈšY]Ù\œÈ™[XZ[ˆ™XY[Û›H›Üˆ\Ú[™\ÜÈ]K]X^H\XÚ\]H[‚ˆÈZ\ˆÝÛˆš]˜]HÝ\ÜÛÛ™\œØ][Û‹‚ˆ	Ø\WÜÙ[™ØÛY[ÛY\ÜØYÙIËˆB‚ˆ\˜™Y›Ü™WÜ™\]Y\ÝˆYˆÙ[™›Ü˜ÙWÝšY]×ÛÛ›WÝ\Ù\Š
+N‚ˆÈÙ[˜[ÝX\™›ÜˆYØXÞH›Ý]\È]™Y]H\‹\›Ý]HXÛÜ˜]ÜœË‚ˆÈX›XÈÝ\™^KÜÝÜ™HYÙ\È™[XZ[ˆXØÙ\ÜÚX›NÈ[YZ[ˆ[™[\›˜[ˆÈ”ÓÓˆ[™Ú[È™\]Z\™H[ˆXÝ]™H\XØ][ÛˆÙ\ÜÚ[Û‹‚ˆ›ÝXÝYÜ]H
+ˆ™\]Y\Ýœ]œÝ\ÝÚ]
+‹ØYZ[‹ÈŠBˆÜˆ™\]Y\Ýœ]œÝ\ÝÚ]
+‹Ø\KÈŠBˆÜˆ™\]Y\Ýœ]OH‹Ù\Ú›Ø\™ÜÝY™‹[Ý™\˜[‚ˆ
+Bˆ\WÙ^[\H™\]Y\Ýœ]OH‹Ø\KÛXÙ[œÚ[™ËÝ\Ù\œÈˆÈÚ\™YZÙ^H]]ˆYˆ›ÝXÝYÜ][™›Ý\WÙ^[\[™	Ý\Ù\—ÚY	È›Ý[ˆÙ\ÜÚ[ÛŽ‚ˆYˆ™\]Y\Ýœ]œÝ\ÝÚ]
+‹Ø\KÈŠHÜˆ™\]Y\Ýš\×ÚœÛÛŽ‚ˆ™]\›ˆœÛÛšYžJÈœÝXØÙ\ÜÈŽˆ˜[ÙK™\œ›ÜˆŽˆ]][XØ][Ûˆ™\]Z\™YŸJKBˆ›\Ú
+”X\ÙHÙÈ[ˆÈXØÙ\ÜÈ\ÈYÙKˆ‹Ø\›š[™ÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ	ÛÙÚ[‰Ë™^\™\]Y\Ý™[Ü]
+JBˆYˆ›ÝXÝYÜ][™›Ý\WÙ^[\[™	Ý\Ù\—ÚY	È[ˆÙ\ÜÚ[ÛŽ‚ˆÝ\œ™[Ý\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+Ù\ÜÚ[Û–ÉÝ\Ù\—ÚY	×JBˆYˆ›ÝÝ\œ™[Ý\Ù\ˆÜˆ›ÝÝ\œ™[Ý\Ù\‹™Ù]
+	Ú\×ØXÝ]™IÊN‚ˆÙ\ÜÚ[Û‹˜ÛX\Š
+BˆYˆ™\]Y\Ýœ]œÝ\ÝÚ]
+‹Ø\KÈŠHÜˆ™\]Y\Ýš\×ÚœÛÛŽ‚ˆ™]\›ˆœÛÛšYžJÈœÝXØÙ\ÜÈŽˆ˜[ÙK™\œ›ÜˆŽˆ”Ù\ÜÚ[Ûˆ\È›ÈÛ™Ù\ˆXÝ]™HŸJKBˆ›\Ú
+–[Ý\ˆÙ\ÜÚ[Ûˆ\È›ÈÛ™Ù\ˆXÝ]™KˆX\ÙHÙÈ[ˆYØZ[‹ˆ‹Ø\›š[™ÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ	ÛÙÚ[‰ÊJBˆÙ\ÜÚ[Û–ÉÜ›ÛI×HHÝ\œ™[Ý\Ù\–ÉÜ›ÛI×BˆYˆÙ^\™YÛXÙ[œÙWÙ›Ü—Ý\Ù\ŠÝ\œ™[Ý\Ù\ŠN‚ˆÙ\ÜÚ[Û‹˜ÛX\Š
+Bˆ›\Ú
+“XÙ[œÙH^\™YˆX\ÙH™[™]È[Ý\ˆXÙ[œÙKˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›ÙÚ[ˆŠJB‚ˆYˆ™\]Y\Ý›Y]Ù[ˆ
+	ÑÑU	Ë	ÒPQ	Ë	ÓÔSÓ”ÉÊN‚ˆ™]\›ˆ›Û™BˆYˆÙ\ÜÚ[Û‹™Ù]
+	Ü›ÛIÊHOH	Ý\Ù\‰Î‚ˆ™]\›ˆ›Û™Bˆ[™Ú[H™\]Y\Ý™[™Ú[Üˆ	ÉÂˆYˆ[™Ú[[ˆ‘PQÓ“WÕTÑT—ÕÒUSTÕ‚ˆ™]\›ˆ›Û™BˆÈ™Z™XÝ]™\ž][™È[ÙH›ÜˆšY]Ë[Û›HXØÛÝ[ÂˆYˆ™\]Y\Ýš\×ÚœÛÛˆÜˆ™\]Y\ÝšXY\œË™Ù]
+	ÐXØÙ\	Ë	ÉÊKœÝ\ÝÚ]
+	Ø\XØ][Û‹ÚœÛÛ‰ÊN‚ˆ™]\›ˆœÛÛšYžJÈœÝXØÙ\ÜÈŽˆ˜[ÙK™\œ›ÜˆŽˆ”™XY[Û›HXØÛÝ[ŸJKÂˆ›\Ú
+–[Ý\ˆXØÛÝ[\È™XY[Û›H[™Ø[››ÝXZÙHÚ[™Ù\Ëˆ‹Ø\›š[™ÈŠBˆÈ™Y\™XÝ˜XÚÈÈ™Y™\œ™\ˆYˆ]˜Z[X›K[ÙH\Ú›Ø\™ˆ™]\›ˆ™Y\™XÝ
+™\]Y\Ýœ™Y™\œ™\ˆÜˆ\›Ù›ÜŠ	ØYZ[—Ù\Ú›Ø\™	ÊJB‚ˆÈ[š]X[^™HÓU[XZ[ÛÛ™šYÝ\˜][Û‚ˆ[XZ[ØÛÛ™šYÈH[XZ[ÛÛ™šYÊ
+Bˆ[XZ[ØÛÛ™šYËš[š]Ø\
+\
+B‚ˆYˆ[š]ÛX\Ý\—ÜØÚ[XJ
+HOˆ›Û™N‚ˆ™]šY\ÈHÂˆÚ[H™]šY\Èˆ‚ˆžN‚ˆÙÙÙ\‹š[™›Êˆ][\[™ÈØÚ[XH[š]X[^˜][Û‹‹‹ˆ
+Ü™]šY\ßH™]šY\ÈY
+HŠBˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆˆÈKKHÔ‘PUHP“TÈQˆ“ÕVTÕKKBˆˆÈKˆÝÜ™\ÈX›BˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HQˆ“ÕVTÕÈÝÜ™\È
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆÝÜ™WÛ˜[YHTÒTŠMJH“Õ•SˆY™\ÜÈVˆÚ]HTÒTŠL
+Kˆ›Ýš[˜ÙHTÒTŠL
+KˆÜÝ[ØÛÙHTÒTŠŒ
+KˆÛÛXÝÛ[X™\ˆTÒTŠŒ
+Kˆ[XZ[TÒTŠMJKˆÝÜ™WÛX[˜YÙ\—Û˜[YHTÒTŠMJKˆX[˜YÙ\—ØÛÛXÝTÒTŠŒ
+KˆÝÜ™WÝ\HTÒTŠL
+KˆÜ\˜][™×ÚÝ\œÈTÒTŠMJKˆÝ]\ÈS•SJ	ØXÝ]™IË	Ú[˜XÝ]™IË	Ü[™[™ÉÊHQUS	ØXÝ]™IËˆÙÛ×Ý\›TÒTŠL
+KˆXØÙ\Ü×ÝÚÙ[ˆTÒTŠL
+HS’TUQKˆÝX™ÛXZ[ˆTÒTŠL
+HS’TUQKˆÛÛÙÛWÜ™]šY]×Ý\›TÒTŠL
+H•Sˆ™]Ø\™Ý\HTÒTŠMJHQUS	ÔÝÜ™H™]Ø\™Üˆ\ØÛÝ[	ËˆÛÛÙÛWÜ™]šY]×Û[ÙHS•SJ	Ü™]šY]×ÛÛ›IË	Ü™]Ø\™	ÊHQUS	Ü™]Ø\™	ËˆÜ™X]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆ
+BˆˆˆŠB‚ˆÈ‹ˆÝY™ˆX›BˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HQˆ“ÕVTÕÈÝY™ˆ
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆÝÜ™WÚYS•“Õ•Sˆš\œÝÛ˜[YHTÒTŠL
+H“Õ•Sˆ\ÝÛ˜[YHTÒTŠL
+H“Õ•Sˆ[XZ[TÒTŠMJKˆÛ™HTÒTŠŒ
+KˆÜÚ][ÛˆTÒTŠL
+KˆÝ×Ý\›Ó‘ÕVˆ›ÛHS•SJ	ÜÝY™‰Ë	ÛX[˜YÙ\‰Ë	ÜÝ\\š\ÛÜ‰ÊHQUS	ÜÝY™‰Ëˆ\™WÙ]HUKˆÝ]\ÈS•SJ	ØXÝ]™IË	Ú[˜XÝ]™IÊHQUS	ØXÝ]™IËˆÜ™X]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆ“Ô‘RQÓˆÑVH
+ÝÜ™WÚY
+H‘Q‘T‘SÑTÈÝÜ™\ÊY
+HÓˆSUHÐTÐÐQBˆ
+BˆˆˆŠB‚ˆÈËˆÝY™ˆÛÛ[Y[™][ÛœÈX›BˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HQˆ“ÕVTÕÈÝY™—ØÛÛ[Y[™][ÛœÈ
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆ™\ÜÛœÙWÚYS•“Õ•SˆÝY™—ÚYS•“Õ•Sˆ˜][™ÈS•QUSKˆÛÛ[Y[™][Û—Ý\HS•SJ	Ù^Ù[[ÜÙ\šXÙIË	ÙœšY[™WØ]]YIË	Ü›Ù™\ÜÚ[Û˜[	Ë	Ú[[	Ë	ÚÛ›ÝÛYÙXX›IÊHQUS	Ù^Ù[[ÜÙ\šXÙIËˆÛÛ[Y[VˆÜ™X]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆ“Ô‘RQÓˆÑVH
+™\ÜÛœÙWÚY
+H‘Q‘T‘SÑTÈ™\ÜÛœÙ\ÊY
+HÓˆSUHÐTÐÐQKˆ“Ô‘RQÓˆÑVH
+ÝY™—ÚY
+H‘Q‘T‘SÑTÈÝY™ŠY
+HÓˆSUHÐTÐÐQBˆ
+BˆˆˆŠB‚ˆÈˆ]Y\Ý[Û›˜Z\™\ÈX›BˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HQˆ“ÕVTÕÈ]Y\Ý[Û›˜Z\™\È
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆÝÜ™WÚYS••Sˆ]HTÒTŠMJH“Õ•Sˆ\×ØXÝ]™H“ÓÓPSˆQUS•QKˆ\×Ý[\]H“ÓÓPSˆQUSSÑKˆ[\]WÚYS••Sˆ™\œÚ[ÛˆS•QUSKˆÙÛ×Ý\›TÒTŠL
+KˆÜ™X]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆ
+BˆˆˆŠB‚ˆÈËˆ]Y\Ý[ÛœÈX›BˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HQˆ“ÕVTÕÈ]Y\Ý[ÛœÈ
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆ]Y\Ý[Û›˜Z\™WÚYS•“Õ•Sˆ]Y\Ý[Û—Ý^V“Õ•Sˆ]Y\Ý[Û—Ý\HS•SJ	Ü˜][™ÉË	Ý^	Ë	Û][\WØÚÚXÙIÊH“Õ•Sˆ\™Ù]ÜØÛÜHS•SJ	ÛÝ™\˜[	Ë	ÜÝY™‰Ë	ÛX[˜YÙ\‰ÊHQUS	ÛÝ™\˜[	ËˆZ[—ÛX™[TÒTŠMJHQUS	ÔÛÜ‰ËˆX^ÛX™[TÒTŠMJHQUS	Ñ^Ù[[	Ëˆ[Ý×ØÛÛ[Y[“ÓÓPSˆQUSSÑKˆ\×Ü™\]Z\™Y“ÓÓPSˆQUS•QKˆ]Y\Ý[Û—ÛÜ™\ˆS•QUSˆ\×ØXÝ]™H“ÓÓPSˆQUS•QKˆ\×Ý[\]H“ÓÓPSˆQUSSÑKˆ[\]WÚYS••Sˆ
+BˆˆˆŠB‚ˆÈˆ]Y\Ý[ÛˆÜ[ÛœÈX›BˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HQˆ“ÕVTÕÈ]Y\Ý[Û—ÛÜ[ÛœÈ
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆ]Y\Ý[Û—ÚYS•“Õ•SˆÜ[Û—Ý^TÒTŠMJH“Õ•Sˆ
+BˆˆˆŠB‚ˆÈKˆ™\ÜÛœÙ\ÈX›BˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HQˆ“ÕVTÕÈ™\ÜÛœÙ\È
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆ]Y\Ý[Û›˜Z\™WÚYS•“Õ•SˆÝÜ™WÚYS•“Õ•Sˆ\Ù\—Ù[XZ[TÒTŠMJKˆ™XÙZ\Û[X™\ˆTÒTŠL
+KˆÝX›Z]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆÝ]\ÈS•SJ	Ý[œ™\ÛÛ™Y	Ë	Ü™\ÛÛ™Y	ÊHQUS	Ý[œ™\ÛÛ™Y	Âˆ
+BˆˆˆŠB‚ˆÈ˜XÚÈ˜[œØXÝ[Ûˆ[X™\œÈÙ\\˜][HÛÈXXÚ™XÙZ\Ø[ˆÛ›BˆÈ™H\ÙYÛ˜ÙH\ˆÝÜ™K]™[ˆXÜ›ÜÜÈœ›ÝÜÙ\œÈÜˆÚ[][[™[Ý\È™\]Y\ÝË‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HQˆ“ÕVTÕÈ™XÙZ\Ý\ØYÙ\È
+ˆÝÜ™WÚYS•“Õ•Sˆ™XÙZ\Û[X™\ˆTÒTŠL
+H“Õ•Sˆ™\ÜÛœÙWÚYS••Sˆ\ÙYØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆ’SPT–HÑVH
+ÝÜ™WÚY™XÙZ\Û[X™\ŠKˆS‘VYÜ™XÙZ\Ý\ØYÙWÜ™\ÜÛœÙH
+™\ÜÛœÙWÚY
+Bˆ
+BˆˆˆŠB‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HQˆ“ÕVTÕÈÛØ˜[Ü™XÙZ\Ý\ØYÙ\È
+ˆ™XÙZ\Û[X™\ˆTÒTŠL
+H“Õ•S’SPT–HÑVKˆÝÜ™WÚYS•“Õ•Sˆ™\ÜÛœÙWÚYS••Sˆ\ÙYØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆS‘VYÙÛØ˜[Ü™XÙZ\Ü™\ÜÛœÙH
+™\ÜÛœÙWÚY
+Bˆ
+BˆˆˆŠB‚ˆÈ‹ˆ[œÝÙ\œÈX›BˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HQˆ“ÕVTÕÈ[œÝÙ\œÈ
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆ™\ÜÛœÙWÚYS•“Õ•Sˆ]Y\Ý[Û—ÚYS•“Õ•SˆÝY™—ÚYS••Sˆ[œÝÙ\—Ý^Vˆ˜][™×Ý˜[YHPÒSPS
+ËJBˆ
+BˆˆˆŠB‚ˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÈKKHTUHVTÕS‘ÈP“TÈ
+RQÔUSÓ”ÊHKKBˆˆÈ[œÝ\™H]Y\Ý[Û—ÛÜ[ÛœÈX›H^\ÝÈ
+š^[™ÈÜ˜\Ú[ˆX\Ý\—Ü]Y\Ý[Û›˜Z\™JBˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈP“TÈRÑH	Ü]Y\Ý[Û—ÛÜ[ÛœÉÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›Ê•X›H	Ü]Y\Ý[Û—ÛÜ[ÛœÉÈZ\ÜÚ[™ËˆÜ™X][™È]›ÝË‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“H]Y\Ý[Û—ÛÜ[ÛœÈ
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆ]Y\Ý[Û—ÚYS•“Õ•SˆÜ[Û—Ý^TÒTŠMJH“Õ•Sˆ
+BˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÈ[œÝ\™H™\ÜÛœÙ\ÈX›H^\ÝÂˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈP“TÈRÑH	Ü™\ÜÛœÙ\ÉÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›Ê•X›H	Ü™\ÜÛœÙ\ÉÈZ\ÜÚ[™ËˆÜ™X][™È]›ÝË‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“H™\ÜÛœÙ\È
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆ]Y\Ý[Û›˜Z\™WÚYS•“Õ•SˆÝÜ™WÚYS•“Õ•Sˆ\Ù\—Ù[XZ[TÒTŠMJKˆÝX›Z]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆÝ]\ÈS•SJ	Ý[œ™\ÛÛ™Y	Ë	Ü™\ÛÛ™Y	ÊHQUS	Ý[œ™\ÛÛ™Y	Âˆ
+BˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÈ[œÝ\™H[œÝÙ\œÈX›H^\ÝÂˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈP“TÈRÑH	Ø[œÝÙ\œÉÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›Ê•X›H	Ø[œÝÙ\œÉÈZ\ÜÚ[™ËˆÜ™X][™È]›ÝË‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“H[œÝÙ\œÈ
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆ™\ÜÛœÙWÚYS•“Õ•Sˆ]Y\Ý[Û—ÚYS•“Õ•Sˆ[œÝÙ\—Ý^Vˆ˜][™×Ý˜[YHPÒSPS
+ËJBˆ
+BˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÈÚXÚÈ›Üˆ™\ÜÛœÙ\ÈX›HÛÛ[[œÂˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH™\ÜÛœÙ\ÈRÑH	Ý\Ù\—Ù[XZ[	ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÝ\œÛÜ‹™^XÝ]JSTˆP“H™\ÜÛœÙ\ÈQÓÓSSˆ\Ù\—Ù[XZ[TÒTŠMJHQ•TˆÝX›Z]YØ]ŠBˆˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH™\ÜÛœÙ\ÈRÑH	ÜÝ]\ÉÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÝ\œÛÜ‹™^XÝ]JSTˆP“H™\ÜÛœÙ\ÈQÓÓSSˆÝ]\ÈS•SJ	Ý[œ™\ÛÛ™Y	Ë	Ü™\ÛÛ™Y	ÊHQUS	Ý[œ™\ÛÛ™Y	ÈQ•Tˆ\Ù\—Ù[XZ[ŠBˆˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH™\ÜÛœÙ\ÈRÑH	Ú\×Ü™XY	ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÝ\œÛÜ‹™^XÝ]JSTˆP“H™\ÜÛœÙ\ÈQÓÓSSˆ\×Ü™XY“ÓÓPSˆQUSSÑHQ•TˆÝ]\ÈŠBˆˆÈ[œÝ\™HÞ\Ý[WÛ›ÝYšXØ][ÛœÈX›H^\ÝÂˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈP“TÈRÑH	ÜÞ\Ý[WÛ›ÝYšXØ][ÛœÉÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›Ê•X›H	ÜÞ\Ý[WÛ›ÝYšXØ][ÛœÉÈZ\ÜÚ[™ËˆÜ™X][™È]›ÝË‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HÞ\Ý[WÛ›ÝYšXØ][ÛœÈ
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆY\ÜØYÙHV“Õ•Sˆ\HTÒTŠL
+HQUS	Ú[™›ÉËˆÜ™X]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆ\×Ü™XY“ÓÓPSˆQUSSÑBˆ
+BˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÈÜ™X]H]Y]ÙÈX›BˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈP“TÈRÑH	Ø]Y]ÛÙÜÉÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊÜ™X][™È]Y]ÛÙÜÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“H]Y]ÛÙÜÈ
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆ[]WÝ\HTÒTŠL
+H“Õ•Sˆ[]WÚYS•“Õ•SˆXÝ[ÛˆTÒTŠL
+H“Õ•SˆÛÝ˜[Y\ÈVˆ™]×Ý˜[Y\ÈVˆ\Ù\—ÚYTÒTŠMJKˆÜ™X]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆ
+BˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÈÜ™X]HÛY[ØÛÛ™\œØ][ÛœÈX›H›ÜˆY\ÜØYÚ[™ÈÞ\Ý[BˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈP“TÈRÑH	ØÛY[ØÛÛ™\œØ][ÛœÉÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊÜ™X][™ÈÛY[ØÛÛ™\œØ][ÛœÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HÛY[ØÛÛ™\œØ][ÛœÈ
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆÛY[ÚY[YšY\ˆTÒTŠMJH“Õ•SS’TUQKˆÛÛ\[žWÛ˜[YHTÒTŠMJKˆXÙ[œÙWÚÙ^HTÒTŠMJKˆÛÛXÝÙ[XZ[TÒTŠMJKˆÜ[ØÛÛ™\œØ][Û—ÚYS••Sˆ\ÝÛY\ÜØYÙWØ]SQTÕST•Sˆ\ÝÛY\ÜØYÙWÜ™]šY]ÈV•Sˆ[œ™XYØÛÝ[S•QUSˆÜ™X]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆ\]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTÓˆTUHÕT”‘S•ÕSQTÕSTˆS‘VYØÛY[ÚY[YšY\ˆ
+ÛY[ÚY[YšY\ŠKˆS‘VYÛ\ÝÛY\ÜØYÙWØ]
+\ÝÛY\ÜØYÙWØ]
+Bˆ
+BˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ[ÙN‚ˆÈÚXÚÈYˆÜ[ØÛÛ™\œØ][Û—ÚYÛÛ[[ˆ^\ÝËYYˆZ\ÜÚ[™ÂˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓHÛY[ØÛÛ™\œØ][ÛœÈRÑH	ÜÜ[ØÛÛ™\œØ][Û—ÚY	ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	ÜÜ[ØÛÛ™\œØ][Û—ÚY	ÈÛÛ[[ˆÈÛY[ØÛÛ™\œØ][ÛœÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“HÛY[ØÛÛ™\œØ][ÛœÈQÓÓSSˆÜ[ØÛÛ™\œØ][Û—ÚYS••SQ•TˆÛÛXÝÙ[XZ[ŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÈÜ™X]HY\ÜØYÙ\ÈX›H›Üˆ[™]šYX[Y\ÜØYÙ\È[ˆÛÛ™\œØ][ÛœÂˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈP“TÈRÑH	ØÛY[ÛY\ÜØYÙ\ÉÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊÜ™X][™ÈÛY[ÛY\ÜØYÙ\ÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HÛY[ÛY\ÜØYÙ\È
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆÛÛ™\œØ][Û—ÚYS•“Õ•SˆÙ[™\—Ý\HS•SJ	ØÛY[	Ë	ØYZ[‰ÊH“Õ•SˆÙ[™\—Û˜[YHTÒTŠMJKˆY\ÜØYÙHV“Õ•Sˆ\×Ü™XY“ÓÓPSˆQUSSÑKˆÜ™X]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆ“Ô‘RQÓˆÑVH
+ÛÛ™\œØ][Û—ÚY
+H‘Q‘T‘SÑTÈÛY[ØÛÛ™\œØ][ÛœÊY
+HÓˆSUHÐTÐÐQKˆS‘VYØÛÛ™\œØ][Û—ØÜ™X]Y
+ÛÛ™\œØ][Û—ÚYÜ™X]YØ]
+Bˆ
+BˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÈÜ™X]H\Ù\œÈX›BˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈP“TÈRÑH	Ý\Ù\œÉÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊÜ™X][™È\Ù\œÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“H\Ù\œÈ
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆ\Ù\›˜[YHTÒTŠL
+H“Õ•SS’TUQKˆ[XZ[TÒTŠMJH“Õ•SS’TUQKˆ\ÜÝÛÜ™Ú\ÚTÒTŠMJH“Õ•Sˆ›ÛHS•SJ	ÜÝ\\˜YZ[‰Ë	ØYZ[‰Ë	Ý\Ù\‰ÊHQUS	ØYZ[‰Ëˆ\×ØXÝ]™H“ÓÓPSˆQUS•QKˆÜ™X]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆ\]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTÓˆTUHÕT”‘S•ÕSQTÕSTˆ
+BˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÈÜ™X]HXÙ[œÙWØÛÛ™šYÈX›BˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈP“TÈRÑH	ÛXÙ[œÙWØÛÛ™šYÉÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊÜ™X][™ÈXÙ[œÙWØÛÛ™šYÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HXÙ[œÙWØÛÛ™šYÈ
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆXÙ[œÙWÚÙ^HTÒTŠMJH“Õ•Sˆ\WÚÙ^HTÒTŠMJH“Õ•SˆXÙ[œÚ[™×ÜÜ[Ý\›TÒTŠMJHQUS	ÚÎ‹ËÙ™YY˜XÚÛXÙ[œÚ[™Ë\›ÙXÝ[Û‹XÎLÎ\œ˜Z[Ø^K˜\	ËˆÜ™X]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆ\]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTÓˆTUHÕT”‘S•ÕSQTÕSTˆ
+BˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÈÜ[Û˜[Û™K][YH›ÛÝÝ˜\ˆ™]™\ˆÚ\HY˜][\ÜÝÛÜ™‚ˆ›ÛÝÝ˜\Ý\Ù\›˜[YHHÜË™Ù][Š“ÓÕÕTÐQRS—ÕTÑT“SQHŠBˆ›ÛÝÝ˜\Ù[XZ[HÜË™Ù][Š“ÓÕÕTÐQRS—ÑSPRSŠBˆ›ÛÝÝ˜\Ü\ÜÝÛÜ™HÜË™Ù][Š“ÓÕÕTÐQRS—ÔTÔÕÓÔ‘ŠBˆYˆ›ÛÝÝ˜\Ý\Ù\›˜[YH[™›ÛÝÝ˜\Ù[XZ[[™›ÛÝÝ˜\Ü\ÜÝÛÜ™‚ˆ\ÜÝÛÜ™Ú\ÚH˜Üž\š\ÚÊ›ÛÝÝ˜\Ü\ÜÝÛÜ™™[˜ÛÙJ	Ý]‹N	ÊK˜Üž\™Ù[œØ[
+
+JK™XÛÙJ	Ý]‹N	ÊBˆÝ\œÛÜ‹™^XÝ]Jˆ’S”ÑT•S•È\Ù\œÈ
+\Ù\›˜[YK[XZ[\ÜÝÛÜ™Ú\Ú›ÛJHSQTÈ
+	\Ë	\Ë	\Ë	\ÊH‹ˆ
+›ÛÝÝ˜\Ý\Ù\›˜[YK›ÛÝÝ˜\Ù[XZ[\ÜÝÛÜ™Ú\ÚœÝ\\˜YZ[ˆŠBˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÙÙÙ\‹š[™›ÊÜ™X]Y›ÛÝÝ˜\Ý\\˜YZ[ˆ\Ù\ˆœ›ÛH[š\›Û›Y[ŠBˆ[ÙN‚ˆÙÙÙ\‹Ø\›š[™Ê•\Ù\œÈX›HÜ™X]YÚ]Ý]H›ÛÝÝ˜\YZ[ŽÈÛÛ™šYÝ\™H“ÓÕÕTÐQRS—Êˆ˜\šXX›\ÈYˆ\È\ÈH™]È[œÝ[][ÛˆŠBˆˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆÈ›ÛHY\˜\˜ÚHZYÜ˜][Ûˆ
+YØXÞHOˆ™]ÊN‚ˆÈ]ˆOˆÝ\\˜YZ[ˆ
+[\›˜[Ù[XØÙ\ÜÊBˆÈYZ[ˆOˆÝ\\˜YZ[ˆ
+YØXÞHYZ[ˆY[XØÙ\ÜÈÛÊBˆÈ\Ù\ˆOˆYZ[ˆ
+	ØYZ[‰È\È›ÝÈHÛY[›ÛJBˆÈ\Ù\ˆ
+™]ÊHšY]Ë[Û›H
+›È›ÝÜÈY]
+BˆÈKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKBˆžN‚ˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH\Ù\œÈRÑH	Ü›ÛIÈŠBˆ›ÛWØÛÛHÝ\œÛÜ‹™™]ÚÛ™J
+Bˆ›ÛWÝ\HH
+›ÛWØÛÛÌWHYˆ›ÛWØÛÛ[ÙH	ÉÊHÜˆ	ÉÂˆ™YY×ÛZYÜ˜][ÛˆH	Ù]‰È[ˆ›ÛWÝ\K›ÝÙ\Š
+BˆYˆ™YY×ÛZYÜ˜][ÛŽ‚ˆÙÙÙ\‹š[™›Ê“ZYÜ˜][™È\Ù\ˆ›Û\ÈÈ™]ÈY\˜\˜ÚH
+Ý\\˜YZ[‹ØYZ[‹Ý\Ù\ŠK‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JˆSTˆP“H\Ù\œÈSÑQ–HÓÓSSˆ›ÛH‚ˆ‘S•SJ	Ù]‰Ë	ÜÝ\\˜YZ[‰Ë	ØYZ[‰Ë	Ý\Ù\‰ÊHQUS	Ý\Ù\‰È‚ˆ
+BˆÝ\œÛÜ‹™^XÝ]J•TUH\Ù\œÈÑU›ÛOIÜÝ\\˜YZ[‰ÈÒT‘H›ÛHSˆ
+	Ù]‰Ë	ØYZ[‰ÊHŠBˆÝ\œÛÜ‹™^XÝ]J•TUH\Ù\œÈÑU›ÛOIØYZ[‰ÈÒT‘H›ÛOIÝ\Ù\‰ÈŠBˆÝ\œÛÜ‹™^XÝ]JˆSTˆP“H\Ù\œÈSÑQ–HÓÓSSˆ›ÛH‚ˆ‘S•SJ	ÜÝ\\˜YZ[‰Ë	ØYZ[‰Ë	Ý\Ù\‰ÊHQUS	ØYZ[‰È‚ˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÙÙÙ\‹š[™›Ê”›ÛHZYÜ˜][ÛˆÛÛ\]KˆŠBˆ[ÙN‚ˆÈY™[œÚ]™Nˆ]™[ˆYˆS•SH\È\]ËY]Kš^[žHÝ˜YÙÛ\œÈÚ]›ÛOIÙ]‰ÂˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕÓÕS•
+
+ŠH”“ÓH\Ù\œÈÒT‘H›ÛOIÙ]‰ÈŠBˆYÝ™\ˆHÝ\œÛÜ‹™™]ÚÛ™J
+VÌBˆYˆYÝ™\Ž‚ˆÙÙÙ\‹Ø\›š[™Êˆ‘›Ý[™ÛYÝ™\ŸHYØXÞH	Ù]‰È\Ù\ŠÊNÈ›Û[Ý[™ÈÈÝ\\˜YZ[‹ˆŠBˆÝ\œÛÜ‹™^XÝ]J•TUH\Ù\œÈÑU›ÛOIÜÝ\\˜YZ[‰ÈÒT‘H›ÛOIÙ]‰ÈŠBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ”›ÛHZYÜ˜][Ûˆ\œ›ÜŽˆÙ_HŠB‚ˆÈÜ™X]H\Ù\—ÜÝÜ™\È[šÈX›H›Üˆ\‹\ÝÜ™HšY]Ë[Û›H\ÜÚYÛ›Y[ÂˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈP“TÈRÑH	Ý\Ù\—ÜÝÜ™\ÉÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊÜ™X][™È\Ù\—ÜÝÜ™\ÈX›H›Üˆ\‹\ÝÜ™HšY]Ë[Û›HXØÙ\ÜË‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“H\Ù\—ÜÝÜ™\È
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆ\Ù\—ÚYS•“Õ•SˆÝÜ™WÚYS•“Õ•SˆÜ™X]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆS’TUQHÑVH[š\WÝ\Ù\—ÜÝÜ™H
+\Ù\—ÚYÝÜ™WÚY
+Kˆ“Ô‘RQÓˆÑVH
+\Ù\—ÚY
+H‘Q‘T‘SÑTÈ\Ù\œÊY
+HÓˆSUHÐTÐÐQKˆ“Ô‘RQÓˆÑVH
+ÝÜ™WÚY
+H‘Q‘T‘SÑTÈÝÜ™\ÊY
+HÓˆSUHÐTÐÐQBˆ
+BˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÈÚXÚÈ›Üˆ\Ù\œÈX›HÛÛ[[œÈHYX^ÜÝÜ™\È[™XÙ[œÙWÚÙ^H›ÜˆÛY[XÙ[œÚ[™ÂˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH\Ù\œÈRÑH	ÛX^ÜÝÜ™\ÉÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	ÛX^ÜÝÜ™\ÉÈÛÛ[[ˆÈ\Ù\œÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H\Ù\œÈQÓÓSSˆX^ÜÝÜ™\ÈS•QUSQ•Tˆ›ÛHŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH\Ù\œÈRÑH	ÛXÙ[œÙWÚÙ^IÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	ÛXÙ[œÙWÚÙ^IÈÛÛ[[ˆÈ\Ù\œÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H\Ù\œÈQÓÓSSˆXÙ[œÙWÚÙ^HTÒTŠMJH•SQ•TˆX^ÜÝÜ™\ÈŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HQˆ“ÕVTÕÈ™]šY]×Ü™]Ø\™È
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆ™\ÜÛœÙWÚYS•“Õ•SS’TUQKˆÝÜ™WÚYS•“Õ•SˆÝÛ™\—Ý\Ù\—ÚYS•“Õ•SˆXÙ[œÙWÚÙ^HTÒTŠMJKˆÝ\ÝÛY\—Ù[XZ[TÒTŠMJH“Õ•SˆÛZ[WÝÚÙ[ˆTÒTŠL
+H“Õ•SS’TUQKˆ™]Ø\™ØÛÙHTÒTŠ
+HS’TUQKˆ™]Ø\™Ý\HTÒTŠMJH“Õ•SˆÝ]\ÈS•SJ	Ü[™[™ÉË	Ú\ÜÝYY	Ë	Ý\ÙY	ÊHQUS	Ü[™[™ÉËˆ[XZ[ÜÙ[“ÓÓPSˆQUSSÑKˆ[XZ[Ù\œ›ÜˆV•SˆÛÛÙÛWÜ™]šY]×Ü›ÛÙˆQQUSUV•Sˆ™XÙZ\Ü›ÛÙˆQQUSUV•Sˆ™]šY]×ÛØÜ—Ý^V•Sˆ™XÙZ\ÛØÜ—Ý^V•Sˆ›ÛÙ—Ý™\šYšYYØ]SQTÕST•SˆÜ™X]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTˆ\ÜÝYYØ]SQTÕST•Sˆ\ÙYØ]SQTÕST•Sˆ“Ô‘RQÓˆÑVH
+™\ÜÛœÙWÚY
+H‘Q‘T‘SÑTÈ™\ÜÛœÙ\ÊY
+HÓˆSUHÐTÐÐQKˆ“Ô‘RQÓˆÑVH
+ÝÜ™WÚY
+H‘Q‘T‘SÑTÈÝÜ™\ÊY
+HÓˆSUHÐTÐÐQKˆ“Ô‘RQÓˆÑVH
+ÝÛ™\—Ý\Ù\—ÚY
+H‘Q‘T‘SÑTÈ\Ù\œÊY
+HÓˆSUHÐTÐÐQKˆS‘VYÜ™]Ø\™Ý[˜[
+ÝÛ™\—Ý\Ù\—ÚYXÙ[œÙWÚÙ^KÝ]\ÊBˆ
+BˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆ›ÜˆÛÛ[[—Û˜[YKÛÛ[[—ÙYš[š][Ûˆ[ˆ
+ˆ
+™ÛÛÙÛWÜ™]šY]×Ü›ÛÙˆ‹“QQUSUV•SŠKˆ
+œ™XÙZ\Ü›ÛÙˆ‹“QQUSUV•SŠKˆ
+œ™]šY]×ÛØÜ—Ý^‹•V•SŠKˆ
+œ™XÙZ\ÛØÜ—Ý^‹•V•SŠKˆ
+œ›ÛÙ—Ý™\šYšYYØ]‹•SQTÕST•SŠKˆ
+N‚ˆÝ\œÛÜ‹™^XÝ]Jˆ”ÒÕÈÓÓSS”È”“ÓH™]šY]×Ü™]Ø\™ÈRÑH	ÞØÛÛ[[—Û˜[Y_IÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÝ\œÛÜ‹™^XÝ]JˆSTˆP“H™]šY]×Ü™]Ø\™ÈQÓÓSSˆØÛÛ[[—Û˜[Y_HØÛÛ[[—ÙYš[š][ÛŸHŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÈÚXÚÈ›Üˆ]Y\Ý[Û›˜Z\™\ÈX›HÛÛ[[œÂˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH]Y\Ý[Û›˜Z\™\ÈRÑH	Ú\×Ý[\]IÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	Ú\×Ý[\]IÈÛÛ[[ˆÈ]Y\Ý[Û›˜Z\™\ÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[Û›˜Z\™\ÈQÓÓSSˆ\×Ý[\]H“ÓÓPSˆQUSSÑHQ•Tˆ\×ØXÝ]™HŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH]Y\Ý[Û›˜Z\™\ÈRÑH	Ý[\]WÚY	ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	Ý[\]WÚY	ÈÛÛ[[ˆÈ]Y\Ý[Û›˜Z\™\ÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[Û›˜Z\™\ÈQÓÓSSˆ[\]WÚYS••SQ•Tˆ\×Ý[\]HŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH]Y\Ý[Û›˜Z\™\ÈRÑH	Ý™\œÚ[Û‰ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	Ý™\œÚ[Û‰ÈÛÛ[[ˆÈ]Y\Ý[Û›˜Z\™\ÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[Û›˜Z\™\ÈQÓÓSSˆ™\œÚ[ÛˆS•QUSHQ•Tˆ[\]WÚYŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH]Y\Ý[Û›˜Z\™\ÈRÑH	ÛÙÛ×Ý\›	ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	ÛÙÛ×Ý\›	ÈÛÛ[[ˆÈ]Y\Ý[Û›˜Z\™\ÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[Û›˜Z\™\ÈQÓÓSSˆÙÛ×Ý\›Ó‘ÕVQ•Tˆ™\œÚ[ÛˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ[ÙN‚ˆÈ[Ø^\ÈžHÈ\]HÈÓ‘ÕVÈ[œÝ\™H]Ø[ˆ[™H˜\ÙM]BˆžN‚ˆÙÙÙ\‹š[™›Ê‘[œÝ\š[™È	ÛÙÛ×Ý\›	ÈÛÛ[[ˆ\ÈÓ‘ÕV›Üˆ˜\ÙMÝÜ˜YÙK‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[Û›˜Z\™\ÈSÑQ–HÓÓSSˆÙÛ×Ý\›Ó‘ÕVŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÙÙÙ\‹š[™›Ê‰ÛÙÛ×Ý\›	ÈÛÛ[[ˆ\]YÈÓ‘ÕVŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹š[™›ÊˆÛÛ[[ˆX^H[™XYH™HÓ‘ÕVˆÙ_HŠB‚ˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH]Y\Ý[Û›˜Z\™\ÈRÑH	ÛÝÛ™\—Ý\Ù\—ÚY	ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È[˜[ÝÛ™\ˆÈ]Y\Ý[Û›˜Z\™\Ë‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[Û›˜Z\™\ÈQÓÓSSˆÝÛ™\—Ý\Ù\—ÚYS••SQ•TˆÝÜ™WÚYŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH]Y\Ý[Û›˜Z\™\ÈRÑH	ÛXÙ[œÙWÚÙ^IÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™ÈXÙ[œÙHØÛÜHÈ]Y\Ý[Û›˜Z\™\Ë‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[Û›˜Z\™\ÈQÓÓSSˆXÙ[œÙWÚÙ^HTÒTŠMJH•SQ•TˆÝÛ™\—Ý\Ù\—ÚYŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÔ‘PUHP“HQˆ“ÕVTÕÈ[˜[Øœ˜[™[™È
+ˆYS•UU×ÒSÔ‘SQS•’SPT–HÑVKˆÝÛ™\—Ý\Ù\—ÚYS•“Õ•SˆØÛÜWÚÙ^HTÒTŠMJH“Õ•SS’TUQKˆXÙ[œÙWÚÙ^HTÒTŠMJH•Sˆš[X\žWØÛÛÜˆTÒTŠÊH“Õ•SQUS	ÈÌPŒQMÍ‰ËˆÙXÛÛ™\žWØÛÛÜˆTÒTŠÊH“Õ•SQUS	ÈÑÎÌL‰ËˆXØÙ[ØÛÛÜˆTÒTŠÊH“Õ•SQUS	ÈÑÎÌL‰Ëˆ^ØÛÛÜˆTÒTŠÊH“Õ•SQUS	ÈÌŒLLŽIËˆ\]YØ]SQTÕSTQUSÕT”‘S•ÕSQTÕSTÓˆTUHÕT”‘S•ÕSQTÕSTˆ“Ô‘RQÓˆÑVH
+ÝÛ™\—Ý\Ù\—ÚY
+H‘Q‘T‘SÑTÈ\Ù\œÊY
+HÓˆSUHÐTÐÐQBˆ
+BˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÈÚXÚÈ›Üˆ]Y\Ý[ÛœÈX›HÛÛ[[œÂˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH]Y\Ý[ÛœÈRÑH	Ú\×ØXÝ]™IÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[ÛœÈQÓÓSSˆ\×ØXÝ]™H“ÓÓPSˆQUS•QHQ•Tˆ]Y\Ý[Û—ÛÜ™\ˆŠBˆˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH]Y\Ý[ÛœÈRÑH	Ú\×Ý[\]IÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	Ú\×Ý[\]IÈÛÛ[[ˆÈ]Y\Ý[ÛœÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[ÛœÈQÓÓSSˆ\×Ý[\]H“ÓÓPSˆQUSSÑHQ•Tˆ\×ØXÝ]™HŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH]Y\Ý[ÛœÈRÑH	Ý[\]WÚY	ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	Ý[\]WÚY	ÈÛÛ[[ˆÈ]Y\Ý[ÛœÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[ÛœÈQÓÓSSˆ[\]WÚYS••SQ•Tˆ\×Ý[\]HŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH]Y\Ý[ÛœÈRÑH	ÛZ[—ÛX™[	ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	ÛZ[—ÛX™[	ÈÛÛ[[ˆÈ]Y\Ý[ÛœÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[ÛœÈQÓÓSSˆZ[—ÛX™[TÒTŠMJHQUS	ÔÛÜ‰ÈQ•Tˆ]Y\Ý[Û—Ý\HŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH]Y\Ý[ÛœÈRÑH	ÛX^ÛX™[	ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	ÛX^ÛX™[	ÈÛÛ[[ˆÈ]Y\Ý[ÛœÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[ÛœÈQÓÓSSˆX^ÛX™[TÒTŠMJHQUS	Ñ^Ù[[	ÈQ•TˆZ[—ÛX™[ŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH]Y\Ý[ÛœÈRÑH	Ø[Ý×ØÛÛ[Y[	ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	Ø[Ý×ØÛÛ[Y[	ÈÛÛ[[ˆÈ]Y\Ý[ÛœÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[ÛœÈQÓÓSSˆ[Ý×ØÛÛ[Y[“ÓÓPSˆQUSSÑHQ•TˆX^ÛX™[ŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH]Y\Ý[ÛœÈRÑH	Ý\™Ù]ÜØÛÜIÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È]Y\Ý[Ûˆ\™Ù]ØÛÜK‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H]Y\Ý[ÛœÈQÓÓSSˆ\™Ù]ÜØÛÜHS•SJ	ÛÝ™\˜[	Ë	ÜÝY™‰Ë	ÛX[˜YÙ\‰ÊHQUS	ÛÝ™\˜[	ÈQ•Tˆ]Y\Ý[Û—Ý\HŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓHÝY™ˆRÑH	ÜÝ×Ý\›	ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™ÈÝY™ˆ›Ùš[HÝË‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“HÝY™ˆQÓÓSSˆÝ×Ý\›Ó‘ÕVQ•TˆÜÚ][ÛˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH[œÝÙ\œÈRÑH	ÜÝY™—ÚY	ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™ÈÙ[XÝYÝY™ˆÈ]Y\Ý[Û›˜Z\™H[œÝÙ\œË‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H[œÝÙ\œÈQÓÓSSˆÝY™—ÚYS••SQ•Tˆ]Y\Ý[Û—ÚYŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÈÚXÚÈ›ÜˆÝÜ™\ÈX›HÛÛ[[œÂˆÝÜ™WØÛÛ[[œÈHÂˆ
+œÝÜ™WÛX[˜YÙ\—Û˜[YH‹•TÒTŠMJHŠKˆ
+›X[˜YÙ\—ØÛÛXÝ‹•TÒTŠŒ
+HŠKˆ
+œÝÜ™WÝ\H‹•TÒTŠL
+HŠKˆ
+›Ü\˜][™×ÚÝ\œÈ‹•TÒTŠMJHŠKˆ
+œÝ]\È‹‘S•SJ	ØXÝ]™IË	Ú[˜XÝ]™IË	Ü[™[™ÉÊHQUS	ØXÝ]™IÈŠKˆ
+›ÙÛ×Ý\›‹•TÒTŠL
+HŠKˆ
+˜XØÙ\Ü×ÝÚÙ[ˆ‹•TÒTŠL
+HS’TUQHŠKˆ
+œÝX™ÛXZ[ˆ‹•TÒTŠL
+HS’TUQHŠKˆ
+\Ù\—ÚY‹’S•ŠKˆ
+›XÙ[œÙWÚÙ^H‹•TÒTŠMJHŠKˆ
+™ÛÛÙÛWÜ™]šY]×Ý\›‹•TÒTŠL
+H•SŠKˆ
+œ™]Ø\™Ý\H‹•TÒTŠMJHQUS	ÔÝÜ™H™]Ø\™Üˆ\ØÛÝ[	ÈŠKˆ
+™ÛÛÙÛWÜ™]šY]×Û[ÙH‹‘S•SJ	Ü™]šY]×ÛÛ›IË	Ü™]Ø\™	ÊHQUS	Ü™]Ø\™	ÈŠBˆBˆˆ›ÜˆÛÛ[[—Û˜[YKÛÛ[[—Ý\H[ˆÝÜ™WØÛÛ[[œÎ‚ˆÝ\œÛÜ‹™^XÝ]Jˆ”ÒÕÈÓÓSS”È”“ÓHÝÜ™\ÈRÑH	ÞØÛÛ[[—Û˜[Y_IÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊˆY[™ÈÛÛ[[ˆØÛÛ[[—Û˜[Y_HÈÝÜ™\ÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JˆSTˆP“HÝÜ™\ÈQÓÓSSˆØÛÛ[[—Û˜[Y_HØÛÛ[[—Ý\_HŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÙÙÙ\‹š[™›ÊˆÛÛ[[ˆØÛÛ[[—Û˜[Y_HYYÝXØÙ\ÜÙ[HŠB‚ˆžN‚ˆÝ\œÛÜ‹™^XÝ]JSTˆP“HÝÜ™\ÈSÑQ–HÓÓSSˆÙÛ×Ý\›Ó‘ÕVŠBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹š[™›Êˆ”ÝÜ™HÙÛÈÛÛ[[ˆX^H[™XYH™HÓ‘ÕVˆÙ_HŠB‚ˆÈ\ÜÚYÛˆ\Ù\—ÚYÈ^\Ý[™ÈÝÜ™\È]Û‰Ý]™H]ˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕY”“ÓHÝÜ™\ÈÒT‘H\Ù\—ÚYTÈ•SŠBˆÝÜ™\×ÝÚ]Ý]Ý\Ù\ˆHÝ\œÛÜ‹™™]Ú[
+
+BˆYˆÝÜ™\×ÝÚ]Ý]Ý\Ù\Ž‚ˆÙÙÙ\‹š[™›Êˆ\ÜÚYÛš[™È\Ù\—ÚYÈÛ[ŠÝÜ™\×ÝÚ]Ý]Ý\Ù\Š_H^\Ý[™ÈÝÜ™\Ë‹‹ˆŠBˆÈÙ]Hš\œÝYZ[‹Ù]ˆ\Ù\ˆÈ\ÜÚYÛˆ\ÈÝÛ™\‚ˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕY”“ÓH\Ù\œÈÒT‘H›ÛHH	ÜÝ\\˜YZ[‰ÈSRUHŠBˆYZ[—Ý\Ù\ˆHÝ\œÛÜ‹™™]ÚÛ™J
+BˆYˆYZ[—Ý\Ù\Ž‚ˆYZ[—ÚYHYZ[—Ý\Ù\–ÌBˆ›ÜˆÝÜ™WÜ›ÝÈ[ˆÝÜ™\×ÝÚ]Ý]Ý\Ù\Ž‚ˆÝÜ™WÚYHÝÜ™WÜ›ÝÖÌBˆÝ\œÛÜ‹™^XÝ]J•TUHÝÜ™\ÈÑU\Ù\—ÚYH	\ÈÒT‘HYH	\È‹
+YZ[—ÚYÝÜ™WÚY
+JBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÙÙÙ\‹š[™›Êˆ\ÜÚYÛ™YÛ[ŠÝÜ™\×ÝÚ]Ý]Ý\Ù\Š_HÝÜ™\ÈÈ\Ù\ˆØYZ[—ÚYHŠBˆ[ÙN‚ˆÙÙÙ\‹Ø\›š[™Ê“›ÈYZ[ˆ\Ù\ˆ›Ý[™È\ÜÚYÛˆ^\Ý[™ÈÝÜ™\ÈÈŠB‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆ•TUHÝÜ™\ÈÂˆS“‘Tˆ“ÒSˆ\Ù\œÈHÓˆKšYHË\Ù\—ÚYˆÑUË›XÙ[œÙWÚÙ^HHK›XÙ[œÙWÚÙ^BˆÒT‘HË›XÙ[œÙWÚÙ^HTÈ•SS‘K›XÙ[œÙWÚÙ^HTÈ“Õ•SˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÈÙ[™\˜]HXØÙ\ÜÈÚÙ[œÈ›Üˆ^\Ý[™ÈÝÜ™\È]Û‰Ý]™H[Bˆ[\ÜÙXÜ™]ÂˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕY”“ÓHÝÜ™\ÈÒT‘HXØÙ\Ü×ÝÚÙ[ˆTÈ•SÔˆXØÙ\Ü×ÝÚÙ[ˆH	ÉÈŠBˆÝÜ™\×ÝÚ]Ý]ÝÚÙ[ˆHÝ\œÛÜ‹™™]Ú[
+
+BˆYˆÝÜ™\×ÝÚ]Ý]ÝÚÙ[Ž‚ˆÙÙÙ\‹š[™›Êˆ‘Ù[™\˜][™ÈXØÙ\ÜÈÚÙ[œÈ›ÜˆÛ[ŠÝÜ™\×ÝÚ]Ý]ÝÚÙ[Š_H^\Ý[™ÈÝÜ™\Ë‹‹ˆŠBˆ›ÜˆÝÜ™WÜ›ÝÈ[ˆÝÜ™\×ÝÚ]Ý]ÝÚÙ[Ž‚ˆÝÜ™WÚYHÝÜ™WÜ›ÝÖÌBˆXØÙ\Ü×ÝÚÙ[ˆHÙXÜ™]ËÚÙ[—Ý\›ØY™JÌŠBˆÝ\œÛÜ‹™^XÝ]J•TUHÝÜ™\ÈÑUXØÙ\Ü×ÝÚÙ[ˆH	\ÈÒT‘HYH	\È‹
+XØÙ\Ü×ÝÚÙ[‹ÝÜ™WÚY
+JBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÈÙ[™\˜]HÝX™ÛXZ[œÈ›Üˆ^\Ý[™ÈÝÜ™\È]Û‰Ý]™H[BˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕYÝÜ™WÛ˜[YH”“ÓHÝÜ™\ÈÒT‘HÝX™ÛXZ[ˆTÈ•SÔˆÝX™ÛXZ[ˆH	ÉÈŠBˆÝÜ™\×ÝÚ]Ý]ÜÝX™ÛXZ[ˆHÝ\œÛÜ‹™™]Ú[
+
+BˆYˆÝÜ™\×ÝÚ]Ý]ÜÝX™ÛXZ[Ž‚ˆÙÙÙ\‹š[™›Êˆ‘Ù[™\˜][™ÈÝX™ÛXZ[œÈ›ÜˆÛ[ŠÝÜ™\×ÝÚ]Ý]ÜÝX™ÛXZ[Š_H^\Ý[™ÈÝÜ™\Ë‹‹ˆŠBˆ›ÜˆÝÜ™WÜ›ÝÈ[ˆÝÜ™\×ÝÚ]Ý]ÜÝX™ÛXZ[Ž‚ˆÝÜ™WÚYHÝÜ™WÜ›ÝÖÌBˆÝÜ™WÛ˜[YHHÝÜ™WÜ›ÝÖÌWBˆÈÙ[™\˜]HÝX™ÛXZ[ˆœ›ÛHÝÜ™H˜[YH
+ÝÙ\˜Ø\ÙK[[[Y\šXË\[œÊBˆ[\Ü™BˆÝX™ÛXZ[ˆH™KœÝXŠ‰Ö×˜K^KVŒNW×IË	ÉËÝÜ™WÛ˜[YJK›ÝÙ\Š
+Kœ™\XÙJ	È	Ë	ËIÊBˆÝX™ÛXZ[ˆH™KœÝXŠ‰ËJÉË	ËIËÝX™ÛXZ[ŠKœÝš\
+	ËIÊBˆÈ[œÝ\™H[š\]Y[™\ÜÈžHY[™È˜[™ÛHÝY™š^Yˆ™YYYˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕY”“ÓHÝÜ™\ÈÒT‘HÝX™ÛXZ[ˆH	\È‹
+ÝX™ÛXZ[‹
+JBˆYˆÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÝX™ÛXZ[ˆHˆžÜÝX™ÛXZ[ŸK^ÜÙXÜ™]ËÚÙ[—Ú^
+Ê_H‚ˆÝ\œÛÜ‹™^XÝ]J•TUHÝÜ™\ÈÑUÝX™ÛXZ[ˆH	\ÈÒT‘HYH	\È‹
+ÝX™ÛXZ[‹ÝÜ™WÚY
+JBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÈÚXÚÈ›Üˆ™\ÜÛœÙ\ÈX›H™XÙZ\Û[X™\ˆÛÛ[[‚ˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓH™\ÜÛœÙ\ÈRÑH	Ü™XÙZ\Û[X™\‰ÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	Ü™XÙZ\Û[X™\‰ÈÛÛ[[ˆÈ™\ÜÛœÙ\ÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“H™\ÜÛœÙ\ÈQÓÓSSˆ™XÙZ\Û[X™\ˆTÒTŠL
+HQ•Tˆ\Ù\—Ù[XZ[ŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÈ™\Ù\™H™XÙZ\È[™XYH\ÙY™Y›Ü™HÛ™K][YH[™›Ü˜Ù[Y[Ø\ÈYY‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆS”ÑT•QÓ“Ô‘HS•È™XÙZ\Ý\ØYÙ\Âˆ
+ÝÜ™WÚY™XÙZ\Û[X™\‹™\ÜÛœÙWÚY\ÙYØ]
+BˆÑSPÕÝÜ™WÚY™XÙZ\Û[X™\‹RSŠY
+KRSŠÝX›Z]YØ]
+Bˆ”“ÓH™\ÜÛœÙ\ÂˆÒT‘H™XÙZ\Û[X™\ˆTÈ“Õ•SS‘™XÙZ\Û[X™\ˆˆ	ÉÂˆÔ“ÕT–HÝÜ™WÚY™XÙZ\Û[X™\‚ˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÈ[™›Ü˜ÙHÛ™K][YH™XÙZ\\ØYÙHXÜ›ÜÜÈ]™\žHœ˜[˜Ú[ˆHÞ\Ý[K‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆS”ÑT•QÓ“Ô‘HS•ÈÛØ˜[Ü™XÙZ\Ý\ØYÙ\Âˆ
+™XÙZ\Û[X™\‹ÝÜ™WÚY™\ÜÛœÙWÚY\ÙYØ]
+BˆÑSPÕ™XÙZ\Û[X™\‹RSŠÝÜ™WÚY
+KRSŠY
+KRSŠÝX›Z]YØ]
+Bˆ”“ÓH™\ÜÛœÙ\ÂˆÒT‘H™XÙZ\Û[X™\ˆTÈ“Õ•SS‘™XÙZ\Û[X™\ˆˆ	ÉÂˆÔ“ÕT–H™XÙZ\Û[X™\‚ˆˆˆŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÈY˜][™ÈÛÛ[[ˆÈÝY™—ØÛÛ[Y[™][ÛœÈYˆZ\ÜÚ[™ÂˆÝ\œÛÜ‹™^XÝ]J”ÒÕÈÓÓSS”È”“ÓHÝY™—ØÛÛ[Y[™][ÛœÈRÑH	Ü˜][™ÉÈŠBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆÙÙÙ\‹š[™›ÊY[™È	Ü˜][™ÉÈÛÛ[[ˆÈÝY™—ØÛÛ[Y[™][ÛœÈX›K‹‹ˆŠBˆÝ\œÛÜ‹™^XÝ]JSTˆP“HÝY™—ØÛÛ[Y[™][ÛœÈQÓÓSSˆ˜][™ÈS•QUSHQ•TˆÝY™—ÚYŠBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÛÛ›‹˜ÛÜÙJ
+BˆÙÙÙ\‹š[™›Ê“X\Ý\ˆØÚ[XHÚXÚËÝ\]HÛÛ\]YˆŠBˆœ™XZÂˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ‘]X˜\ÙH[š]X[^˜][Ûˆ\œ›ÜŽˆÙ_HŠBˆ™]šY\ÈOHBˆYˆ™]šY\Èˆ‚ˆ[YKœÛY\
+JBˆ[ÙN‚ˆÙÙÙ\‹˜Üš]XØ[
+ÛÝ[›Ý[š]X[^™H]X˜\ÙHØÚ[XHY\ˆ][\H][\ËˆŠB‚ˆÈ[Ø^\È[š]X[^™HØÚ[XHÛˆÝ\\ˆžN‚ˆ[š]ÛX\Ý\—ÜØÚ[XJ
+BˆÙÙÙ\‹š[™›Ê”ØÚ[XH[š]X[^˜][ÛˆÛÛ\]YÝXØÙ\ÜÙ[HŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹˜Üš]XØ[
+ˆÔ’UPÐSˆØÚ[XH[š]X[^˜][Ûˆ˜Z[YˆÙ_HŠBˆ˜Z\ÙB‚ˆÈKKHT”“ÔˆS‘T”ÈKKBˆ\™\œ›Üš[™\Š^Ù\[ÛŠBˆYˆ[™WÙ^Ù\[ÛŠJN‚ˆˆˆ‘ÛØ˜[\œ›Üˆ[™\ˆÈÚÝÈ˜XÙX˜XÚÜÈ›ÜˆS–HÜ˜\Ú[ˆ˜Z[Ø^Hˆˆ‚ˆ\œ›Ü—Ù]Z[ÈH˜XÙX˜XÚË™›Ü›X]Ù^Ê
+BˆÙÙÙ\‹™\œ›ÜŠˆ‘ÛØ˜[Ü˜\ÚˆÙ_WžÙ\œ›Ü—Ù]Z[ßHŠBˆˆ™]\›ˆˆˆˆ‚ˆ]ˆÝ[OH™›ÛY˜[Z[NˆØ[œË\Ù\šYŽÈY[™ÎˆŒÈÛÛÜŽˆÍÌŒXÌÈ˜XÚÙÜ›Ý[™ˆÙŽÙNÈ›Ü™\Žˆ\ÛÛYÙXÍ˜ØŽÈ›Ü™\‹\˜Y]\ÎˆÈ‚ˆˆÝ[OH›X\™Ú[‹]ÜˆÈ“ÛÜÈHÛÛY][™ÈÜ˜\ÚYÚ‚ˆ‘\œ›ÜŽØˆÙ_OÜ‚ˆ‚ˆ•˜XÙX˜XÚÈ›ÜˆXYÙÚ[™ÎØÜ‚ˆ™HÝ[OH˜˜XÚÙÜ›Ý[™ˆÙ™™ŽÈY[™ÎˆM\È›Ü™\‹\˜Y]\ÎˆÈÝ™\™›ÝÎˆ]]ÎÈ›Û\Ú^™NˆLÜÈžÙ\œ›Ü—Ù]Z[ßOÜ™O‚ˆÙ]‚ˆˆˆ‹L‚ˆ\™\œ›Üš[™\Š
+BˆYˆ›ÝÙ›Ý[™Ù\œ›ÜŠ\œ›ÜŠN‚ˆ™]\›ˆ›Ý›Ý[™‹‚ˆ\œ›Ý]J‹ÙXYËÙ[ˆŠBˆÙÚ[—Ü™\]Z\™YˆYˆXY×Ù[Š
+N‚ˆˆˆ”›Ý]HÈÙYH]˜Z[X›H[š\›Û›Y[˜\šXX›HÙ^\È
+“Õ˜[Y\ÊHˆˆ‚ˆ\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+Ù\ÜÚ[Û–ÉÝ\Ù\—ÚY	×JBˆYˆ\Ù\–ÉÜ›ÛI×HOH	ÜÝ\\˜YZ[‰Î‚ˆ™]\›ˆœÛÛšYžJÈ™\œ›ÜˆŽˆ•[˜]]Üš^™YŸJKÂˆ™]\›ˆœÛÛšYžJÂˆ˜]˜Z[X›WÚÙ^\ÈŽˆ\Ý
+ÜË™[š\›Û‹šÙ^\Ê
+JKˆ™—ØÛÛ™šY×ÚÜÝŽˆ\˜ÛÛ™šYÖÈ‘—ÐÓÓ‘’QÈ—K™Ù]
+šÜÝŠKˆ™—ØÛÛ™šY×ÜÜŽˆ\˜ÛÛ™šYÖÈ‘—ÐÓÓ‘’QÈ—K™Ù]
+œÜŠKˆœ]Û—Ý™\œÚ[ÛˆŽˆÞ\Ë™\œÚ[Û‚ˆJB‚ˆYˆÙ]Ø\ÜÚYÛ™YÜÝÜ™WÚYÊ\Ù\—ÚYˆ[
+HOˆ\ÝÚ[N‚ˆˆˆ”™]\›ˆÝÜ™HYÈHšY]Ë[Û›H\Ù\ˆ\È™Y[ˆÜ˜[YXØÙ\ÜÈËˆˆˆ‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕÝÜ™WÚY”“ÓH\Ù\—ÜÝÜ™\ÈÒT‘H\Ù\—ÚYH	\È‹
+\Ù\—ÚY
+JBˆ™]\›ˆÜ›ÝÖÌH›Üˆ›ÝÈ[ˆÝ\œÛÜ‹™™]Ú[
+
+WBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ‘\œ›Üˆ™]Ú[™È\ÜÚYÛ™YÝÜ™\È›Üˆ\Ù\ˆÝ\Ù\—ÚYNˆÙ_HŠBˆ™]\›ˆ×Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆYˆØ[—ÛX[˜YÙWÜÝÜ™J\Ù\—ÚYˆ[ÝÜ™WÚYˆ[
+HOˆ›ÛÛ‚ˆˆˆ”Ý\\˜YZ[œÈX[˜YÙH[ÝÜ™\ÎÈÛY[ÈX[˜YÙHÛ›HÝÜ™\È^HÝÛ‹ˆˆˆ‚ˆ\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+\Ù\—ÚY
+BˆYˆ›Ý\Ù\ˆÜˆ\Ù\‹™Ù]
+	Ü›ÛIÊHOH	Ý\Ù\‰Î‚ˆ™]\›ˆ˜[ÙBˆYˆ\Ù\‹™Ù]
+	Ü›ÛIÊHOH	ÜÝ\\˜YZ[‰Î‚ˆ™]\›ˆYBˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕH”“ÓHÝÜ™\ÈÒT‘HYH	\ÈS‘\Ù\—ÚYH	\È‹
+ÝÜ™WÚY\Ù\—ÚY
+JBˆ™]\›ˆÝ\œÛÜ‹™™]ÚÛ™J
+H\È›Ý›Û™Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆYˆØ[—ÛX[˜YÙWÜÝÜ™WÜÝY™Š\Ù\—ÚYˆ[ÝÜ™WÚYˆ[
+HOˆ›ÛÛ‚ˆˆˆ[ÝÈÝÛ™\œËÜÝ\\˜YZ[œË\ÈšY]Ù\œÈ\ÜÚYÛ™YÈ\È^XÝÝÜ™Kˆˆˆ‚ˆ\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+\Ù\—ÚY
+BˆYˆ›Ý\Ù\Ž‚ˆ™]\›ˆ˜[ÙBˆYˆ\Ù\‹™Ù]
+	Ü›ÛIÊH[ˆ
+	ØYZ[‰Ë	ÜÝ\\˜YZ[‰ÊN‚ˆ™]\›ˆØ[—ÛX[˜YÙWÜÝÜ™J\Ù\—ÚYÝÜ™WÚY
+BˆYˆ\Ù\‹™Ù]
+	Ü›ÛIÊHOH	Ý\Ù\‰Î‚ˆ™]\›ˆ˜[ÙBˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]Jˆ”ÑSPÕH”“ÓH\Ù\—ÜÝÜ™\ÈÒT‘H\Ù\—ÚYH	\ÈS‘ÝÜ™WÚYH	\ÈSRUH‹ˆ
+\Ù\—ÚYÝÜ™WÚY
+Kˆ
+Bˆ™]\›ˆÝ\œÛÜ‹™™]ÚÛ™J
+H\È›Ý›Û™Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆYˆ™]ÚÜÝÜ™\Ê\Ù\—ÚYˆ[›Û™HH›Û™K\ÜÚYÛ™YÜÝÜ™WÚYÎˆ\ÝÚ[H›Û™HH›Û™JHOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJB‚ˆYˆ\ÜÚYÛ™YÜÝÜ™WÚYÈ\È›Ý›Û™N‚ˆÈšY]Ë[Û›H\Ù\Žˆš[\ˆžH^XÚ]\ÝÙˆ\ÜÚYÛ™YÝÜ™HYÂˆYˆ›Ý\ÜÚYÛ™YÜÝÜ™WÚYÎ‚ˆÙÙÙ\‹š[™›Ê‘™]Ú[™ÈÝÜ™\È›ÜˆšY]Ë[Û›H\Ù\ˆÚ]›È\ÜÚYÛ›Y[ÈOˆ×HŠBˆ™]\›ˆ×BˆXÙZÛ\œÈH‹‹š›Ú[ŠÈ‰\È—H
+ˆ[Š\ÜÚYÛ™YÜÝÜ™WÚYÊJBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕYÝÜ™WÛ˜[YKY™\ÜËÚ]K›Ýš[˜ÙKÜÝ[ØÛÙKˆÛÛXÝÛ[X™\‹[XZ[ÝÜ™WÛX[˜YÙ\—Û˜[YKX[˜YÙ\—ØÛÛXÝˆÝÜ™WÝ\KÝ]\ËÜ™X]YØ]ÙÛ×Ý\›XØÙ\Ü×ÝÚÙ[‹ÝX™ÛXZ[‹\Ù\—ÚYXÙ[œÙWÚÙ^KˆÛÛÙÛWÜ™]šY]×Ý\›™]Ø\™Ý\KÛÛÙÛWÜ™]šY]×Û[ÙBˆ”“ÓHÝÜ™\ÂˆÒT‘HYSˆ
+ÜXÙZÛ\œßJBˆÔ‘Tˆ–HYTÐÂˆˆˆ‹ˆ\J\ÜÚYÛ™YÜÝÜ™WÚYÊKˆ
+Bˆ[Yˆ\Ù\—ÚY‚ˆÈ›ÜˆÛY[\Ù\œËÛ›HÚÝÈZ\ˆÝÛˆÝÜ™\ÂˆÙÙÙ\‹š[™›Êˆ‘™]Ú[™ÈÝÜ™\È›Üˆ\Ù\—ÚYˆÝ\Ù\—ÚYHŠBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆÑSPÕYÝÜ™WÛ˜[YKY™\ÜËÚ]K›Ýš[˜ÙKÜÝ[ØÛÙKˆÛÛXÝÛ[X™\‹[XZ[ÝÜ™WÛX[˜YÙ\—Û˜[YKX[˜YÙ\—ØÛÛXÝˆÝÜ™WÝ\KÝ]\ËÜ™X]YØ]ÙÛ×Ý\›XØÙ\Ü×ÝÚÙ[‹ÝX™ÛXZ[‹\Ù\—ÚYXÙ[œÙWÚÙ^KˆÛÛÙÛWÜ™]šY]×Ý\›™]Ø\™Ý\KÛÛÙÛWÜ™]šY]×Û[ÙBˆ”“ÓHÝÜ™\ÂˆÒT‘H\Ù\—ÚYH	\ÂˆÔ‘Tˆ–HYTÐÂˆˆˆ‹ˆ
+\Ù\—ÚY
+Bˆ
+Bˆ[ÙN‚ˆÈ›ÜˆYZ[‹Ù]‹ÜÝ\\˜YZ[‹ÚÝÈ[ÝÜ™\ÂˆÙÙÙ\‹š[™›Ê‘™]Ú[™È[ÝÜ™\È
+›È\Ù\—ÚYš[\ŠHŠBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆÑSPÕYÝÜ™WÛ˜[YKY™\ÜËÚ]K›Ýš[˜ÙKÜÝ[ØÛÙKˆÛÛXÝÛ[X™\‹[XZ[ÝÜ™WÛX[˜YÙ\—Û˜[YKX[˜YÙ\—ØÛÛXÝˆÝÜ™WÝ\KÝ]\ËÜ™X]YØ]ÙÛ×Ý\›XØÙ\Ü×ÝÚÙ[‹ÝX™ÛXZ[‹\Ù\—ÚYXÙ[œÙWÚÙ^KˆÛÛÙÛWÜ™]šY]×Ý\›™]Ø\™Ý\KÛÛÙÛWÜ™]šY]×Û[ÙBˆ”“ÓHÝÜ™\ÂˆÔ‘Tˆ–HYTÐÂˆˆˆ‚ˆ
+Bˆ›ÝÜÈHÝ\œÛÜ‹™™]Ú[
+
+BˆÙÙÙ\‹š[™›Êˆ‘™]ÚYÛ[Š›ÝÜÊ_HÝÜ™\ÈŠBˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆ™]\›ˆ›ÝÜÂ‚ˆYˆ™]ÚÜÝÜ™WØžWÚY
+ÝÜ™WÚYˆ[
+HOˆXÝÜÝ‹[žWH›Û™N‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆÑSPÕYÝÜ™WÛ˜[YKY™\ÜËÚ]K›Ýš[˜ÙKÜÝ[ØÛÙKˆÛÛXÝÛ[X™\‹[XZ[ÝÜ™WÛX[˜YÙ\—Û˜[YKX[˜YÙ\—ØÛÛXÝˆÝÜ™WÝ\KÝ]\ËÜ™X]YØ]ÙÛ×Ý\›XØÙ\Ü×ÝÚÙ[‹ÝX™ÛXZ[‹\Ù\—ÚYXÙ[œÙWÚÙ^KˆÛÛÙÛWÜ™]šY]×Ý\›™]Ø\™Ý\KÛÛÙÛWÜ™]šY]×Û[ÙBˆ”“ÓHÝÜ™\ÂˆÒT‘HYH	\ÂˆSRUBˆˆˆ‹ˆ
+ÝÜ™WÚY
+Kˆ
+BˆÝÜ™HHÝ\œÛÜ‹™™]ÚÛ™J
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆ™]\›ˆÝÜ™B‚ˆYˆÜ™X]WÜÝÜ™JˆÝÜ™WÛ˜[YNˆÝ‹ˆY™\ÜÎˆÝˆ›Û™HH›Û™KˆÚ]NˆÝˆ›Û™HH›Û™Kˆ›Ýš[˜ÙNˆÝˆ›Û™HH›Û™KˆÜÝ[ØÛÙNˆÝˆ›Û™HH›Û™KˆÛÛXÝÛ[X™\ŽˆÝˆ›Û™HH›Û™Kˆ[XZ[ˆÝˆ›Û™HH›Û™KˆÝÜ™WÛX[˜YÙ\—Û˜[YNˆÝˆ›Û™HH›Û™KˆX[˜YÙ\—ØÛÛXÝˆÝˆ›Û™HH›Û™KˆÝÜ™WÝ\NˆÝˆ›Û™HH›Û™KˆÝ]\ÎˆÝˆH˜XÝ]™H‹ˆÙÛ×Ý\›ˆÝˆ›Û™HH›Û™KˆÝX™ÛXZ[ŽˆÝˆ›Û™HH›Û™KˆÛÛÙÛWÜ™]šY]×Ý\›ˆÝˆ›Û™HH›Û™KˆÛÛÙÛWÜ™]šY]×Û[ÙNˆÝˆHœ™]Ø\™‹ˆ\Ù\—ÚYˆ[›Û™HH›Û™KˆXÙ[œÙWÚÙ^NˆÝˆ›Û™HH›Û™Bˆ
+HOˆ[‚ˆˆˆÜ™X]HH™]ÈÝÜ™HÚ]˜[Y][Û‹ˆˆˆ‚ˆÈ[œ]˜[Y][Û‚ˆYˆ›ÝÝÜ™WÛ˜[YHÜˆ›ÝÝÜ™WÛ˜[YKœÝš\
+
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ”ÝÜ™H˜[YH\È™\]Z\™YŠBˆYˆÝ]\È›Ý[ˆÈ˜XÝ]™H‹š[˜XÝ]™H‹œ[™[™È—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[YÝ]\È˜[YHŠBˆYˆ[XZ[[™ˆ›Ý[ˆ[XZ[‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[Y[XZ[›Ü›X]ŠBˆYˆÛÛÙÛWÜ™]šY]×Û[ÙH›Ý[ˆÈœ™]šY]×ÛÛ›H‹œ™]Ø\™ŸN‚ˆÛÛÙÛWÜ™]šY]×Û[ÙHHœ™]Ø\™‚ˆˆ[\ÜÙXÜ™]Âˆ[\Ü™BˆXØÙ\Ü×ÝÚÙ[ˆHÙXÜ™]ËÚÙ[—Ý\›ØY™JÌŠBˆˆÈÙ[™\˜]HÝX™ÛXZ[ˆœ›ÛHÝÜ™H˜[YHYˆ›Ý›ÝšYYˆYˆ›ÝÝX™ÛXZ[Ž‚ˆÝX™ÛXZ[ˆH™KœÝXŠ‰Ö×˜K^KVŒNW×IË	ÉËÝÜ™WÛ˜[YJK›ÝÙ\Š
+Kœ™\XÙJ	È	Ë	ËIÊBˆÝX™ÛXZ[ˆH™KœÝXŠ‰ËJÉË	ËIËÝX™ÛXZ[ŠKœÝš\
+	ËIÊBˆˆÚ]Ù]Ù—ØÛÛ›™XÝ[Û—ÝÚ]Ý˜[œØXÝ[ÛŠ
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•ÈÝÜ™\È
+ˆÝÜ™WÛ˜[YKY™\ÜËÚ]K›Ýš[˜ÙKÜÝ[ØÛÙKˆÛÛXÝÛ[X™\‹[XZ[ÝÜ™WÛX[˜YÙ\—Û˜[YKX[˜YÙ\—ØÛÛXÝˆÝÜ™WÝ\KÝ]\ËÙÛ×Ý\›XØÙ\Ü×ÝÚÙ[‹ÝX™ÛXZ[‹ÛÛÙÛWÜ™]šY]×Ý\›ÛÛÙÛWÜ™]šY]×Û[ÙK\Ù\—ÚYXÙ[œÙWÚÙ^Bˆ
+BˆSQTÈ
+	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\ÊBˆˆˆ‹ˆ
+ˆÝÜ™WÛ˜[YKœÝš\
+
+KY™\ÜËÚ]K›Ýš[˜ÙKÜÝ[ØÛÙKˆÛÛXÝÛ[X™\‹[XZ[ÝÜ™WÛX[˜YÙ\—Û˜[YKX[˜YÙ\—ØÛÛXÝˆÝÜ™WÝ\KÝ]\ËÙÛ×Ý\›XØÙ\Ü×ÝÚÙ[‹ÝX™ÛXZ[‹ÛÛÙÛWÜ™]šY]×Ý\›ÛÛÙÛWÜ™]šY]×Û[ÙK\Ù\—ÚYXÙ[œÙWÚÙ^Bˆ
+Kˆ
+Bˆ™]×ÜÝÜ™WÚYH[
+Ý\œÛÜ‹›\Ý›ÝÚY
+B‚ˆ™]\›ˆ™]×ÜÝÜ™WÚY‚ˆYˆ™]ÚÜ]Y\Ý[Û›˜Z\™WØžWÜÝÜ™JÝÜ™WÚYˆ[
+HOˆXÝÜÝ‹[žWH›Û™N‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆÑSPÕYÝÜ™WÚYÝÛ™\—Ý\Ù\—ÚYXÙ[œÙWÚÙ^K]K\×ØXÝ]™KÙÛ×Ý\›Ü™X]YØ]ˆ”“ÓH]Y\Ý[Û›˜Z\™\ÂˆÒT‘HÝÜ™WÚYH	\ÂˆÔ‘Tˆ–HYTÐÂˆSRUBˆˆˆ‹ˆ
+ÝÜ™WÚY
+Kˆ
+Bˆ]Y\Ý[Û›˜Z\™HHÝ\œÛÜ‹™™]ÚÛ™J
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆ™]\›ˆ]Y\Ý[Û›˜Z\™B‚ˆYˆ™]ÚÜ]Y\Ý[Ûœ×Ù›Ü—Ü]Y\Ý[Û›˜Z\™J]Y\Ý[Û›˜Z\™WÚYˆ[
+HOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆÑSPÕY]Y\Ý[Û—Ý^]Y\Ý[Û—Ý\K\™Ù]ÜØÛÜKZ[—ÛX™[X^ÛX™[[Ý×ØÛÛ[Y[\×Ü™\]Z\™Y]Y\Ý[Û—ÛÜ™\‚ˆ”“ÓH]Y\Ý[ÛœÂˆÒT‘H]Y\Ý[Û›˜Z\™WÚYH	\ÈS‘\×ØXÝ]™HH•QBˆÔ‘Tˆ–H]Y\Ý[Û—ÛÜ™\ˆTÐËYTÐÂˆˆˆ‹ˆ
+]Y\Ý[Û›˜Z\™WÚY
+Kˆ
+Bˆ]Y\Ý[ÛœÈHÝ\œÛÜ‹™™]Ú[
+
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆ™]\›ˆ]Y\Ý[ÛœÂ‚ˆYˆ™]ÚÛÜ[Ûœ×Ù›Ü—Ü]Y\Ý[ÛœÊ]Y\Ý[Û—ÚYÎˆ\ÝÚ[JHOˆXÝÚ[\ÝÑXÝÜÝ‹[žWWWN‚ˆYˆ›Ý]Y\Ý[Û—ÚYÎ‚ˆ™]\›ˆßB‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆXÙZÛ\œÈH‹‹š›Ú[ŠÈ‰\È—H
+ˆ[Š]Y\Ý[Û—ÚYÊJBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕ]Y\Ý[Û—ÚYYÜ[Û—Ý^ˆ”“ÓH]Y\Ý[Û—ÛÜ[ÛœÂˆÒT‘H]Y\Ý[Û—ÚYSˆ
+ÜXÙZÛ\œßJBˆÔ‘Tˆ–H]Y\Ý[Û—ÚYTÐËYTÐÂˆˆˆ‹ˆ\J]Y\Ý[Û—ÚYÊKˆ
+Bˆ›ÝÜÈHÝ\œÛÜ‹™™]Ú[
+
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆžWÜ]Y\Ý[ÛŽˆXÝÚ[\ÝÑXÝÜÝ‹[žWWWHHßBˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆZYH[
+›ÝÖÈœ]Y\Ý[Û—ÚY—JBˆžWÜ]Y\Ý[Û‹œÙ]Y˜][
+ZY×JK˜\[™
+ÈšYŽˆ›ÝÖÈšY—K›Ü[Û—Ý^Žˆ›ÝÖÈ›Ü[Û—Ý^—_JBˆ™]\›ˆžWÜ]Y\Ý[Û‚‚ˆYˆÙ]ÜÝÜ™WÜX›X×Ý\›
+ÝÜ™WÚYˆ[
+HOˆÝŽ‚ˆˆˆ”™]\›ˆHÝ\ÝÛY\‹\Ú\™XX›HT“™]™\ˆ[ˆ[\›˜[ÛÛZ[™\ˆTˆˆˆ‚ˆX›X×ÙÛXZ[ˆH
+ÜË™Ù][Š”RSÐVWÔP“P×ÑÓPRSˆŠHÜˆˆŠKœÝš\
+
+KœœÝš\
+	ËÉÊBˆÝ]X×Ý\›H
+ÜË™Ù][Š”RSÐVWÔÕUP×ÕT“ŠHÜˆˆŠKœÝš\
+
+KœœÝš\
+	ËÉÊBˆYˆX›X×ÙÛXZ[Ž‚ˆ˜\ÙWÝ\›HX›X×ÙÛXZ[ˆYˆX›X×ÙÛXZ[‹œÝ\ÝÚ]
+
+š‹ËÈ‹šÎ‹ËÈŠJH[ÙHˆšÎ‹ËÞÜX›X×ÙÛXZ[ŸH‚ˆ[YˆÝ]X×Ý\›‚ˆ˜\ÙWÝ\›HÝ]X×Ý\›YˆÝ]X×Ý\›œÝ\ÝÚ]
+
+š‹ËÈ‹šÎ‹ËÈŠJH[ÙHˆšÎ‹ËÞÜÝ]X×Ý\›H‚ˆ[ÙN‚ˆ˜\ÙWÝ\›H™\]Y\Ý\›Ü›ÛÝœœÝš\
+	ËÉÊBˆ™]\›ˆˆžØ˜\ÙWÝ\›^Ý\›Ù›ÜŠ	ÜX›X×ÜÝ\™^IËÝÜ™WÚY\ÝÜ™WÚY
+_H‚‚ˆYˆÙ[™\˜]WÜ\—Ù]WÝ\šJ^ˆÝŠHOˆÝŽ‚ˆ\ˆH\˜ÛÙK”TÛÙJˆ™\œÚ[ÛS›Û™Kˆ\œ›Ü—ØÛÜœ™XÝ[Û\\˜ÛÙK˜ÛÛœÝ[Ë‘T”“Ô—ÐÓÔ”‘PÕÓKˆ›ÞÜÚ^™OM‹ˆ›Ü™\L‹ˆ
+Bˆ\‹˜YÙ]J^
+Bˆ\‹›XZÙJš]UYJBˆ[YÈH\‹›XZÙWÚ[XYÙJš[ØÛÛÜH˜›XÚÈ‹˜XÚ×ØÛÛÜHÚ]HŠBˆYˆH[Ëž]\ÒSÊ
+Bˆ[YËœØ]™JY‹›Ü›X]H”‘ÈŠBˆ[˜ÛÙYH˜\ÙM˜[˜ÛÙJY‹™Ù]˜[YJ
+JK™XÛÙJ]‹NŠBˆ™]\›ˆˆ™]Nš[XYÙKÜ™ÎØ˜\ÙMÙ[˜ÛÙYH‚‚ˆ\œ›Ý]J‹ØYZ[‹ÜÝÜ™\ËÏ[œÝÜ™WÚY‹Ü\‹YÝÛ›ØYŠBˆYˆÝÛ›ØYÜ\ŠÝÜ™WÚYˆ[
+N‚ˆˆˆ‘ÝÛ›ØYTˆÛÙH\È‘Èš[Kˆˆˆ‚ˆÝÜ™HH™]ÚÜÝÜ™WØžWÚY
+ÝÜ™WÚY\ÝÜ™WÚY
+BˆYˆ›ÝÝÜ™N‚ˆ›\Ú
+”ÝÜ™H›Ý›Ý[™‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠœÝÜ™\×ÛX[˜YÙ[Y[ŠJBˆX›X×Ý\›HÙ]ÜÝÜ™WÜX›X×Ý\›
+ÝÜ™WÚY\ÝÜ™WÚY
+Bˆ\ˆH\˜ÛÙK”TÛÙJˆ™\œÚ[ÛS›Û™Kˆ\œ›Ü—ØÛÜœ™XÝ[Û\\˜ÛÙK˜ÛÛœÝ[Ë‘T”“Ô—ÐÓÔ”‘PÕÓKˆ›ÞÜÚ^™OLLˆ›Ü™\L‹ˆ
+Bˆ\‹˜YÙ]JX›X×Ý\›
+Bˆ\‹›XZÙJš]UYJBˆ[YÈH\‹›XZÙWÚ[XYÙJš[ØÛÛÜH˜›XÚÈ‹˜XÚ×ØÛÛÜHÚ]HŠBˆYˆH[Ëž]\ÒSÊ
+Bˆ[YËœØ]™JY‹›Ü›X]H”‘ÈŠBˆY‹œÙYZÊ
+Bˆš[[˜[YHHˆ”T—ÞÜÝÜ™VÉÜÝÜ™WÛ˜[YI×Kœ™\XÙJ	È	Ë	×ÉÊ_Kœ™È‚ˆ™]\›ˆÙ[™Ùš[JY‹Z[Y]\OHš[XYÙKÜ™È‹\×Ø]XÚY[UYKÝÛ›ØYÛ˜[YOYš[[˜[YJB‚ˆÈKKKKKKKKKKKKKKKKKKKKKKKKBˆÈ‘TÔ•ÑS‘TUSÓˆ
+ÔÕˆ	ˆŠBˆÈKKKKKKKKKKKKKKKKKKKKKKKKBˆYˆÙÙ]Ü™\ÜÙ]JÝÜ™WÚYˆ[[ÛˆÝˆH›Û™JN‚ˆˆˆ‘Ø]\ˆ™YY˜XÚÈ]H›Üˆ™\ÜËÜ[Û˜[Hš[\™YžH[Û
+VVVKSSJKˆˆˆ‚ˆÝÜ™HH™]ÚÜÝÜ™WØžWÚY
+ÝÜ™WÚY\ÝÜ™WÚY
+BˆYˆ›ÝÝÜ™N‚ˆ™]\›ˆ›Û™K›Û™K›Û™K›Û™K›Û™Bˆ[Ù™YY˜XÚÈH™]ÚÜ™\ÜÛœÙ\×Ù›Ü—ÜÝÜ™JÝÜ™WÚY\ÝÜ™WÚY[Z]LL
+B‚ˆÈš[\ˆžH[ÛYˆ›ÝšYYˆYˆ[Û‚ˆš[\™YH×Bˆ›Üˆ˜ˆ[ˆ[Ù™YY˜XÚÎ‚ˆÝX›Z]YH˜‹™Ù]
+œÝX›Z]YØ]ŠBˆYˆÝX›Z]Y‚ˆYˆ\Ú[œÝ[˜ÙJÝX›Z]YÝŠN‚ˆžN‚ˆÝX›Z]YH]][YKœÝœ[YJÝX›Z]Y‰VKI[KIY	R‰SN‰TÈŠBˆ^Ù\
+˜[YQ\œ›Ü‹\Q\œ›ÜŠN‚ˆÛÛ[YBˆYˆÝX›Z]YœÝ™[YJ‰VKI[HŠHOH[Û‚ˆš[\™Y˜\[™
+˜ŠBˆ[Ù™YY˜XÚÈHš[\™Y‚ˆ™\ÜÛœÙWÚYÈHÚ[
+–ÈšY—JH›Üˆˆ[ˆ[Ù™YY˜XÚ×Bˆ[œÝÙ\œ×ÛX\H™]ÚØ[œÝÙ\œ×Ù›Ü—Ü™\ÜÛœÙ\Ê™\ÜÛœÙWÚYÊHYˆ™\ÜÛœÙWÚYÈ[ÙHßB‚ˆÈÙ]ÛÛ[Y[™][ÛœÂˆÛÛ[Y[™][Ûœ×ÛX\HßBˆYˆ™\ÜÛœÙWÚYÎ‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆH	Ë	Ëš›Ú[ŠÉÉ\É×H
+ˆ[Š™\ÜÛœÙWÚYÊJBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆÑSPÕØËœ™\ÜÛœÙWÚYË™š\œÝÛ˜[YKË›\ÝÛ˜[YKËœÜÚ][Û‚ˆ”“ÓHÝY™—ØÛÛ[Y[™][ÛœÈØÂˆ“ÒSˆÝY™ˆÈÓˆËšYHØËœÝY™—ÚYˆÒT‘HØËœ™\ÜÛœÙWÚYSˆ
+ÜJBˆˆˆ‹™\ÜÛœÙWÚYÊBˆ›Üˆ›ÝÈ[ˆÝ\œÛÜ‹™™]Ú[
+
+N‚ˆÛÛ[Y[™][Ûœ×ÛX\œÙ]Y˜][
+[
+›ÝÖÈœ™\ÜÛœÙWÚY—JK×JK˜\[™
+›ÝÊBˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆ™]\›ˆÝÜ™K[Ù™YY˜XÚË[œÝÙ\œ×ÛX\ÛÛ[Y[™][Ûœ×ÛX\™\ÜÛœÙWÚYÂ‚ˆ\œ›Ý]J‹ØYZ[‹ÜÝÜ™\ËÏ[œÝÜ™WÚY‹Ü™\ÜØÜÝˆŠBˆYˆÝÛ›ØYÜ™\ÜØÜÝŠÝÜ™WÚYˆ[
+N‚ˆˆˆ‘ÝÛ›ØY™YY˜XÚÈ]H\ÈÔÕ‹ˆˆˆ‚ˆ[ÛH™\]Y\Ý˜\™ÜË™Ù]
+›[Û‹ˆŠBˆÝÜ™K™YY˜XÚ×Û\Ý[œÝÙ\œ×ÛX\ÛÛ[Y[™][Ûœ×ÛX\ÈHÙÙ]Ü™\ÜÙ]JÝÜ™WÚY[ÛÜˆ›Û™JBˆYˆ›ÝÝÜ™N‚ˆ›\Ú
+”ÝÜ™H›Ý›Ý[™‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠœÝÜ™\×ÛX[˜YÙ[Y[ŠJB‚ˆÝ]]H[Ë”Ýš[™ÒSÊ
+BˆÜš]\ˆHÜÝ‹Üš]\ŠÝ]]
+BˆÜš]\‹Üš]\›ÝÊÂˆ‘™YY˜XÚÈQ‹‘]H‹‘[XZ[‹”™XÙZ\È‹”Ý]\È‹ˆ”]Y\Ý[Ûˆ‹•\H‹”˜][™È‹[œÝÙ\ˆ‹ˆÛÛ[Y[™YÝY™ˆ‚ˆJB‚ˆ›Üˆ˜ˆ[ˆ™YY˜XÚ×Û\Ý‚ˆ˜—ÚYH[
+˜–ÈšY—JBˆÝX›Z]YH˜‹™Ù]
+œÝX›Z]YØ]‹ˆŠBˆYˆ\Ø]ŠÝX›Z]YœÝ™[YHŠN‚ˆÝX›Z]YHÝX›Z]YœÝ™[YJ‰VKI[KIY	R‰SN‰TÈŠBˆ[XZ[H˜‹™Ù]
+\Ù\—Ù[XZ[‹ˆŠBˆ™XÙZ\H˜‹™Ù]
+œ™XÙZ\Û[X™\ˆ‹ˆŠBˆÝ]\ÈH˜‹™Ù]
+œÝ]\È‹ˆŠBˆ[œÝÙ\œÈH[œÝÙ\œ×ÛX\™Ù]
+˜—ÚY×JBˆÛÛ[\ÈHÛÛ[Y[™][Ûœ×ÛX\™Ù]
+˜—ÚY×JBˆÛÛ[WÛ˜[Y\ÈH‹‹š›Ú[ŠˆžØÖÉÙš\œÝÛ˜[YI×_HØÖÉÛ\ÝÛ˜[YI×_Hˆ›ÜˆÈ[ˆÛÛ[\ÊB‚ˆYˆ[œÝÙ\œÎ‚ˆ›Üˆ[œÈ[ˆ[œÝÙ\œÎ‚ˆÜš]\‹Üš]\›ÝÊÂˆ˜—ÚYÝX›Z]Y[XZ[™XÙZ\Ý]\Ëˆ[œË™Ù]
+œ]Y\Ý[Û—Ý^‹ˆŠKˆ[œË™Ù]
+œ]Y\Ý[Û—Ý\H‹ˆŠKˆ[œË™Ù]
+œ˜][™×Ý˜[YH‹ˆŠKˆ[œË™Ù]
+˜[œÝÙ\—Ý^‹ˆŠKˆÛÛ[WÛ˜[Y\ÂˆJBˆ[ÙN‚ˆÜš]\‹Üš]\›ÝÊÙ˜—ÚYÝX›Z]Y[XZ[™XÙZ\Ý]\Ëˆ‹ˆ‹ˆ‹ˆ‹ÛÛ[WÛ˜[Y\×JB‚ˆYˆH[Ëž]\ÒSÊ
+BˆY‹Üš]JÝ]]™Ù]˜[YJ
+K™[˜ÛÙJ]‹NŠJBˆY‹œÙYZÊ
+Bˆ[ÛÛX™[H[ÛYˆ[Û[ÙH˜[‚ˆš[[˜[YHHˆ”™\ÜÞÜÝÜ™VÉÜÝÜ™WÛ˜[YI×Kœ™\XÙJ	È	Ë	×ÉÊ_WÞÛ[ÛÛX™[K˜ÜÝˆ‚ˆ™]\›ˆÙ[™Ùš[JY‹Z[Y]\OH^ØÜÝˆ‹\×Ø]XÚY[UYKÝÛ›ØYÛ˜[YOYš[[˜[YJB‚ˆ\œ›Ý]J‹ØYZ[‹ÜÝÜ™\ËÏ[œÝÜ™WÚY‹Ü™\ÜÜˆŠBˆYˆÝÛ›ØYÜ™\ÜÜŠÝÜ™WÚYˆ[
+N‚ˆˆˆ‘ÝÛ›ØY™YY˜XÚÈ™\Ü\È‹ˆˆˆ‚ˆ[ÛH™\]Y\Ý˜\™ÜË™Ù]
+›[Û‹ˆŠBˆÝÜ™K™YY˜XÚ×Û\Ý[œÝÙ\œ×ÛX\ÛÛ[Y[™][Ûœ×ÛX\ÈHÙÙ]Ü™\ÜÙ]JÝÜ™WÚY[ÛÜˆ›Û™JBˆYˆ›ÝÝÜ™N‚ˆ›\Ú
+”ÝÜ™H›Ý›Ý[™‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠœÝÜ™\×ÛX[˜YÙ[Y[ŠJB‚ˆÝ[H[Š™YY˜XÚ×Û\Ý
+Bˆ™\ÛÛ™YHÝ[JH›Üˆˆ[ˆ™YY˜XÚ×Û\ÝYˆ‹™Ù]
+œÝ]\ÈŠHOHœ™\ÛÛ™YŠBˆ[œ™\ÛÛ™YHÝ[H™\ÛÛ™Yˆ™\ÛÛ][Û—Ü˜]HH›Ý[™
+™\ÛÛ™YÈÝ[
+ˆLJHYˆÝ[ˆ[ÙH‚ˆÈ˜][™ÈÝ]Âˆ˜][™×Ù\ÝHÌBˆÝ[Ü˜][™ÜÈHˆ›Üˆ˜ˆ[ˆ™YY˜XÚ×Û\Ý‚ˆ›Üˆ[œÈ[ˆ[œÝÙ\œ×ÛX\™Ù]
+[
+˜–ÈšY—JK×JN‚ˆˆH[œË™Ù]
+œ˜][™×Ý˜[YHŠBˆYˆŽ‚ˆˆH[
+›Ø]
+ŠJBˆYˆHHˆHN‚ˆ˜][™×Ù\ÝÜˆHWH
+ÏHBˆÝ[Ü˜][™ÜÈ
+ÏHBˆ]™×Ü˜][™ÈH›Ý[™
+Ý[J
+H
+ÈJH
+ˆÈ›ÜˆKÈ[ˆ[[Y\˜]J˜][™×Ù\Ý
+JHÈÝ[Ü˜][™ÜËŠHYˆÝ[Ü˜][™ÜÈˆ[ÙH‚ˆÈÜÛÛ[Y[™YÝY™‚ˆÝY™—ØÛÝ[ÈHY˜][XÝ
+[
+Bˆ›Üˆ˜ˆ[ˆ™YY˜XÚ×Û\Ý‚ˆ›ÜˆÈ[ˆÛÛ[Y[™][Ûœ×ÛX\™Ù]
+[
+˜–ÈšY—JK×JN‚ˆÝY™—ØÛÝ[ÖÙˆžØÖÉÙš\œÝÛ˜[YI×_HØÖÉÛ\ÝÛ˜[YI×_H—H
+ÏHBˆÜÜÝY™ˆHÛÜY
+ÝY™—ØÛÝ[Ëš][\Ê
+KÙ^O[[X™HˆÌWK™]™\œÙOUYJVÎŒLB‚ˆÈZ[‚ˆ[ÛÛX™[H[ÛYˆ[Û[ÙH[[YH‚ˆˆH”Š
+Bˆ‹œÙ]Ø]]×ÜYÙWØœ™XZÊ]]ÏUYKX\™Ú[LMJBˆ‹˜YÜYÙJ
+B‚ˆÈ]Bˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹N
+Bˆ‹˜Ù[
+L‹ˆžÜÝÜ™VÉÜÝÜ™WÛ˜[YI×_HH™YY˜XÚÈ™\Ü‹UYK[YÛHÈŠBˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹LJBˆ‹˜Ù[
+ˆ”\š[ÙˆÛ[ÛÛX™[HÙ[™\˜]YˆÙ]][YK››ÝÊ
+KœÝ™[YJ	ÉVKI[KIY	R‰SIÊ_H‹UYK[YÛHÈŠBˆ‹›Š
+B‚ˆÈÔHÝ[[X\žBˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹LÊBˆ‹˜Ù[
+”Ý[[X\žH‹UYJBˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹L
+BˆÛÛÝÈHËBˆ‹œÙ]Ùš[ØÛÛÜŠ
+Bˆ›ÜˆX™[˜[[ˆÊ•Ý[™YY˜XÚÈ‹Ý[
+K
+”™\ÛÛ™Y‹™\ÛÛ™Y
+K
+•[œ™\ÛÛ™Y‹[œ™\ÛÛ™Y
+K
+”™\ÛÛ][Ûˆ˜]H‹ˆžÜ™\ÛÛ][Û—Ü˜]_IHŠWN‚ˆ‹˜Ù[
+ÛÛÝËNˆžÛX™[WžÝ˜[H‹›Ü™\LK[YÛHÈ‹š[UYJBˆ‹›ŠN
+Bˆ‹›Š
+B‚ˆÈ˜][™ÈÝ[[X\žBˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹LÊBˆ‹˜Ù[
+”˜][™ÜÈ‹UYJBˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹L
+Bˆ‹˜Ù[
+MKˆ]™\˜YÙH˜][™ÎˆØ]™×Ü˜][™ßHÈH‹Q˜[ÙJBˆ‹˜Ù[
+MKˆ•Ý[˜][™ÜÎˆÝÝ[Ü˜][™ÜßH‹UYJBˆÈ˜][™È\ÝšX][ÛˆX›Bˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹JBˆ›ÜˆH[ˆ˜[™ÙJJN‚ˆ‹˜Ù[
+ÎËˆžÚJÌ_HÝ\ˆ‹›Ü™\LK[YÛHÈ‹š[UYJBˆ‹›ŠÊBˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹JBˆ›ÜˆH[ˆ˜[™ÙJJN‚ˆÝH›Ý[™
+˜][™×Ù\ÝÚWHÈÝ[Ü˜][™ÜÈ
+ˆLJHYˆÝ[Ü˜][™ÜÈˆ[ÙHˆ‹˜Ù[
+ÎËˆžÜ˜][™×Ù\ÝÚW_H
+ÜÝIJH‹›Ü™\LK[YÛHÈŠBˆ‹›ŠÊBˆ‹›ŠŠB‚ˆÈÜÛÛ[Y[™YÝY™‚ˆYˆÜÜÝY™Ž‚ˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹LÊBˆ‹˜Ù[
+•ÜÛÛ[Y[™YÝY™ˆ‹UYJBˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹JBˆ‹œÙ]Ùš[ØÛÛÜŠŒÌŒÌŒÌ
+Bˆ‹˜Ù[
+LËˆÈ‹›Ü™\LK[YÛHÈ‹š[UYJBˆ‹˜Ù[
+LË”ÝY™ˆY[X™\ˆ‹›Ü™\LKš[UYJBˆ‹˜Ù[
+ËÛÛ[Y[™][ÛœÈ‹›Ü™\LK[YÛHÈ‹š[UYJBˆ‹›ŠÊBˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹JBˆ›ÜˆY
+˜[YKÛÝ[
+H[ˆ[[Y\˜]JÜÜÝY™‹JN‚ˆ‹˜Ù[
+LËÝŠY
+K›Ü™\LK[YÛHÈŠBˆ‹˜Ù[
+LË˜[YK›Ü™\LJBˆ‹˜Ù[
+ËÝŠÛÝ[
+K›Ü™\LK[YÛHÈŠBˆ‹›ŠÊBˆ‹›ŠŠB‚ˆÈ™YY˜XÚÈ]Z[X›Bˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹LÊBˆ‹˜Ù[
+‘™YY˜XÚÈ]Z[È‹UYJBˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹
+Bˆ‹œÙ]Ùš[ØÛÛÜŠŒÌŒÌŒÌ
+BˆÛÛÝÚYÈHÌMKÌKKŒMWBˆXY\œÈHÈ’Q‹‘]H‹‘[XZ[‹”™XÙZ\È‹”Ý]\È‹]™È˜][™È—Bˆ›ÜˆK[ˆ[[Y\˜]JXY\œÊN‚ˆ‹˜Ù[
+ÛÛÝÚYÖÚWKË›Ü™\LK[YÛHÈ‹š[UYJBˆ‹›ŠÊB‚ˆ‹œÙ]Ù›Û
+’[™]XØH‹ˆ‹ÊBˆ›Üˆ˜ˆ[ˆ™YY˜XÚ×Û\Ý‚ˆ˜—ÚYH[
+˜–ÈšY—JBˆÝX›Z]YH˜‹™Ù]
+œÝX›Z]YØ]‹ˆŠBˆYˆ\Ø]ŠÝX›Z]YœÝ™[YHŠN‚ˆÝX›Z]YHÝX›Z]YœÝ™[YJ‰[KÉYÉ^HŠBˆ[Yˆ\Ú[œÝ[˜ÙJÝX›Z]YÝŠH[™[ŠÝX›Z]Y
+HˆL‚ˆÝX›Z]YHÝX›Z]YÎŒLBˆ[XZ[H
+˜‹™Ù]
+\Ù\—Ù[XZ[‹ˆŠHÜˆˆŠVÎŒWBˆ™XÙZ\H
+˜‹™Ù]
+œ™XÙZ\Û[X™\ˆ‹ˆŠHÜˆˆŠVÎŒMWBˆÝ]\ÈH˜‹™Ù]
+œÝ]\È‹ˆŠBˆ[œÝÙ\œÈH[œÝÙ\œ×ÛX\™Ù]
+˜—ÚY×JBˆ˜][™ÜÈHÙ›Ø]
+VÈœ˜][™×Ý˜[YH—JH›ÜˆH[ˆ[œÝÙ\œÈYˆK™Ù]
+œ˜][™×Ý˜[YHŠWBˆ]™×ÜˆH›Ý[™
+Ý[J˜][™ÜÊHÈ[Š˜][™ÜÊKJHYˆ˜][™ÜÈ[ÙH“‹ÐH‚‚ˆ‹˜Ù[
+ÛÛÝÚYÖÌK‹ÝŠ˜—ÚY
+K›Ü™\LK[YÛHÈŠBˆ‹˜Ù[
+ÛÛÝÚYÖÌWK‹ÝŠÝX›Z]Y
+K›Ü™\LK[YÛHÈŠBˆ‹˜Ù[
+ÛÛÝÚYÖÌ—K‹[XZ[›Ü™\LJBˆ‹˜Ù[
+ÛÛÝÚYÖÌ×K‹™XÙZ\›Ü™\LK[YÛHÈŠBˆ‹˜Ù[
+ÛÛÝÚYÖÍK‹Ý]\Ë›Ü™\LK[YÛHÈŠBˆ‹˜Ù[
+ÛÛÝÚYÖÍWK‹ÝŠ]™×ÜŠK›Ü™\LK[YÛHÈŠBˆ‹›ŠŠB‚ˆYˆH[Ëž]\ÒSÊ
+Bˆ‹›Ý]]
+YŠBˆY‹œÙYZÊ
+Bˆš[[˜[YHHˆ”™\ÜÞÜÝÜ™VÉÜÝÜ™WÛ˜[YI×Kœ™\XÙJ	È	Ë	×ÉÊ_WÞÛ[ÛÛX™[œ™\XÙJ	È	Ë	×ÉÊ_Kœˆ‚ˆ™]\›ˆÙ[™Ùš[JY‹Z[Y]\OH˜\XØ][Û‹Üˆ‹\×Ø]XÚY[UYKÝÛ›ØYÛ˜[YOYš[[˜[YJB‚ˆÈKKKKKKKKKKKKKKKKKKKKKKKKBˆÈSTUHUQTÕSÓ“RT‘HÔ•QˆÈKKKKKKKKKKKKKKKKKKKKKKKKBˆYˆÝ[˜[ÛÝÛ™\Š\Ù\—ÚYˆ[›Û™HH›Û™JHOˆXÝÜÝ‹[žWN‚ˆZYH[
+\Ù\—ÚYÜˆÙ\ÜÚ[Û–ÉÝ\Ù\—ÚY	×JBˆ\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+ZY
+BˆYˆ›Ý\Ù\Ž‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ•[˜[ÝÛ™\ˆ›Ý›Ý[™ŠBˆ™]\›ˆ\Ù\‚‚ˆYˆ™]ÚÝ[\]WÜ]Y\Ý[Û›˜Z\™JÝÛ™\—Ý\Ù\—ÚYˆ[›Û™HH›Û™KXÙ[œÙWÚÙ^NˆÝˆ›Û™HH›Û™JHOˆXÝÜÝ‹[žWH›Û™N‚ˆÝÛ™\ˆHÝ[˜[ÛÝÛ™\ŠÝÛ™\—Ý\Ù\—ÚY
+BˆY™™XÝ]™WÛXÙ[œÙHHXÙ[œÙWÚÙ^HYˆXÙ[œÙWÚÙ^H\È›Ý›Û™H[ÙHÝÛ™\‹™Ù]
+	ÛXÙ[œÙWÚÙ^IÊBˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆÑSPÕY]K\×ØXÝ]™K™\œÚ[Û‹Ü™X]YØ]\]YØ]ÙÛ×Ý\›ˆÝÛ™\—Ý\Ù\—ÚYXÙ[œÙWÚÙ^Bˆ”“ÓH]Y\Ý[Û›˜Z\™\ÂˆÒT‘H\×Ý[\]HH•QHS‘ÝÛ™\—Ý\Ù\—ÚYH	\ÈS‘XÙ[œÙWÚÙ^HOˆ	\ÂˆÔ‘Tˆ–HYTÐÂˆSRUBˆˆˆ‹ˆ
+ÝÛ™\–ÉÚY	×KY™™XÝ]™WÛXÙ[œÙJKˆ
+Bˆ›ÝÈHÝ\œÛÜ‹™™]ÚÛ™J
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+Bˆ™]\›ˆ›ÝÂ‚ˆYˆ[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™JÝÛ™\—Ý\Ù\—ÚYˆ[›Û™HH›Û™JHOˆXÝÜÝ‹[žWN‚ˆÝÛ™\ˆHÝ[˜[ÛÝÛ™\ŠÝÛ™\—Ý\Ù\—ÚY
+Bˆ^\Ý[™ÈH™]ÚÝ[\]WÜ]Y\Ý[Û›˜Z\™J[
+ÝÛ™\–ÉÚY	×JJBˆYˆ^\Ý[™Î‚ˆ™]\›ˆ^\Ý[™ÂˆÚ]Ù]Ù—ØÛÛ›™XÝ[Û—ÝÚ]Ý˜[œØXÝ[ÛŠ
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÈ[ˆYZ[ˆ™XÙZ]™\ÈH]XÚYÛ˜\ÚÝÙˆH]‹ÔÝ\\˜YZ[‚ˆÈÝ\\ˆ]Y\Ý[Û›˜Z\™KˆHÛÜYY›ÝÜÈ™]™\ˆÚ[˜XÚÈÈBˆÈ]ˆ]Y\Ý[Û›˜Z\™KÛÈÛY[Y]ÈÝ^H[œÚYHZ\ˆÝÛˆXÙ[œÙK‚ˆÝ\\ˆH›Û™BˆYˆÝÛ™\‹™Ù]
+	Ü›ÛIÊHOH	ØYZ[‰Î‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ”ÑSPÕKšYK]KKš\×ØXÝ]™KK™\œÚ[Û‹K›ÙÛ×Ý\›ˆ”“ÓH]Y\Ý[Û›˜Z\™\ÈBˆ“ÒSˆ\Ù\œÈHÓˆKšYHK›ÝÛ™\—Ý\Ù\—ÚYˆÒT‘HKš\×Ý[\]HH•QHS‘Kœ›ÛHH	ÜÝ\\˜YZ[‰ÂˆÔ‘Tˆ–HKšYTÐÈSRUHˆˆ‚ˆ
+BˆÝ\\ˆHÝ\œÛÜ‹™™]ÚÛ™J
+BˆYˆ›ÝÝ\\Ž‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆ”ÑSPÕY]K\×ØXÝ]™K™\œÚ[Û‹ÙÛ×Ý\›ˆ”“ÓH]Y\Ý[Û›˜Z\™\ÂˆÒT‘H\×Ý[\]HH•QHS‘ÝÛ™\—Ý\Ù\—ÚYTÈ•SˆÔ‘Tˆ–HYTÐÈSRUHˆˆŠBˆÝ\\ˆHÝ\œÛÜ‹™™]ÚÛ™J
+BˆY˜][Ý]HHÝ\\–ÌWHYˆÝ\\ˆ[ÙHÝ\ÝÛY\ˆ™YY˜XÚÈ‚ˆY˜][ØXÝ]™HH›ÛÛ
+Ý\\–Ì—JHYˆÝ\\ˆ[ÙHYBˆY˜][Ý™\œÚ[ÛˆH[
+Ý\\–Ì×HÜˆJHYˆÝ\\ˆ[ÙHBˆY˜][ÛÙÛÈHÝ\\–ÍHYˆÝ\\ˆ[ÙH›Û™BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È]Y\Ý[Û›˜Z\™\Âˆ
+ÝÜ™WÚYÝÛ™\—Ý\Ù\—ÚYXÙ[œÙWÚÙ^K]K\×ØXÝ]™K\×Ý[\]K™\œÚ[Û‹ÙÛ×Ý\›
+BˆSQTÈ
+•S	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\ÊBˆˆˆ‹ˆ
+ÝÛ™\–ÉÚY	×KÝÛ™\‹™Ù]
+	ÛXÙ[œÙWÚÙ^IÊKY˜][Ý]KY˜][ØXÝ]™KYKY˜][Ý™\œÚ[Û‹Y˜][ÛÙÛÊKˆ
+Bˆ[\]WÚYH[
+Ý\œÛÜ‹›\Ý›ÝÚY
+BˆÛÜYYØÛÝ[HˆYˆÝ\\Ž‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ”ÑSPÕY]Y\Ý[Û—Ý^]Y\Ý[Û—Ý\K\™Ù]ÜØÛÜKˆZ[—ÛX™[X^ÛX™[[Ý×ØÛÛ[Y[\×Ü™\]Z\™Yˆ]Y\Ý[Û—ÛÜ™\‹\×ØXÝ]™Bˆ”“ÓH]Y\Ý[ÛœÂˆÒT‘H]Y\Ý[Û›˜Z\™WÚYH	\ÈS‘\×Ý[\]HH•QBˆÔ‘Tˆ–H]Y\Ý[Û—ÛÜ™\ˆTÐËYTÐÈSRUHˆˆ‹ˆ
+[
+Ý\\–ÌJK
+Kˆ
+Bˆ›ÜˆÛÝ\˜ÙWÜ]Y\Ý[Ûˆ[ˆÝ\œÛÜ‹™™]Ú[
+
+N‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ’S”ÑT•S•È]Y\Ý[ÛœÂˆ
+]Y\Ý[Û›˜Z\™WÚY]Y\Ý[Û—Ý^]Y\Ý[Û—Ý\K\™Ù]ÜØÛÜKˆZ[—ÛX™[X^ÛX™[[Ý×ØÛÛ[Y[\×Ü™\]Z\™Yˆ]Y\Ý[Û—ÛÜ™\‹\×ØXÝ]™K\×Ý[\]K[\]WÚY
+BˆSQTÈ
+	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë•QK•S
+Hˆˆ‹ˆ
+[\]WÚYÛÝ\˜ÙWÜ]Y\Ý[Û–ÌWKÛÝ\˜ÙWÜ]Y\Ý[Û–Ì—KÛÝ\˜ÙWÜ]Y\Ý[Û–Ì×HÜˆ	ÛÝ™\˜[	ËˆÛÝ\˜ÙWÜ]Y\Ý[Û–ÍKÛÝ\˜ÙWÜ]Y\Ý[Û–ÍWKÛÝ\˜ÙWÜ]Y\Ý[Û–Í—KÛÝ\˜ÙWÜ]Y\Ý[Û–Í×KˆÛÝ\˜ÙWÜ]Y\Ý[Û–ÎKÛÝ\˜ÙWÜ]Y\Ý[Û–ÎWJKˆ
+BˆÛÜYYÜ]Y\Ý[Û—ÚYH[
+Ý\œÛÜ‹›\Ý›ÝÚY
+BˆÝ\œÛÜ‹™^XÝ]Jˆ”ÑSPÕÜ[Û—Ý^”“ÓH]Y\Ý[Û—ÛÜ[ÛœÈÒT‘H]Y\Ý[Û—ÚYH	\ÈÔ‘Tˆ–HYTÐÈ‹ˆ
+[
+ÛÝ\˜ÙWÜ]Y\Ý[Û–ÌJK
+Kˆ
+BˆÛÝ\˜ÙWÛÜ[ÛœÈHÝ\œÛÜ‹™™]Ú[
+
+BˆYˆÛÝ\˜ÙWÛÜ[ÛœÎ‚ˆÝ\œÛÜ‹™^XÝ][X[žJˆ’S”ÑT•S•È]Y\Ý[Û—ÛÜ[ÛœÈ
+]Y\Ý[Û—ÚYÜ[Û—Ý^\×Ý[\]JHSQTÈ
+	\Ë	\Ë•QJH‹ˆÊÛÜYYÜ]Y\Ý[Û—ÚYÜ[Û–ÌJH›ÜˆÜ[Ûˆ[ˆÛÝ\˜ÙWÛÜ[Ûœ×Kˆ
+BˆÛÜYYØÛÝ[
+ÏHB‚ˆ˜[˜XÚ×Ü]Y\Ý[ÛœÈHÂˆ
+’ÝÈÛÝ[[ÝH˜]H[Ý\ˆÝ™\˜[^\šY[˜ÙH[™Ù\šXÙOÈ‹›Ý™\˜[ŠKˆ
+’ÝÈÛÝ[[ÝH˜]HHX[˜YÙ\‰ÜÈÙ\šXÙOÈ‹›X[˜YÙ\ˆŠKˆ
+’ÝÈÛÝ[[ÝH˜]HHÝY™ˆY[X™\ˆÚÈ\ÜÚ\ÝY[ÝOÈ‹œÝY™ˆŠKˆ
+’ÝÈØ]\ÙšYY\™H[ÝHÚ]H]X[]H[ÝH™XÙZ]™YÈ‹›Ý™\˜[ŠKˆ
+’ÝÈZÙ[H\™H[ÝHÈ™XÛÛ[Y[™\ÈÝÜ™OÈ‹›Ý™\˜[ŠKˆBˆYˆÛÜYYØÛÝ[N‚ˆÝ\œÛÜ‹™^XÝ][X[žJˆˆˆ’S”ÑT•S•È]Y\Ý[ÛœÂˆ
+]Y\Ý[Û›˜Z\™WÚY]Y\Ý[Û—Ý^]Y\Ý[Û—Ý\K\™Ù]ÜØÛÜKˆZ[—ÛX™[X^ÛX™[[Ý×ØÛÛ[Y[\×Ü™\]Z\™Yˆ]Y\Ý[Û—ÛÜ™\‹\×ØXÝ]™K\×Ý[\]K[\]WÚY
+BˆSQTÈ
+	\Ë	\Ë	Ü˜][™ÉË	\Ë	ÔÛÜ‰Ë	Ñ^Ù[[	Ë•QKˆ•QK	\Ë•QK•QK•S
+Hˆˆ‹ˆÊ[\]WÚY^ØÛÜKÜ™\ŠBˆ›ÜˆÜ™\‹
+^ØÛÜJH[ˆ[[Y\˜]J˜[˜XÚ×Ü]Y\Ý[ÛœËJBˆYˆÜ™\ˆˆÛÜYYØÛÝ[Kˆ
+BˆÈ^\Ý[™È[˜[]Y\Ý[Û›˜Z\™\È\™H™\Ù\™Y[™™]™\ˆÛX\™Y‚ˆ™]\›ˆÈšYŽˆ[\]WÚY]HŽˆY˜][Ý]Kš\×ØXÝ]™HŽˆY˜][ØXÝ]™Kˆ™\œÚ[ÛˆŽˆY˜][Ý™\œÚ[Û‹˜Ü™X]YØ]Žˆ›Û™Kš\×Ý[\]HŽˆYKˆ›ÝÛ™\—Ý\Ù\—ÚYŽˆÝÛ™\–ÉÚY	×K›XÙ[œÙWÚÙ^HŽˆÝÛ™\‹™Ù]
+	ÛXÙ[œÙWÚÙ^IÊK›ÙÛ×Ý\›ŽˆY˜][ÛÙÛßB‚ˆYˆ™]ÚÝ[˜[Øœ˜[™[™ÊÝÛ™\—Ý\Ù\—ÚYˆ[XÙ[œÙWÚÙ^NˆÝˆ›Û™HH›Û™JHOˆXÝÜÝ‹[žWN‚ˆY˜][ÈHÈœš[X\žWØÛÛÜˆŽˆˆÌPŒQMÍˆ‹œÙXÛÛ™\žWØÛÛÜˆŽˆˆÑÎÌLˆ‹ˆ˜XØÙ[ØÛÛÜˆŽˆˆÑÎÌLˆ‹^ØÛÛÜˆŽˆˆÌŒLLŽHŸBˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÝÛ™\ˆHÝ[˜[ÛÝÛ™\ŠÝÛ™\—Ý\Ù\—ÚY
+BˆY™™XÝ]™WÛXÙ[œÙHHXÙ[œÙWÚÙ^HYˆXÙ[œÙWÚÙ^H\È›Ý›Û™H[ÙHÝÛ™\‹™Ù]
+	ÛXÙ[œÙWÚÙ^IÊBˆØÛÜWÚÙ^HHY™™XÝ]™WÛXÙ[œÙHÜˆˆ\Ù\ŽžÛÝÛ™\—Ý\Ù\—ÚYH‚ˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕš[X\žWØÛÛÜ‹ÙXÛÛ™\žWØÛÛÜ‹XØÙ[ØÛÛÜ‹^ØÛÛÜˆ”“ÓH[˜[Øœ˜[™[™ÈÒT‘HØÛÜWÚÙ^HH	\È‹
+ØÛÜWÚÙ^K
+JBˆœ˜[™[™ÈHÝ\œÛÜ‹™™]ÚÛ™J
+BˆÈ\Ü˜YHH›Ü›Y\ˆÜ˜[™ÙHY˜][[]HÚ[H™\Ù\š[™È[žBˆÈÙ[Z[™[HÝ\ÝÛH[˜[ÛÛÜˆÙ[XÝ[Û‹‚ˆYˆœ˜[™[™È[™œ˜[™[™Ë™Ù]
+œš[X\žWØÛÛÜˆ‹ˆŠK\\Š
+HOHˆÑ‘ŒÍHŽ‚ˆ™]\›ˆY˜][Âˆ™]\›ˆœ˜[™[™ÈÜˆY˜][Âˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆ\˜ÛÛ^Ü›ØÙ\ÜÛÜ‚ˆYˆ[š™XÝÝ[˜[ÝZWØœ˜[™[™Ê
+N‚ˆˆˆ\HÛÛ\[žHÛÛÜœÈÈ]™\žH]][XØ]YÛY[ØYZ[ˆYÙKˆˆˆ‚ˆY˜][ÈHÈœš[X\žWØÛÛÜˆŽˆˆÌPŒQMÍˆ‹œÙXÛÛ™\žWØÛÛÜˆŽˆˆÑÎÌLˆ‹ˆ˜XØÙ[ØÛÛÜˆŽˆˆÑÎÌLˆ‹^ØÛÛÜˆŽˆˆÌŒLLŽHŸBˆ\Ù\—ÚYHÙ\ÜÚ[Û‹™Ù]
+\Ù\—ÚYŠBˆYˆ›Ý\Ù\—ÚY‚ˆ™]\›ˆÈZWØœ˜[™[™ÈŽˆY˜][ßBˆžN‚ˆ\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+[
+\Ù\—ÚY
+JBˆYˆ›Ý\Ù\ˆÜˆ\Ù\‹™Ù]
+œ›ÛHŠHOHœÝ\\˜YZ[ˆŽ‚ˆ™]\›ˆÈZWØœ˜[™[™ÈŽˆY˜][ßBˆYˆ\Ù\‹™Ù]
+œ›ÛHŠHOH˜YZ[ˆŽ‚ˆ™]\›ˆÈZWØœ˜[™[™ÈŽˆ™]ÚÝ[˜[Øœ˜[™[™Ê[
+\Ù\–ÈšY—JK\Ù\‹™Ù]
+›XÙ[œÙWÚÙ^HŠJ_BˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ”ÑSPÕË\Ù\—ÚYË›XÙ[œÙWÚÙ^H”“ÓH\Ù\—ÜÝÜ™\È\Âˆ“ÒSˆÝÜ™\ÈÈÓˆËšYH\ËœÝÜ™WÚYˆÒT‘H\Ë\Ù\—ÚYH	\ÈÔ‘Tˆ–HËšYTÐÈSRUHˆˆ‹ˆ
+[
+\Ù\–ÈšY—JK
+Kˆ
+BˆÝÜ™WÛÝÛ™\ˆHÝ\œÛÜ‹™™]ÚÛ™J
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+BˆYˆÝÜ™WÛÝÛ™\Ž‚ˆ™]\›ˆÈZWØœ˜[™[™ÈŽˆ™]ÚÝ[˜[Øœ˜[™[™Ê[
+ÝÜ™WÛÝÛ™\–È\Ù\—ÚY—JKÝÜ™WÛÝÛ™\‹™Ù]
+›XÙ[œÙWÚÙ^HŠJ_Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹Ø\›š[™Ê•[˜X›HÈØYRHœ˜[™[™Îˆ	\È‹^ÊBˆ™]\›ˆÈZWØœ˜[™[™ÈŽˆY˜][ßB‚ˆYˆÙ]Ü]Y\Ý[Û›˜Z\™WÛXÙ[œÙWÛ[Z]
+ÝÛ™\ŽˆXÝÜÝ‹[žWJHOˆ[‚ˆˆˆ”™]\›ˆXÙ[œÙY
+˜Y][Û˜[
+ˆ]Y\Ý[ÛœÎÈ™\›ÈYX[œÈ›È^˜H]Y\Ý[ÛœËˆˆˆ‚ˆYˆÝÛ™\‹™Ù]
+	Ü›ÛIÊHOH	ØYZ[‰Î‚ˆ™]\›ˆˆXÙ[œÙWÚÙ^HHÝÛ™\‹™Ù]
+	ÛXÙ[œÙWÚÙ^IÊBˆYˆ›ÝXÙ[œÙWÚÙ^N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠÛÛ™šYÝ\™HH˜[YXÙ[œÙHÙ^H™Y›Ü™HX›\Ú[™È]Y\Ý[Û›˜Z\™\ËˆŠBˆÛÛ™šYÈHÙ]ÛXÙ[œÙWØÛÛ™šYÊ
+BˆÜ[Ý\›H›Ü›X[^™WÜÜ[Ý\›
+ÛÛ™šYË™Ù]
+›XÙ[œÚ[™×ÜÜ[Ý\›ŠHYˆÛÛ™šYÈ[ÙH›Û™JBˆžN‚ˆ[\Ü™\]Y\ÝÈ\ÈÜ™\]Y\ÝÂˆ™\ÜÛœÙHHÜ™\]Y\ÝËœÜÝ
+ˆˆžÜÜ[Ý\›KØ\KÝ˜[Y]KÞÛXÙ[œÙWÚÙ^_H‹ˆXY\œÏ[XÙ[œÚ[™×Ø\WÚXY\œÊ
+K[Y[Ý]LLˆ
+Bˆ]HH™\ÜÛœÙKšœÛÛŠ
+HYˆ™\ÜÛœÙK˜ÛÛ[[ÙHßBˆYˆ™\ÜÛœÙKœÝ]\×ØÛÙHOHŒÜˆ›Ý]K™Ù]
+	Ý˜[Y	ÊN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ]K™Ù]
+	ÛY\ÜØYÙIÊHÜˆ•HXÙ[œÙH\È[˜[YÜˆ[˜XÝ]™KˆŠBˆ™]\›ˆX^
+[
+]K™Ù]
+	ÛX^Ü]Y\Ý[Û›˜Z\™\ÉÊHÜˆ
+JBˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ˜Z\ÙBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™\œ›ÜŠ•[˜X›HÈ˜[Y]H]Y\Ý[Û›˜Z\™H[Z]ˆ	\È‹^ÊBˆ˜Z\ÙH˜[YQ\œ›ÜŠ•[˜X›HÈ˜[Y]HH]Y\Ý[Û›˜Z\™HXÙ[œÙH[Z]ˆX\ÙHžHYØZ[‹ˆŠB‚ˆYˆ[™›Ü˜ÙWÜ]Y\Ý[Û›˜Z\™WÛ[Z]
+ÝÛ™\ŽˆXÝÜÝ‹[žWKØØ[™Y]WÜÝÜ™WÚYÎˆ\ÝÚ[JHOˆ›Û™N‚ˆˆˆ’ÙY\Hš]™HÝ\\ˆ]Y\Ý[ÛœÈ\ÈHXÙ[œÙYY][Û˜[[ÝØ[˜ÙKˆˆˆ‚ˆX^Ü]Y\Ý[Û›˜Z\™\ÈHÙ]Ü]Y\Ý[Û›˜Z\™WÛXÙ[œÙWÛ[Z]
+ÝÛ™\ŠBˆ[ÝÙYÝÝ[HH
+ÈX^Ü]Y\Ý[Û›˜Z\™\Âˆ[\]HH™]ÚÝ[\]WÜ]Y\Ý[Û›˜Z\™J[
+ÝÛ™\–ÉÚY	×JKÝÛ™\‹™Ù]
+	ÛXÙ[œÙWÚÙ^IÊJBˆYˆ›Ý[\]N‚ˆ™]\›‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ”ÑSPÕÓÕS•
+
+ŠH”“ÓH]Y\Ý[ÛœÂˆÒT‘H]Y\Ý[Û›˜Z\™WÚYH	\ÈS‘\×Ý[\]HH•QHˆˆ‹ˆ
+[
+[\]VÉÚY	×JK
+Kˆ
+BˆÝ\œ™[ØÛÝ[H[
+Ý\œÛÜ‹™™]ÚÛ™J
+VÌJBˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+BˆYˆÝ\œ™[ØÛÝ[ˆ[ÝÙYÝÝ[‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆˆ”]Y\Ý[Ûˆ[Z]^ÙYYYˆ[Ý\ˆ[ˆ[˜ÛY\ÈHÝ\\ˆ]Y\Ý[ÛœÈ\È‚ˆˆžÛX^Ü]Y\Ý[Û›˜Z\™\ßHY][Û˜[]Y\Ý[ÛŠÊH
+Ø[ÝÙYÝÝ[HÝ[
+Kˆ‚ˆ
+B‚ˆYˆ]Y\Ý[Û›˜Z\™WÜ][ÝWÜÝ]\ÊÝÛ™\ŽˆXÝÜÝ‹[žWJHOˆXÝÜÝ‹[žWN‚ˆY][Û˜[Û[Z]HÙ]Ü]Y\Ý[Û›˜Z\™WÛXÙ[œÙWÛ[Z]
+ÝÛ™\ŠBˆ[ÝÙYÝÝ[HH
+ÈY][Û˜[Û[Z]ˆ[\]HH™]ÚÝ[\]WÜ]Y\Ý[Û›˜Z\™J[
+ÝÛ™\–ÉÚY	×JKÝÛ™\‹™Ù]
+	ÛXÙ[œÙWÚÙ^IÊJBˆYˆ›Ý[\]N‚ˆ™]\›ˆÈ\ÙYŽˆ›X^Žˆ[ÝÙYÝÝ[˜˜\ÙHŽˆKˆ˜Y][Û˜[ŽˆY][Û˜[Û[Z]œ™[XZ[š[™ÈŽˆ[ÝÙYÝÝ[BˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ”ÑSPÕÓÕS•
+
+ŠH”“ÓH]Y\Ý[ÛœÂˆÒT‘H]Y\Ý[Û›˜Z\™WÚYH	\ÈS‘\×Ý[\]HH•QHˆˆ‹ˆ
+[
+[\]VÉÚY	×JK
+Kˆ
+Bˆ\ÙYH[
+Ý\œÛÜ‹™™]ÚÛ™J
+VÌJBˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+Bˆ™]\›ˆÈ\ÙYŽˆ\ÙY›X^Žˆ[ÝÙYÝÝ[˜˜\ÙHŽˆKˆ˜Y][Û˜[ŽˆY][Û˜[Û[Z]œ™[XZ[š[™ÈŽˆX^
+[ÝÙYÝÝ[H\ÙY
+_B‚ˆYˆ\]WÝ[\]WÜ]Y\Ý[Û›˜Z\™J]NˆÝ‹\×ØXÝ]™Nˆ›ÛÛ\]YØ]ˆÝˆ›Û™HH›Û™JHOˆ›Û™N‚ˆˆˆ•\]H[\]H]Y\Ý[Û›˜Z\™HÚ]˜[Y][Û‹ˆˆˆ‚ˆÈ[œ]˜[Y][Û‚ˆYˆ›Ý]HÜˆ›Ý]KœÝš\
+
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ•]H\È™\]Z\™YŠBˆˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+BˆÚ]Ù]Ù—ØÛÛ›™XÝ[Û—ÝÚ]Ý˜[œØXÝ[ÛŠ
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆYˆ\]YØ]‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆTUH]Y\Ý[Û›˜Z\™\ÂˆÑU]HH	\Ë\×ØXÝ]™HH	\Ë\]YØ]H	\ÂˆÒT‘HYH	\Âˆˆˆ‹ˆ
+]KœÝš\
+
+K\×ØXÝ]™K\]YØ][
+[\]VÈšY—JJKˆ
+Bˆ[ÙN‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆTUH]Y\Ý[Û›˜Z\™\ÂˆÑU]HH	\Ë\×ØXÝ]™HH	\Ë\]YØ]H“ÕÊ
+BˆÒT‘HYH	\Âˆˆˆ‹ˆ
+]KœÝš\
+
+K\×ØXÝ]™K[
+[\]VÈšY—JJKˆ
+B‚ˆYˆ™]ÚÝ[\]WÜ]Y\Ý[ÛœÊ[\]WÜ]Y\Ý[Û›˜Z\™WÚYˆ[
+HOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆÑSPÕY]Y\Ý[Û—Ý^]Y\Ý[Û—Ý\K\™Ù]ÜØÛÜKZ[—ÛX™[X^ÛX™[[Ý×ØÛÛ[Y[\×Ü™\]Z\™Y]Y\Ý[Û—ÛÜ™\‚ˆ”“ÓH]Y\Ý[ÛœÂˆÒT‘H]Y\Ý[Û›˜Z\™WÚYH	\ÂˆÔ‘Tˆ–H]Y\Ý[Û—ÛÜ™\ˆTÐËYTÐÂˆˆˆ‹ˆ
+[\]WÜ]Y\Ý[Û›˜Z\™WÚY
+Kˆ
+Bˆ›ÝÜÈHÝ\œÛÜ‹™™]Ú[
+
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+Bˆ™]\›ˆ›ÝÜÂ‚ˆYˆ™]ÚÝ[\]WÛÜ[Ûœ×ØžWÜ]Y\Ý[ÛŠ[\]WÜ]Y\Ý[Û—ÚYÎˆ\ÝÚ[JHOˆXÝÚ[\ÝÑXÝÜÝ‹[žWWWN‚ˆYˆ›Ý[\]WÜ]Y\Ý[Û—ÚYÎ‚ˆ™]\›ˆßBˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆXÙZÛ\œÈH‹‹š›Ú[ŠÈ‰\È—H
+ˆ[Š[\]WÜ]Y\Ý[Û—ÚYÊJBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕ]Y\Ý[Û—ÚYYÜ[Û—Ý^ˆ”“ÓH]Y\Ý[Û—ÛÜ[ÛœÂˆÒT‘H]Y\Ý[Û—ÚYSˆ
+ÜXÙZÛ\œßJBˆÔ‘Tˆ–H]Y\Ý[Û—ÚYTÐËYTÐÂˆˆˆ‹ˆ\J[\]WÜ]Y\Ý[Û—ÚYÊKˆ
+Bˆ›ÝÜÈHÝ\œÛÜ‹™™]Ú[
+
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+BˆžWÜNˆXÝÚ[\ÝÑXÝÜÝ‹[žWWWHHßBˆ›Üˆˆ[ˆ›ÝÜÎ‚ˆZYH[
+–Èœ]Y\Ý[Û—ÚY—JBˆžWÜKœÙ]Y˜][
+ZY×JK˜\[™
+ÈšYŽˆ–ÈšY—K›Ü[Û—Ý^Žˆ–È›Ü[Û—Ý^—_JBˆ™]\›ˆžWÜB‚ˆYˆYÝ[\]WÜ]Y\Ý[ÛŠˆ[\]WÜ]Y\Ý[Û›˜Z\™WÚYˆ[ˆ]Y\Ý[Û—Ý^ˆÝ‹ˆ]Y\Ý[Û—Ý\NˆÝ‹ˆ\×Ü™\]Z\™Yˆ›ÛÛˆ]Y\Ý[Û—ÛÜ™\Žˆ[ˆZ[—ÛX™[ˆÝˆH”ÛÜˆ‹ˆX^ÛX™[ˆÝˆH‘^Ù[[‹ˆ[Ý×ØÛÛ[Y[ˆ›ÛÛH˜[ÙKˆ\™Ù]ÜØÛÜNˆÝˆH›Ý™\˜[‹ˆ
+HOˆ[‚ˆˆˆYH[\]H]Y\Ý[ÛˆÚ]˜[Y][Û‹ˆˆˆ‚ˆÈ[œ]˜[Y][Û‚ˆYˆ›Ý]Y\Ý[Û—Ý^Üˆ›Ý]Y\Ý[Û—Ý^œÝš\
+
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ”]Y\Ý[Ûˆ^\È™\]Z\™YŠBˆYˆ]Y\Ý[Û—Ý\H›Ý[ˆÈœ˜][™È‹^‹›][\WØÚÚXÙH—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[Y]Y\Ý[Ûˆ\HŠBˆYˆ\™Ù]ÜØÛÜH›Ý[ˆÈ›Ý™\˜[‹œÝY™ˆ‹›X[˜YÙ\ˆ—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[Y]Y\Ý[Ûˆ\™Ù]ŠBˆYˆ]Y\Ý[Û—ÛÜ™\ˆ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ”]Y\Ý[ÛˆÜ™\ˆ]\Ý™H›Û‹[™YØ]]™HŠBˆˆÚ]Ù]Ù—ØÛÛ›™XÝ[Û—ÝÚ]Ý˜[œØXÝ[ÛŠ
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È]Y\Ý[ÛœÂˆ
+]Y\Ý[Û›˜Z\™WÚY]Y\Ý[Û—Ý^]Y\Ý[Û—Ý\K\™Ù]ÜØÛÜKZ[—ÛX™[X^ÛX™[[Ý×ØÛÛ[Y[\×Ü™\]Z\™Y]Y\Ý[Û—ÛÜ™\‹\×Ý[\]JBˆSQTÈ
+	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\ÊBˆˆˆ‹ˆ
+[\]WÜ]Y\Ý[Û›˜Z\™WÚY]Y\Ý[Û—Ý^œÝš\
+
+K]Y\Ý[Û—Ý\K\™Ù]ÜØÛÜKZ[—ÛX™[X^ÛX™[[Ý×ØÛÛ[Y[\×Ü™\]Z\™Y]Y\Ý[Û—ÛÜ™\‹YJKˆ
+Bˆ™]\›ˆ[
+Ý\œÛÜ‹›\Ý›ÝÚY
+B‚ˆYˆ[]WÝ[\]WÜ]Y\Ý[ÛŠ[\]WÜ]Y\Ý[Û—ÚYˆ[
+HOˆ›Û™N‚ˆˆˆ‘[]HH[\]H]Y\Ý[ÛˆžHQˆˆˆ‚ˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+BˆÚ]Ù]Ù—ØÛÛ›™XÝ[Û—ÝÚ]Ý˜[œØXÝ[ÛŠ
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]J‘SUH”“ÓH]Y\Ý[ÛœÈÒT‘HYH	\ÈS‘]Y\Ý[Û›˜Z\™WÚYH	\ÈS‘\×Ý[\]HH•QH‹
+[\]WÜ]Y\Ý[Û—ÚY[\]VÉÚY	×JJB‚ˆYˆ\]WÝ[\]WÜ]Y\Ý[ÛŠ]Y\Ý[Û—ÚYˆ[]Y\Ý[Û—Ý^ˆÝ‹]Y\Ý[Û—Ý\NˆÝ‹\×Ü™\]Z\™Yˆ›ÛÛZ[—ÛX™[ˆÝˆH”ÛÜˆ‹X^ÛX™[ˆÝˆH‘^Ù[[‹[Ý×ØÛÛ[Y[ˆ›ÛÛH˜[ÙK\™Ù]ÜØÛÜNˆÝˆH›Ý™\˜[ŠHOˆ›Û™N‚ˆˆˆ•\]HH[\]H]Y\Ý[ÛˆÚ]˜[Y][Û‹ˆˆˆ‚ˆÈ[œ]˜[Y][Û‚ˆYˆ›Ý]Y\Ý[Û—Ý^Üˆ›Ý]Y\Ý[Û—Ý^œÝš\
+
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ”]Y\Ý[Ûˆ^\È™\]Z\™YŠBˆYˆ]Y\Ý[Û—Ý\H›Ý[ˆÈœ˜][™È‹^‹›][\WØÚÚXÙH—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[Y]Y\Ý[Ûˆ\HŠBˆYˆ\™Ù]ÜØÛÜH›Ý[ˆÈ›Ý™\˜[‹œÝY™ˆ‹›X[˜YÙ\ˆ—N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ’[˜[Y]Y\Ý[Ûˆ\™Ù]ŠBˆˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+BˆÚ]Ù]Ù—ØÛÛ›™XÝ[Û—ÝÚ]Ý˜[œØXÝ[ÛŠ
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆTUH]Y\Ý[ÛœÂˆÑU]Y\Ý[Û—Ý^H	\Ë]Y\Ý[Û—Ý\HH	\Ë\™Ù]ÜØÛÜHH	\Ë\×Ü™\]Z\™YH	\ËZ[—ÛX™[H	\ËX^ÛX™[H	\Ë[Ý×ØÛÛ[Y[H	\ÂˆÒT‘HYH	\ÈS‘]Y\Ý[Û›˜Z\™WÚYH	\ÈS‘\×Ý[\]HH•QBˆˆˆ‹ˆ
+]Y\Ý[Û—Ý^œÝš\
+
+K]Y\Ý[Û—Ý\K\™Ù]ÜØÛÜK\×Ü™\]Z\™YZ[—ÛX™[X^ÛX™[[Ý×ØÛÛ[Y[]Y\Ý[Û—ÚY[\]VÉÚY	×JKˆ
+B‚ˆYˆYÝ[\]WÛÜ[ÛŠ[\]WÜ]Y\Ý[Û—ÚYˆ[Ü[Û—Ý^ˆÝŠHOˆ[‚ˆˆˆYH[\]HÜ[ÛˆÚ]˜[Y][Û‹ˆˆˆ‚ˆÈ[œ]˜[Y][Û‚ˆYˆ›ÝÜ[Û—Ý^Üˆ›ÝÜ[Û—Ý^œÝš\
+
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ“Ü[Ûˆ^\È™\]Z\™YŠBˆˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+BˆÚ]Ù]Ù—ØÛÛ›™XÝ[Û—ÝÚ]Ý˜[œØXÝ[ÛŠ
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕH”“ÓH]Y\Ý[ÛœÈÒT‘HYH	\ÈS‘]Y\Ý[Û›˜Z\™WÚYH	\ÈS‘\×Ý[\]HH•QH‹
+[\]WÜ]Y\Ý[Û—ÚY[\]VÉÚY	×JJBˆYˆ›ÝÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ”]Y\Ý[ÛˆÙ\È›Ý™[Û™ÈÈ\ÈXÙ[œÙHŠBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È]Y\Ý[Û—ÛÜ[ÛœÈ
+]Y\Ý[Û—ÚYÜ[Û—Ý^
+BˆSQTÈ
+	\Ë	\ÊBˆˆˆ‹ˆ
+[\]WÜ]Y\Ý[Û—ÚYÜ[Û—Ý^œÝš\
+
+JKˆ
+Bˆ™]\›ˆ[
+Ý\œÛÜ‹›\Ý›ÝÚY
+B‚ˆYˆ[]WÝ[\]WÛÜ[ÛŠ[\]WÛÜ[Û—ÚYˆ[
+HOˆ›Û™N‚ˆˆˆ‘[]HH[\]HÜ[ÛˆžHQˆˆˆ‚ˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+BˆÚ]Ù]Ù—ØÛÛ›™XÝ[Û—ÝÚ]Ý˜[œØXÝ[ÛŠ
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]Jˆˆ‘SUH[È”“ÓH]Y\Ý[Û—ÛÜ[ÛœÈ[ÂˆS“‘Tˆ“ÒSˆ]Y\Ý[ÛœÈHÓˆKšYH[Ëœ]Y\Ý[Û—ÚYˆÒT‘H[ËšYH	\ÈS‘Kœ]Y\Ý[Û›˜Z\™WÚYH	\ÈS‘Kš\×Ý[\]HH•QHˆˆ‹ˆ
+[\]WÛÜ[Û—ÚY[\]VÉÚY	×JJB‚ˆYˆX›\ÚÝ[\]WÝ×Ø[ÜÝÜ™\Ê
+HOˆ[‚ˆˆˆ”X›\ÚÛ›H[œÚYHHÚYÛ™YZ[ˆYZ[‰ÜÈ[˜[ÛXÙ[œÙHØÛÜKˆˆˆ‚ˆÝÛ™\ˆHÝ[˜[ÛÝÛ™\Š
+Bˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+Bˆ[\]WÚYH[
+[\]VÈšY—JBˆ[\]WÜ]Y\Ý[ÛœÈH™]ÚÝ[\]WÜ]Y\Ý[ÛœÊ[\]WÜ]Y\Ý[Û›˜Z\™WÚY][\]WÚY
+Bˆ[\]WÛÜ[Ûœ×ØžWÜ]Y\Ý[Û—ÚYH™]ÚÝ[\]WÛÜ[Ûœ×ØžWÜ]Y\Ý[ÛŠÚ[
+VÈšY—JH›ÜˆH[ˆ[\]WÜ]Y\Ý[Ûœ×JB‚ˆÝÜ™\ÈHÜÝÜ™H›ÜˆÝÜ™H[ˆ™]ÚÜÝÜ™\Ê\Ù\—ÚYZ[
+ÝÛ™\–ÉÚY	×JJBˆYˆ
+ÝÜ™K™Ù]
+	ÛXÙ[œÙWÚÙ^IÊHÜˆ›Û™JHOH
+ÝÛ™\‹™Ù]
+	ÛXÙ[œÙWÚÙ^IÊHÜˆ›Û™JWBˆ[™›Ü˜ÙWÜ]Y\Ý[Û›˜Z\™WÛ[Z]
+ÝÛ™\‹Ú[
+ÝÜ™VÉÚY	×JH›ÜˆÝÜ™H[ˆÝÜ™\×JBˆÚ]Ù]Ù—ØÛÛ›™XÝ[Û—ÝÚ]Ý˜[œØXÝ[ÛŠ
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆX›\ÚYØÛÝ[H‚ˆ›ÜˆÝÜ™H[ˆÝÜ™\Î‚ˆÝÜ™WÚYH[
+ÝÜ™VÈšY—JB‚ˆÈÚXÚÈYˆÝÜ™H[™XYH\ÈH]Y\Ý[Û›˜Z\™BˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕY”“ÓH]Y\Ý[Û›˜Z\™\ÈÒT‘HÝÜ™WÚYH	\ÈS‘\×Ý[\]HHSÑHÔ‘Tˆ–HYTÐÈSRUH‹
+ÝÜ™WÚY
+JBˆ^\Ý[™ÈHÝ\œÛÜ‹™™]ÚÛ™J
+BˆˆYˆ^\Ý[™Î‚ˆÈ\]H^\Ý[™È]Y\Ý[Û›˜Z\™HY]Y]HÚ]Ý][][™È]ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆTUH]Y\Ý[Û›˜Z\™\ÂˆÑU]HH	\Ë\×ØXÝ]™HH	\Ë[\]WÚYH	\ËˆÝÛ™\—Ý\Ù\—ÚYH	\ËXÙ[œÙWÚÙ^HH	\ËÙÛ×Ý\›H	\ÂˆÒT‘HYH	\Âˆˆˆ‹ˆ
+[\]VÈ]H—K›ÛÛ
+[\]VÈš\×ØXÝ]™H—JK[\]WÚYˆÝÛ™\–ÉÚY	×KÝÛ™\‹™Ù]
+	ÛXÙ[œÙWÚÙ^IÊKÝÜ™K™Ù]
+	ÛÙÛ×Ý\›	ÊHÜˆ[\]K™Ù]
+	ÛÙÛ×Ý\›	ÊK[
+^\Ý[™ÖÈšY—JJKˆ
+Bˆ]Y\Ý[Û›˜Z\™WÚYH[
+^\Ý[™ÖÈšY—JBˆˆÈXXÝ]˜]H^\Ý[™È]Y\Ý[ÛœÈ[œÝXYÙˆ[][™È[BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆTUH]Y\Ý[ÛœÂˆÑU\×ØXÝ]™HHSÑBˆÒT‘H]Y\Ý[Û›˜Z\™WÚYH	\ÈS‘\×Ý[\]HHSÑBˆˆˆ‹ˆ
+]Y\Ý[Û›˜Z\™WÚY
+Kˆ
+Bˆ[ÙN‚ˆÈÜ™X]H™]ÈÝÜ™H]Y\Ý[Û›˜Z\™BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È]Y\Ý[Û›˜Z\™\Âˆ
+ÝÜ™WÚYÝÛ™\—Ý\Ù\—ÚYXÙ[œÙWÚÙ^K]K\×ØXÝ]™K\×Ý[\]K[\]WÚYÙÛ×Ý\›
+BˆSQTÈ
+	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\ÊBˆˆˆ‹ˆ
+ÝÜ™WÚYÝÛ™\–ÉÚY	×KÝÛ™\‹™Ù]
+	ÛXÙ[œÙWÚÙ^IÊK[\]VÈ]H—Kˆ›ÛÛ
+[\]VÈš\×ØXÝ]™H—JK˜[ÙK[\]WÚYÝÜ™K™Ù]
+	ÛÙÛ×Ý\›	ÊHÜˆ[\]K™Ù]
+	ÛÙÛ×Ý\›	ÊJKˆ
+Bˆ]Y\Ý[Û›˜Z\™WÚYH[
+Ý\œÛÜ‹›\Ý›ÝÚY
+B‚ˆÈY™]ÈXÝ]™H]Y\Ý[ÛœÈœ›ÛH[\]Bˆ]Y\Ý[Û—ÚYÛX\ˆXÝÚ[[HHßBˆ›ÜˆH[ˆ[\]WÜ]Y\Ý[ÛœÎ‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È]Y\Ý[ÛœÂˆ
+]Y\Ý[Û›˜Z\™WÚY]Y\Ý[Û—Ý^]Y\Ý[Û—Ý\K\™Ù]ÜØÛÜKZ[—ÛX™[X^ÛX™[[Ý×ØÛÛ[Y[\×Ü™\]Z\™Y]Y\Ý[Û—ÛÜ™\‹\×Ý[\]K[\]WÚY
+BˆSQTÈ
+	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\ÊBˆˆˆ‹ˆ
+ˆ]Y\Ý[Û›˜Z\™WÚYˆVÈœ]Y\Ý[Û—Ý^—KˆVÈœ]Y\Ý[Û—Ý\H—KˆK™Ù]
+\™Ù]ÜØÛÜH‹›Ý™\˜[ŠKˆK™Ù]
+›Z[—ÛX™[‹”ÛÜˆŠKˆK™Ù]
+›X^ÛX™[‹‘^Ù[[ŠKˆ›ÛÛ
+K™Ù]
+˜[Ý×ØÛÛ[Y[‹˜[ÙJJKˆ›ÛÛ
+VÈš\×Ü™\]Z\™Y—JKˆ[
+VÈœ]Y\Ý[Û—ÛÜ™\ˆ—JKˆ˜[ÙKÈÝÜ™H]Y\Ý[ÛœÈ\™H›Ý[\]\Âˆ[
+VÈšY—JKÈ[šÈÈ[\]H]Y\Ý[Û‚ˆ
+Kˆ
+Bˆ™]×ÜZYH[
+Ý\œÛÜ‹›\Ý›ÝÚY
+Bˆ]Y\Ý[Û—ÚYÛX\Ú[
+VÈšY—JWHH™]×ÜZY‚ˆ›ÜˆÛÝWÚYÜÈ[ˆ[\]WÛÜ[Ûœ×ØžWÜ]Y\Ý[Û—ÚYš][\Ê
+N‚ˆ™]×ÜZYH]Y\Ý[Û—ÚYÛX\™Ù]
+[
+ÛÝWÚY
+JBˆYˆ›Ý™]×ÜZY‚ˆÛÛ[YBˆ›ÜˆÜ[ˆÜÎ‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È]Y\Ý[Û—ÛÜ[ÛœÈ
+]Y\Ý[Û—ÚYÜ[Û—Ý^
+BˆSQTÈ
+	\Ë	\ÊBˆˆˆ‹ˆ
+™]×ÜZYÜÈ›Ü[Û—Ý^—JKˆ
+B‚ˆX›\ÚYØÛÝ[
+ÏHB‚ˆ™]\›ˆX›\ÚYØÛÝ[‚ˆ\œ›Ý]J‹ÈŠBˆYˆ[™^
+
+N‚ˆYˆ	Ý\Ù\—ÚY	È[ˆÙ\ÜÚ[ÛŽ‚ˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ù\Ú›Ø\™ŠJBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›ÙÚ[ˆŠJB‚ˆ\œ›Ý]J‹ÛÙÚ[ˆ‹Y]ÙÏVÈ‘ÑU‹”ÔÕ—JBˆYˆÙÚ[Š
+N‚ˆYˆ™\]Y\Ý›Y]ÙOH”ÔÕŽ‚ˆ\Ù\›˜[YHH™\]Y\Ý™›Ü›K™Ù]
+\Ù\›˜[YH‹ˆŠKœÝš\
+
+Bˆ\ÜÝÛÜ™H™\]Y\Ý™›Ü›K™Ù]
+œ\ÜÝÛÜ™‹ˆŠBˆˆYˆ›Ý\Ù\›˜[YHÜˆ›Ý\ÜÝÛÜ™‚ˆ›\Ú
+•\Ù\›˜[YH[™\ÜÝÛÜ™\™H™\]Z\™Yˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›ÙÚ[ˆŠJBˆˆ\Ù\ˆHÙ]Ý\Ù\—ØžWÝ\Ù\›˜[YJ\Ù\›˜[YJBˆYˆ›Ý\Ù\Ž‚ˆ›\Ú
+’[˜[Y\Ù\›˜[YHÜˆ\ÜÝÛÜ™ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›ÙÚ[ˆŠJBˆˆYˆ›Ý\Ù\–ÉÚ\×ØXÝ]™I×N‚ˆ›\Ú
+–[Ý\ˆXØÛÝ[\È™Y[ˆXXÝ]˜]Yˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›ÙÚ[ˆŠJBˆˆYˆ™\šYžWÜ\ÜÝÛÜ™
+\ÜÝÛÜ™\Ù\–ÉÜ\ÜÝÛÜ™Ú\Ú	×JN‚ˆYˆÙ^\™YÛXÙ[œÙWÙ›Ü—Ý\Ù\Š\Ù\‹›Ü˜ÙOUYJN‚ˆ›\Ú
+“XÙ[œÙH^\™YˆX\ÙH™[™]È[Ý\ˆXÙ[œÙKˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›ÙÚ[ˆŠJBˆÙ\ÜÚ[Û–ÉÝ\Ù\—ÚY	×HH\Ù\–ÉÚY	×BˆÙ\ÜÚ[Û–ÉÝ\Ù\›˜[YI×HH\Ù\–ÉÝ\Ù\›˜[YI×BˆÙ\ÜÚ[Û–ÉÜ›ÛI×HH\Ù\–ÉÜ›ÛI×Bˆ›\Ú
+ˆ•Ù[ÛÛYH˜XÚËÝ\Ù\–ÉÝ\Ù\›˜[YI×_HH‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ù\Ú›Ø\™ŠJBˆ[ÙN‚ˆ›\Ú
+’[˜[Y\Ù\›˜[YHÜˆ\ÜÝÛÜ™ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›ÙÚ[ˆŠJBˆˆ™]\›ˆ™[™\—Ý[\]J˜]]ÛÙÚ[‹š[ŠB‚ˆ\œ›Ý]J‹ÛÙÛÝ]ŠBˆYˆÙÛÝ]
+
+N‚ˆÙ\ÜÚ[Û‹˜ÛX\Š
+Bˆ›\Ú
+–[ÝH]™H™Y[ˆÙÙÙYÝ]ˆ‹š[™›ÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›ÙÚ[ˆŠJB‚ˆ\œ›Ý]J‹Ø\KÛXÙ[œÙKÜ™Yœ™\Ú‹Y]ÙÏVÈ‘ÑU—JBˆÙÚ[—Ü™\]Z\™YˆYˆ\WÜ™Yœ™\ÚÛXÙ[œÙWÜÝ]\Ê
+N‚ˆˆˆž\\ÜÈHÝ\›HØXÚHÛÈHÛÛ\]Y™[™]Ø[ÛX\œÈ[[YYX][Kˆˆˆ‚ˆ\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+Ù\ÜÚ[Û–È\Ù\—ÚY—JBˆYˆ›Ý\Ù\ˆÜˆ\Ù\‹™Ù]
+œ›ÛHŠHOH˜YZ[ˆˆÜˆ›Ý\Ù\‹™Ù]
+›XÙ[œÙWÚÙ^HŠN‚ˆ™]\›ˆœÛÛšYžJÈœÝXØÙ\ÜÈŽˆ˜[ÙK™\œ›ÜˆŽˆ“›ÈÛY[XÙ[œÙHÛÛ›™XÝYŸJKÂˆÝ]\ÈH˜[Y]WÝ[˜[ÛXÙ[œÙJ\Ù\–È›XÙ[œÙWÚÙ^H—K›Ü˜ÙOUYJBˆ^\žHHÜ\œÙWÛXÙ[œÙWÙ^\žJÝ]\ÊBˆÙXÛÛ™×ÛYH[
+
+^\žHH]][YK››ÝÊ[Y^›Û™K]ÊJKÝ[ÜÙXÛÛ™Ê
+JHYˆ^\žH[ÙH›Û™Bˆ™]\›ˆœÛÛšYžJÂˆœÝXØÙ\ÜÈŽˆYKˆ™^\™YŽˆÛXÙ[œÙWÚ\×Ù^\™Y
+Ý]\ÊKˆœÚÝ×ÝØ\›š[™ÈŽˆÙXÛÛ™×ÛY\È›Ý›Û™H[™ÙXÛÛ™×ÛYHÌ
+ˆ
+ˆŒ
+ˆŒˆ™^\™\×Ø]Žˆ^\žKš\ÛÙ›Ü›X]
+
+HYˆ^\žH[ÙH›Û™Kˆ™^\žWÙ]HŽˆ^\žKœÝ™[YJ‰Pˆ	Y	VHŠHYˆ^\žH[ÙH›Û™KˆJB‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™H‹Y]ÙÏVÈ‘ÑU‹”ÔÕ—JBˆÙÚ[—Ü™\]Z\™YˆYˆX\Ý\—Ü]Y\Ý[Û›˜Z\™J
+N‚ˆ\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+Ù\ÜÚ[Û–ÉÝ\Ù\—ÚY	×JBˆYˆ›Ý\Ù\ˆÜˆ\Ù\‹™Ù]
+	Ü›ÛIÊH›Ý[ˆ
+	ØYZ[‰Ë	ÜÝ\\˜YZ[‰ÊN‚ˆ›\Ú
+–[ÝHÛ‰Ý]™H\›Z\ÜÚ[ÛˆÈX[˜YÙH]Y\Ý[Û›˜Z\™\Ëˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ù\Ú›Ø\™ŠJBˆYˆ™\]Y\Ý›Y]ÙOH”ÔÕŽ‚ˆ]HH™\]Y\Ý™›Ü›K™Ù]
+]H‹ˆŠKœÝš\
+
+Bˆ\]YØ]H™\]Y\Ý™›Ü›K™Ù]
+\]YØ]‹ˆŠKœÝš\
+
+BˆYˆ›Ý]N‚ˆ›\Ú
+•[\]H]Y\Ý[Û›˜Z\™H]H\È™\]Z\™Yˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJBˆˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+BˆÛÝ]HH[\]K™Ù]
+]H‹ˆŠBˆˆ\]WÝ[\]WÜ]Y\Ý[Û›˜Z\™J]O]]K\]YØ]]\]YØ]Yˆ\]YØ][ÙH›Û™JBˆˆÈÙÈ]Y\Ý[Û›˜Z\™HÚ[™Ù\ÂˆÚ[™Ù\ÈH×BˆYˆÛÝ]HOH]N‚ˆÚ[™Ù\Ë˜\[™
+ˆ•]NˆÛÛÝ]_H8¡¤ˆÝ]_HŠBˆˆYˆÚ[™Ù\Î‚ˆÙ×Ø]Y]
+ˆ[]WÝ\OHœ]Y\Ý[Û›˜Z\™H‹ˆ[]WÚYZ[
+[\]VÈšY—JKˆXÝ[ÛH\]Y‹ˆÛÝ˜[Y\ÏYˆžÉË	Ëš›Ú[ŠÚ[™Ù\Ê_H‚ˆ
+Bˆˆ›\Ú
+”]Y\Ý[Û›˜Z\™HØ]™YÝXØÙ\ÜÙ[H‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆÈÚ[™ÛH]X˜\ÙHÛÛ›™XÝ[Ûˆ›Üˆ™]\ˆ\™›Ü›X[˜ÙBˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆˆÈÛ™HX\Ý\ˆ[\]H\ˆYZ[‹ÛXÙ[œÙH[˜[‚ˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+BˆˆÈ[š]X[^™H]Y\Ý[ÛœÈ[™Ü[ÛœÂˆ]Y\Ý[ÛœÈH×BˆÜ[Ûœ×ØžWÜ]Y\Ý[Û—ÚYHßBˆˆYˆ[\]N‚ˆ[\]WÚYH[
+[\]VÈšY—JBˆˆÈÙ]]Y\Ý[ÛœÈÚ]Ú[™ÛH]Y\žBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆÑSPÕKšYKœ]Y\Ý[Û—Ý^Kœ]Y\Ý[Û—Ý\KK\™Ù]ÜØÛÜKK›Z[—ÛX™[K›X^ÛX™[ˆK˜[Ý×ØÛÛ[Y[Kš\×Ü™\]Z\™YKœ]Y\Ý[Û—ÛÜ™\‹ˆ[ËšY\ÈÜ[Û—ÚY[Ë›Ü[Û—Ý^ˆ”“ÓH]Y\Ý[ÛœÈBˆQ•“ÒSˆ]Y\Ý[Û—ÛÜ[ÛœÈ[ÈÓˆKšYH[Ëœ]Y\Ý[Û—ÚYˆÒT‘HKœ]Y\Ý[Û›˜Z\™WÚYH	\ÂˆÔ‘Tˆ–HKœ]Y\Ý[Û—ÛÜ™\ˆTÐËKšYTÐË[ËšYTÐÂˆˆˆ‹ˆ
+[\]WÚY
+Kˆ
+Bˆ›ÝÜÈHÝ\œÛÜ‹™™]Ú[
+
+BˆˆÈÜ™Ø[š^™H]Y\Ý[ÛœÈ[™Ü[ÛœÂˆÝ\œ™[Ü]Y\Ý[ÛˆH›Û™Bˆˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆZYH[
+›ÝÖÈšY—JBˆˆÈÜ™X]H]Y\Ý[ÛˆYˆ›Ý^\ÝÂˆYˆZY›Ý[ˆÜK™Ù]
+šYŠH›ÜˆH[ˆ]Y\Ý[Ûœ×N‚ˆ]Y\Ý[ÛœË˜\[™
+ÂˆšYŽˆZYˆœ]Y\Ý[Û—Ý^Žˆ›ÝÖÈœ]Y\Ý[Û—Ý^—Kˆœ]Y\Ý[Û—Ý\HŽˆ›ÝÖÈœ]Y\Ý[Û—Ý\H—Kˆ\™Ù]ÜØÛÜHŽˆ›ÝÖÈ\™Ù]ÜØÛÜH—HÜˆ›Ý™\˜[‹ˆ›Z[—ÛX™[Žˆ›ÝÖÈ›Z[—ÛX™[—Kˆ›X^ÛX™[Žˆ›ÝÖÈ›X^ÛX™[—Kˆ˜[Ý×ØÛÛ[Y[Žˆ›ÛÛ
+›ÝÖÈ˜[Ý×ØÛÛ[Y[—JKˆš\×Ü™\]Z\™YŽˆ›ÛÛ
+›ÝÖÈš\×Ü™\]Z\™Y—JKˆœ]Y\Ý[Û—ÛÜ™\ˆŽˆ[
+›ÝÖÈœ]Y\Ý[Û—ÛÜ™\ˆ—JBˆJBˆÜ[Ûœ×ØžWÜ]Y\Ý[Û—ÚYÜZYHH×BˆˆÈYÜ[ÛˆYˆ^\ÝÂˆYˆ›ÝÖÈ›Ü[Û—ÚY—N‚ˆÜ[Ûœ×ØžWÜ]Y\Ý[Û—ÚYÜZYK˜\[™
+ÂˆšYŽˆ›ÝÖÈ›Ü[Û—ÚY—Kˆ›Ü[Û—Ý^Žˆ›ÝÖÈ›Ü[Û—Ý^—BˆJBˆˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆžN‚ˆ]Y\Ý[Û›˜Z\™WÜ][ÝHH]Y\Ý[Û›˜Z\™WÜ][ÝWÜÝ]\Ê\Ù\ŠBˆ]Y\Ý[Û›˜Z\™WÜ][ÝWÙ\œ›ÜˆH›Û™Bˆ^Ù\˜[YQ\œ›Üˆ\È^Î‚ˆ]Y\Ý[Û›˜Z\™WÜ][ÝHH›Û™Bˆ]Y\Ý[Û›˜Z\™WÜ][ÝWÙ\œ›ÜˆHÝŠ^ÊB‚ˆ™]\›ˆ™[™\—Ý[\]Jˆ›X\Ý\—Ü]Y\Ý[Û›˜Z\™KÛX\Ý\—Ü]Y\Ý[Û›˜Z\™Kš[‹ˆX\Ý\][\]Kˆ]Y\Ý[ÛœÏ\]Y\Ý[ÛœËˆÜ[Ûœ×ØžWÜ]Y\Ý[Û—ÚY[Ü[Ûœ×ØžWÜ]Y\Ý[Û—ÚYˆœ˜[™[™ÏY™]ÚÝ[˜[Øœ˜[™[™Ê[
+\Ù\–ÉÚY	×JJKˆ]Y\Ý[Û›˜Z\™WÜ][ÝO\]Y\Ý[Û›˜Z\™WÜ][ÝKˆ]Y\Ý[Û›˜Z\™WÜ][ÝWÙ\œ›Ü\]Y\Ý[Û›˜Z\™WÜ][ÝWÙ\œ›Ü‹ˆ
+B‚ˆ\œ›Ý]J‹ØYZ[‹Û^K\Ý\™^H‹Y]ÙÏVÈ‘ÑU—JBˆ›ÛWÜ™\]Z\™Y
+	Ý\Ù\‰ÊBˆYˆ\ÜÚYÛ™YÜÝÜ™WÜÝ\™^J
+N‚ˆˆˆ“Ü[ˆHX›XÈÝ\™^H›ÜˆHšY]Ù\‰ÜÈ\ÜÚYÛ™Yœ˜[˜ÚÛ›Kˆˆˆ‚ˆ\ÜÚYÛ™YÜÝÜ™WÚYÈHÙ]Ø\ÜÚYÛ™YÜÝÜ™WÚYÊÙ\ÜÚ[Û–ÉÝ\Ù\—ÚY	×JBˆYˆ›Ý\ÜÚYÛ™YÜÝÜ™WÚYÎ‚ˆ›\Ú
+“›ÈÝÜ™H\È\ÜÚYÛ™YÈ[Ý\ˆXØÛÝ[Y]ˆ‹Ø\›š[™ÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠœÝÜ™\×ÛX[˜YÙ[Y[ŠJBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠœX›X×ÜÝ\™^H‹ÝÜ™WÚYX\ÜÚYÛ™YÜÝÜ™WÚYÖÌJJB‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KÜ]Y\Ý[ÛœËØY‹Y]ÙÏVÈ”ÔÕ—JBˆYˆX\Ý\—ØYÜ]Y\Ý[ÛŠ
+N‚ˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+Bˆ[\]WÚYH[
+[\]VÈšY—JB‚ˆžN‚ˆ][ÝHH]Y\Ý[Û›˜Z\™WÜ][ÝWÜÝ]\ÊÝ[˜[ÛÝÛ™\Š
+JBˆ^Ù\˜[YQ\œ›Üˆ\È^Î‚ˆ›\Ú
+ÝŠ^ÊK™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJBˆYˆ][ÝVÈ\ÙY—HH][ÝVÈ›X^—N‚ˆ›\Ú
+ˆˆ”]Y\Ý[Ûˆ[Z]™XXÚYˆ[Ý\ˆ[ˆ[˜ÛY\ÈHÝ\\ˆ]Y\Ý[ÛœÈ\È‚ˆˆžÜ][ÝVÉØY][Û˜[	×_HY][Û˜[]Y\Ý[ÛŠÊH
+Ü][ÝVÉÛX^	×_HÝ[
+Kˆ‚ˆ‘Y]Üˆ[]H[ˆ^\Ý[™È]Y\Ý[Ûˆ™Y›Ü™HY[™È[›Ý\‹ˆ‹ˆ™[™Ù\ˆ‹ˆ
+Bˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ]Y\Ý[Û—Ý^H™\]Y\Ý™›Ü›K™Ù]
+œ]Y\Ý[Û—Ý^‹ˆŠKœÝš\
+
+Bˆ]Y\Ý[Û—Ý\HH™\]Y\Ý™›Ü›K™Ù]
+œ]Y\Ý[Û—Ý\H‹ˆŠKœÝš\
+
+Bˆ\×Ü™\]Z\™YH™\]Y\Ý™›Ü›K™Ù]
+š\×Ü™\]Z\™YŠHOH›Ûˆ‚ˆZ[—ÛX™[H™\]Y\Ý™›Ü›K™Ù]
+›Z[—ÛX™[‹”ÛÜˆŠKœÝš\
+
+HÜˆ”ÛÜˆ‚ˆX^ÛX™[H™\]Y\Ý™›Ü›K™Ù]
+›X^ÛX™[‹‘^Ù[[ŠKœÝš\
+
+HÜˆ‘^Ù[[‚ˆ[Ý×ØÛÛ[Y[H™\]Y\Ý™›Ü›K™Ù]
+˜[Ý×ØÛÛ[Y[ŠHOH›Ûˆ‚ˆ\™Ù]ÜØÛÜHH™\]Y\Ý™›Ü›K™Ù]
+\™Ù]ÜØÛÜH‹›Ý™\˜[ŠKœÝš\
+
+BˆžN‚ˆ]Y\Ý[Û—ÛÜ™\ˆH[
+™\]Y\Ý™›Ü›K™Ù]
+œ]Y\Ý[Û—ÛÜ™\ˆ‹ŒŠJBˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ]Y\Ý[Û—ÛÜ™\ˆH‚ˆYˆ›Ý]Y\Ý[Û—Ý^‚ˆ›\Ú
+”]Y\Ý[Ûˆ^\È™\]Z\™Yˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆYˆ]Y\Ý[Û—Ý\H›Ý[ˆÈœ˜][™È‹^‹›][\WØÚÚXÙHŸN‚ˆ›\Ú
+’[˜[Y]Y\Ý[Ûˆ\Kˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ™]×Ü]Y\Ý[Û—ÚYHYÝ[\]WÜ]Y\Ý[ÛŠˆ[\]WÜ]Y\Ý[Û›˜Z\™WÚY][\]WÚYˆ]Y\Ý[Û—Ý^\]Y\Ý[Û—Ý^ˆ]Y\Ý[Û—Ý\O\]Y\Ý[Û—Ý\Kˆ\×Ü™\]Z\™YZ\×Ü™\]Z\™Yˆ]Y\Ý[Û—ÛÜ™\\]Y\Ý[Û—ÛÜ™\‹ˆZ[—ÛX™[[Z[—ÛX™[ˆX^ÛX™[[X^ÛX™[ˆ[Ý×ØÛÛ[Y[X[Ý×ØÛÛ[Y[ˆ\™Ù]ÜØÛÜO]\™Ù]ÜØÛÜKˆ
+BˆˆÈÙÈH]Y\Ý[ÛˆY][Û‚ˆÙ×Ø]Y]
+ˆ[]WÝ\OHœ]Y\Ý[Ûˆ‹ˆ[]WÚY[™]×Ü]Y\Ý[Û—ÚYˆXÝ[ÛH˜Ü™X]Y‹ˆ™]×Ý˜[Y\ÏYˆ•^ˆÜ]Y\Ý[Û—Ý^K\NˆÜ]Y\Ý[Û—Ý\_K™\]Z\™YˆÚ\×Ü™\]Z\™YH‚ˆ
+Bˆˆ›\Ú
+”]Y\Ý[ÛˆYYÝXØÙ\ÜÙ[H‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KÜ]Y\Ý[ÛœËÏ[›X\Ý\—Ü]Y\Ý[Û—ÚY‹Ù[]H‹Y]ÙÏVÈ”ÔÕ—JBˆYˆX\Ý\—Ù[]WÜ]Y\Ý[ÛŠX\Ý\—Ü]Y\Ý[Û—ÚYˆ[
+N‚ˆÈÙ]]Y\Ý[Ûˆ^™Y›Ü™H[][Ûˆ›ÜˆÙÙÚ[™ÂˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕ]Y\Ý[Û—Ý^”“ÓH]Y\Ý[ÛœÈÒT‘HYH	\È‹
+X\Ý\—Ü]Y\Ý[Û—ÚY
+JBˆ]Y\Ý[ÛˆHÝ\œÛÜ‹™™]ÚÛ™J
+Bˆ]Y\Ý[Û—Ý^H]Y\Ý[Û–ÌHYˆ]Y\Ý[Ûˆ[ÙH•[šÛ›ÝÛˆ‚ˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+Bˆˆ[]WÝ[\]WÜ]Y\Ý[ÛŠ[\]WÜ]Y\Ý[Û—ÚY[X\Ý\—Ü]Y\Ý[Û—ÚY
+BˆˆÈÙÈH]Y\Ý[Ûˆ[][Û‚ˆÙ×Ø]Y]
+ˆ[]WÝ\OHœ]Y\Ý[Ûˆ‹ˆ[]WÚY[X\Ý\—Ü]Y\Ý[Û—ÚYˆXÝ[ÛH™[]Y‹ˆÛÝ˜[Y\ÏYˆ•^ˆÜ]Y\Ý[Û—Ý^H‚ˆ
+Bˆˆ›\Ú
+”]Y\Ý[Ûˆ[]Y‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KÜ]Y\Ý[ÛœËÏ[›X\Ý\—Ü]Y\Ý[Û—ÚY‹ÙY]‹Y]ÙÏVÈ”ÔÕ—JBˆYˆX\Ý\—ÙY]Ü]Y\Ý[ÛŠX\Ý\—Ü]Y\Ý[Û—ÚYˆ[
+N‚ˆ]Y\Ý[Û—Ý^H™\]Y\Ý™›Ü›K™Ù]
+œ]Y\Ý[Û—Ý^‹ˆŠKœÝš\
+
+Bˆ]Y\Ý[Û—Ý\HH™\]Y\Ý™›Ü›K™Ù]
+œ]Y\Ý[Û—Ý\H‹ˆŠKœÝš\
+
+Bˆ\×Ü™\]Z\™YH™\]Y\Ý™›Ü›K™Ù]
+š\×Ü™\]Z\™YŠHOH›Ûˆ‚ˆZ[—ÛX™[H™\]Y\Ý™›Ü›K™Ù]
+›Z[—ÛX™[‹”ÛÜˆŠKœÝš\
+
+HÜˆ”ÛÜˆ‚ˆX^ÛX™[H™\]Y\Ý™›Ü›K™Ù]
+›X^ÛX™[‹‘^Ù[[ŠKœÝš\
+
+HÜˆ‘^Ù[[‚ˆ[Ý×ØÛÛ[Y[H™\]Y\Ý™›Ü›K™Ù]
+˜[Ý×ØÛÛ[Y[ŠHOH›Ûˆ‚ˆ\™Ù]ÜØÛÜHH™\]Y\Ý™›Ü›K™Ù]
+\™Ù]ÜØÛÜH‹›Ý™\˜[ŠKœÝš\
+
+B‚ˆYˆ›Ý]Y\Ý[Û—Ý^‚ˆ›\Ú
+”]Y\Ý[Ûˆ^\È™\]Z\™Yˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ\]WÝ[\]WÜ]Y\Ý[ÛŠX\Ý\—Ü]Y\Ý[Û—ÚY]Y\Ý[Û—Ý^]Y\Ý[Û—Ý\K\×Ü™\]Z\™YZ[—ÛX™[X^ÛX™[[Ý×ØÛÛ[Y[\™Ù]ÜØÛÜJBˆ›\Ú
+”]Y\Ý[Ûˆ\]YÝXØÙ\ÜÙ[H‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KÜ]Y\Ý[ÛœËÏ[›X\Ý\—Ü]Y\Ý[Û—ÚY‹Ý\™Ù]‹Y]ÙÏVÈ”ÔÕ—JBˆYˆX\Ý\—Ý\]WÜ]Y\Ý[Û—Ý\™Ù]
+X\Ý\—Ü]Y\Ý[Û—ÚYˆ[
+N‚ˆ\™Ù]ÜØÛÜHH™\]Y\Ý™›Ü›K™Ù]
+\™Ù]ÜØÛÜH‹›Ý™\˜[ŠKœÝš\
+
+BˆYˆ\™Ù]ÜØÛÜH›Ý[ˆÈ›Ý™\˜[‹œÝY™ˆ‹›X[˜YÙ\ˆŸN‚ˆ›\Ú
+’[˜[Y]Y\Ý[Ûˆ\™Ù]ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJBˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+BˆÚ]Ù]Ù—ØÛÛ›™XÝ[Û—ÝÚ]Ý˜[œØXÝ[ÛŠ
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ•TUH]Y\Ý[ÛœÈÑU\™Ù]ÜØÛÜHH	\ÂˆÒT‘HYH	\ÈS‘]Y\Ý[Û›˜Z\™WÚYH	\ÈS‘\×Ý[\]HH•QHˆˆ‹ˆ
+\™Ù]ÜØÛÜKX\Ý\—Ü]Y\Ý[Û—ÚY[
+[\]VÉÚY	×JJKˆ
+Bˆ›\Ú
+”]Y\Ý[Ûˆ\™Ù]\]YˆX›\ÚÜˆÞ[˜ÈÈ\H]ÈÝÜ™\Ëˆ‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KÜ]Y\Ý[ÛœËÏ[›X\Ý\—Ü]Y\Ý[Û—ÚY‹ÛÜ[ÛœËØY‹Y]ÙÏVÈ”ÔÕ—JBˆYˆX\Ý\—ØYÛÜ[ÛŠX\Ý\—Ü]Y\Ý[Û—ÚYˆ[
+N‚ˆÜ[Û—Ý^H™\]Y\Ý™›Ü›K™Ù]
+›Ü[Û—Ý^‹ˆŠKœÝš\
+
+BˆYˆ›ÝÜ[Û—Ý^‚ˆ›\Ú
+“Ü[Ûˆ^\È™\]Z\™Yˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJBˆYÝ[\]WÛÜ[ÛŠ[\]WÜ]Y\Ý[Û—ÚY[X\Ý\—Ü]Y\Ý[Û—ÚYÜ[Û—Ý^[Ü[Û—Ý^
+Bˆ›\Ú
+“Ü[ÛˆYYˆ‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KÛÜ[ÛœËÏ[›X\Ý\—ÛÜ[Û—ÚY‹Ù[]H‹Y]ÙÏVÈ”ÔÕ—JBˆYˆX\Ý\—Ù[]WÛÜ[ÛŠX\Ý\—ÛÜ[Û—ÚYˆ[
+N‚ˆ[]WÝ[\]WÛÜ[ÛŠ[\]WÛÜ[Û—ÚY[X\Ý\—ÛÜ[Û—ÚY
+Bˆ›\Ú
+“Ü[Ûˆ[]Yˆ‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KÝ\ØY[ÙÛÈ‹Y]ÙÏVÈ”ÔÕ—JBˆYˆX\Ý\—Ý\ØYÛÙÛÊ
+N‚ˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+BˆÈ[™HÙÛÈ\ØY›ÜˆX\Ý\ˆ]Y\Ý[Û›˜Z\™HHÝÜ™H\È˜\ÙM[ˆ]X˜\ÙBˆÙÛ×Ù]HH›Û™BˆYˆ	ÛÙÛÉÈ[ˆ™\]Y\Ý™š[\Î‚ˆÙÛ×Ùš[HH™\]Y\Ý™š[\ÖÉÛÙÛÉ×BˆYˆÙÛ×Ùš[H[™ÙÛ×Ùš[K™š[[˜[YN‚ˆÈ˜[Y]Hš[H\Bˆ[ÝÙYÙ^[œÚ[ÛœÈHÉÜ™ÉË	ÚœÉË	ÚœYÉßBˆYˆ	Ë‰È›Ý[ˆÙÛ×Ùš[K™š[[˜[YHÜˆÙÛ×Ùš[K™š[[˜[YKœœÜ]
+	Ë‰ËJVÌWK›ÝÙ\Š
+H›Ý[ˆ[ÝÙYÙ^[œÚ[ÛœÎ‚ˆ›\Ú
+’[˜[Yš[H\KˆÛ›H‘Ë”Ë[™”QÈš[\È\™H[ÝÙYˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJBˆˆÈ˜[Y]Hš[HÚ^™H
+SPˆX^
+BˆÙÛ×Ùš[KœÙYZÊÜË”ÑQR×ÑS‘
+Bˆš[WÜÚ^™HHÙÛ×Ùš[K[
+
+BˆÙÛ×Ùš[KœÙYZÊ
+BˆYˆš[WÜÚ^™HˆH
+ˆL
+ˆL‚ˆ›\Ú
+‘š[HÚ^™H^ÙYYÈSPˆ[Z]ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJBˆˆÈÛÛ™\[XYÙHÈ˜\ÙMÚ]]HT’H™Yš^ˆ[\Ü˜\ÙMˆÙÛ×Øž]\ÈHÙÛ×Ùš[Kœ™XY
+
+Bˆš[WÙ^HÙÛ×Ùš[K™š[[˜[YKœœÜ]
+	Ë‰ËJVÌWK›ÝÙ\Š
+BˆZ[YWÝ\HHˆš[XYÙKÞÙš[WÙ^H‚ˆÙÛ×Ù]HHˆ™]NžÛZ[YWÝ\_NØ˜\ÙMØ˜\ÙM˜[˜ÛÙJÙÛ×Øž]\ÊK™XÛÙJ	Ý]‹N	Ê_H‚‚ˆÈ\]HHX\Ý\ˆ[\]H]Y\Ý[Û›˜Z\™HÚ]H˜\ÙMÙÛÈ]BˆYˆÙÛ×Ù]N‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]J•TUH]Y\Ý[Û›˜Z\™\ÈÑUÙÛ×Ý\›H	\ÈÒT‘HYH	\È‹
+ÙÛ×Ù]K[\]VÉÚY	×JJBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ›\Ú
+œ˜[™ÙÛÈ\ØYYÝXØÙ\ÜÙ[H‹œÝXØÙ\ÜÈŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ‘\œ›Üˆ\ØY[™ÈÙÛÎˆÙ_HŠBˆ›\Ú
+ˆ‘\œ›Üˆ\ØY[™ÈÙÛÎˆÙ_H‹™[™Ù\ˆŠBˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+Bˆ[ÙN‚ˆ›\Ú
+“›Èš[HÙ[XÝY‹Ø\›š[™ÈŠB‚ˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KÙ[]K[ÙÛÈ‹Y]ÙÏVÈ”ÔÕ—JBˆYˆX\Ý\—Ù[]WÛÙÛÊ
+N‚ˆÈ[]HHÙÛÈœ›ÛHHX\Ý\ˆ]Y\Ý[Û›˜Z\™Bˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+BˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]J•TUH]Y\Ý[Û›˜Z\™\ÈÑUÙÛ×Ý\›H•SÒT‘HYH	\È‹
+[\]VÉÚY	×K
+JBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆ›\Ú
+œ˜[™ÙÛÈ[]YÝXØÙ\ÜÙ[H‹œÝXØÙ\ÜÈŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ‘\œ›Üˆ[][™ÈÙÛÎˆÙ_HŠBˆ›\Ú
+ˆ‘\œ›Üˆ[][™ÈÙÛÎˆÙ_H‹™[™Ù\ˆŠBˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KØœ˜[™[™È‹Y]ÙÏVÈ”ÔÕ—JBˆÙÚ[—Ü™\]Z\™YˆYˆØ]™WÝ[˜[Øœ˜[™[™Ê
+N‚ˆ\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+Ù\ÜÚ[Û–ÉÝ\Ù\—ÚY	×JBˆYˆ›Ý\Ù\ˆÜˆ\Ù\‹™Ù]
+	Ü›ÛIÊH›Ý[ˆ
+	ØYZ[‰Ë	ÜÝ\\˜YZ[‰ÊN‚ˆ™]\›ˆœÛÛšYžJÈœÝXØÙ\ÜÈŽˆ˜[ÙK™\œ›ÜˆŽˆXØÙ\ÜÈ[šYYŸJKÂˆšY[ÈH
+œš[X\žWØÛÛÜˆ‹œÙXÛÛ™\žWØÛÛÜˆ‹˜XØÙ[ØÛÛÜˆ‹^ØÛÛÜˆŠBˆÛÛÜœÈHÛ˜[YNˆ™\]Y\Ý™›Ü›K™Ù]
+˜[YKˆŠKœÝš\
+
+K\\Š
+H›Üˆ˜[YH[ˆšY[ßBˆYˆ[žJ›Ý™K™[X]Ú
+ˆˆÖÌNPKQ—^ÍŸH‹˜[YJH›Üˆ˜[YH[ˆÛÛÜœË˜[Y\Ê
+JN‚ˆ›\Ú
+”X\ÙHÙ[XÝ˜[Yœ˜[™ÛÛÜœËˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJBˆÚ]Ù]Ù—ØÛÛ›™XÝ[Û—ÝÚ]Ý˜[œØXÝ[ÛŠ
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ’S”ÑT•S•È[˜[Øœ˜[™[™Âˆ
+ÝÛ™\—Ý\Ù\—ÚYØÛÜWÚÙ^KXÙ[œÙWÚÙ^Kš[X\žWØÛÛÜ‹ÙXÛÛ™\žWØÛÛÜ‹XØÙ[ØÛÛÜ‹^ØÛÛÜŠBˆSQTÈ
+	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\ÊBˆÓˆTPÐUHÑVHTUHXÙ[œÙWÚÙ^HHSQTÊXÙ[œÙWÚÙ^JKˆš[X\žWØÛÛÜˆHSQTÊš[X\žWØÛÛÜŠKÙXÛÛ™\žWØÛÛÜˆHSQTÊÙXÛÛ™\žWØÛÛÜŠKˆXØÙ[ØÛÛÜˆHSQTÊXØÙ[ØÛÛÜŠK^ØÛÛÜˆHSQTÊ^ØÛÛÜŠHˆˆ‹ˆ
+\Ù\–ÉÚY	×K\Ù\‹™Ù]
+	ÛXÙ[œÙWÚÙ^IÊHÜˆˆ\Ù\ŽžÝ\Ù\–ÉÚY	×_H‹\Ù\‹™Ù]
+	ÛXÙ[œÙWÚÙ^IÊKÛÛÜœÖÉÜš[X\žWØÛÛÜ‰×KÛÛÜœÖÉÜÙXÛÛ™\žWØÛÛÜ‰×KˆÛÛÜœÖÉØXØÙ[ØÛÛÜ‰×KÛÛÜœÖÉÝ^ØÛÛÜ‰×JKˆ
+Bˆ›\Ú
+œ˜[™ÛÛÜœÈØ]™Y›Üˆ[Ý\ˆÛÛ\[žHXÙ[œÙKˆ‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KÜX›\Ú‹Y]ÙÏVÈ”ÔÕ—JBˆYˆX\Ý\—ÜX›\Ú
+
+N‚ˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+Bˆ[\]WÚYH[
+[\]VÈšY—JBˆ]Y\Ý[ÛœÈH™]ÚÝ[\]WÜ]Y\Ý[ÛœÊ[\]WÜ]Y\Ý[Û›˜Z\™WÚY][\]WÚY
+BˆYˆ›Ý]Y\Ý[ÛœÎ‚ˆ›\Ú
+Y]X\ÝH]Y\Ý[Ûˆ™Y›Ü™HX›\Ú[™Ëˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆžN‚ˆÛÝ[HX›\ÚÝ[\]WÝ×Ø[ÜÝÜ™\Ê
+Bˆ^Ù\˜[YQ\œ›Üˆ\È^Î‚ˆ›\Ú
+ÝŠ^ÊK™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJBˆˆÈÙÈHX›\ÚXÝ[Û‚ˆÙ×Ø]Y]
+ˆ[]WÝ\OHœ]Y\Ý[Û›˜Z\™H‹ˆ[]WÚY][\]WÚYˆXÝ[ÛHœX›\ÚY‹ˆ™]×Ý˜[Y\ÏYˆ”X›\ÚYÈØÛÝ[HÝÜ™JÊH‚ˆ
+Bˆˆ›\Ú
+ˆ”X›\ÚYÈØÛÝ[HÝÜ™JÊHÝXØÙ\ÜÙ[H‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ\œ›Ý]J‹ØYZ[‹Ø\KÜÝÜ™\È‹Y]ÙÏVÈ‘ÑU—JBˆYˆ\WÜÝÜ™\Ê
+N‚ˆˆˆ”™]\›ˆÛ›HÝÜ™\ÈÝÛ™YžHHÝ\œ™[]Y\Ý[Û›˜Z\™H[˜[ˆˆˆ‚ˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+BˆÝÜ™\ÈHÜÝÜ™H›ÜˆÝÜ™H[ˆ™]ÚÜÝÜ™\Ê\Ù\—ÚY\Ù\ÜÚ[Û–ÉÝ\Ù\—ÚY	×JBˆYˆ
+ÝÜ™K™Ù]
+	ÛXÙ[œÙWÚÙ^IÊHÜˆ›Û™JHOH
+[\]K™Ù]
+	ÛXÙ[œÙWÚÙ^IÊHÜˆ›Û™JWBˆ™]\›ˆœÛÛšYžJÝÜ™\ÊB‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KÜÞ[˜È‹Y]ÙÏVÈ”ÔÕ—JBˆYˆÞ[˜×Ý×ÜÙ[XÝYÜÝÜ™\Ê
+N‚ˆˆˆ”Þ[˜ÈX\Ý\ˆ]Y\Ý[Û›˜Z\™HÈÙ[XÝYÝÜ™\Èˆˆ‚ˆžN‚ˆ]HH™\]Y\Ý™Ù]ÚœÛÛŠ
+HÜˆßBˆžN‚ˆÝÜ™WÚYÈH\Ý
+XÝ™œ›ÛZÙ^\Ê[
+ÝÜ™WÚY
+H›ÜˆÝÜ™WÚY[ˆ]K™Ù]
+	ÜÝÜ™WÚYÉË×JJJBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆÈœÝXØÙ\ÜÈŽˆ˜[ÙK™\œ›ÜˆŽˆ’[˜[YÝÜ™HÙ[XÝ[ÛˆŸKˆˆYˆ›ÝÝÜ™WÚYÎ‚ˆ™]\›ˆÈœÝXØÙ\ÜÈŽˆ˜[ÙK™\œ›ÜˆŽˆ“›ÈÝÜ™\ÈÙ[XÝYŸKˆˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+Bˆ[\]WÚYH[
+[\]VÈšY—JBˆ[\]WÜ]Y\Ý[ÛœÈH™]ÚÝ[\]WÜ]Y\Ý[ÛœÊ[\]WÜ]Y\Ý[Û›˜Z\™WÚY][\]WÚY
+Bˆ[\]WÛÜ[Ûœ×ØžWÜ]Y\Ý[Û—ÚYH™]ÚÝ[\]WÛÜ[Ûœ×ØžWÜ]Y\Ý[ÛŠÚ[
+VÈšY—JH›ÜˆH[ˆ[\]WÜ]Y\Ý[Ûœ×JBˆÝÛ™\ˆHÝ[˜[ÛÝÛ™\Š
+Bˆ[™›Ü˜ÙWÜ]Y\Ý[Û›˜Z\™WÛ[Z]
+ÝÛ™\‹ÝÜ™WÚYÊBˆˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÞ[˜ÙYØÛÝ[Hˆˆ›ÜˆÝÜ™WÚY[ˆÝÜ™WÚYÎ‚ˆÝÜ™WÚYH[
+ÝÜ™WÚY
+BˆˆÈÚXÚÈYˆÝÜ™H^\ÝÂˆÝ\œÛÜ‹™^XÝ]Jˆˆ”ÑSPÕYÙÛ×Ý\›”“ÓHÝÜ™\ÂˆÒT‘HYH	\ÈS‘\Ù\—ÚYH	\ÈS‘XÙ[œÙWÚÙ^HOˆ	\Èˆˆ‹ˆ
+ÝÜ™WÚYÙ\ÜÚ[Û–ÉÝ\Ù\—ÚY	×K[\]K™Ù]
+	ÛXÙ[œÙWÚÙ^IÊJJBˆØÛÜYÜÝÜ™HHÝ\œÛÜ‹™™]ÚÛ™J
+BˆYˆ›ÝØÛÜYÜÝÜ™N‚ˆÛÛ[YBˆˆÈÚXÚÈYˆÝÜ™H[™XYH\ÈH]Y\Ý[Û›˜Z\™BˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕY”“ÓH]Y\Ý[Û›˜Z\™\ÈÒT‘HÝÜ™WÚYH	\ÈS‘\×Ý[\]HHSÑHÔ‘Tˆ–HYTÐÈSRUH‹
+ÝÜ™WÚY
+JBˆ^\Ý[™ÈHÝ\œÛÜ‹™™]ÚÛ™J
+BˆˆYˆ^\Ý[™Î‚ˆÈ\]H^\Ý[™È]Y\Ý[Û›˜Z\™HY]Y]BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆTUH]Y\Ý[Û›˜Z\™\ÂˆÑU]HH	\Ë\×ØXÝ]™HH	\Ë[\]WÚYH	\ËˆÝÛ™\—Ý\Ù\—ÚYH	\ËXÙ[œÙWÚÙ^HH	\ËÙÛ×Ý\›H	\ÂˆÒT‘HYH	\Âˆˆˆ‹ˆ
+[\]VÈ]H—K›ÛÛ
+[\]VÈš\×ØXÝ]™H—JK[\]WÚYˆÙ\ÜÚ[Û–ÉÝ\Ù\—ÚY	×K[\]K™Ù]
+	ÛXÙ[œÙWÚÙ^IÊKØÛÜYÜÝÜ™K™Ù]
+	ÛÙÛ×Ý\›	ÊHÜˆ[\]K™Ù]
+	ÛÙÛ×Ý\›	ÊK[
+^\Ý[™ÖÈšY—JJKˆ
+Bˆ]Y\Ý[Û›˜Z\™WÚYH[
+^\Ý[™ÖÈšY—JBˆˆÈXXÝ]˜]H^\Ý[™È]Y\Ý[ÛœÂˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆTUH]Y\Ý[ÛœÂˆÑU\×ØXÝ]™HHSÑBˆÒT‘H]Y\Ý[Û›˜Z\™WÚYH	\ÈS‘\×Ý[\]HHSÑBˆˆˆ‹ˆ
+]Y\Ý[Û›˜Z\™WÚY
+Kˆ
+Bˆ[ÙN‚ˆÈÜ™X]H™]ÈÝÜ™H]Y\Ý[Û›˜Z\™BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È]Y\Ý[Û›˜Z\™\Âˆ
+ÝÜ™WÚYÝÛ™\—Ý\Ù\—ÚYXÙ[œÙWÚÙ^K]K\×ØXÝ]™K\×Ý[\]K[\]WÚYÙÛ×Ý\›
+BˆSQTÈ
+	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\ÊBˆˆˆ‹ˆ
+ÝÜ™WÚYÙ\ÜÚ[Û–ÉÝ\Ù\—ÚY	×K[\]K™Ù]
+	ÛXÙ[œÙWÚÙ^IÊK[\]VÈ]H—Kˆ›ÛÛ
+[\]VÈš\×ØXÝ]™H—JK˜[ÙK[\]WÚYØÛÜYÜÝÜ™K™Ù]
+	ÛÙÛ×Ý\›	ÊHÜˆ[\]K™Ù]
+	ÛÙÛ×Ý\›	ÊJKˆ
+Bˆ]Y\Ý[Û›˜Z\™WÚYH[
+Ý\œÛÜ‹›\Ý›ÝÚY
+BˆˆÈÛÜH]Y\Ý[ÛœÈœ›ÛH[\]Bˆ›Üˆ[\]WÜ]Y\Ý[Ûˆ[ˆ[\]WÜ]Y\Ý[ÛœÎ‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È]Y\Ý[ÛœÈ
+]Y\Ý[Û›˜Z\™WÚY]Y\Ý[Û—Ý^]Y\Ý[Û—Ý\K\™Ù]ÜØÛÜKZ[—ÛX™[X^ÛX™[[Ý×ØÛÛ[Y[\×Ü™\]Z\™Y]Y\Ý[Û—ÛÜ™\‹\×Ý[\]K[\]WÚY
+BˆSQTÈ
+	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\Ë	\ÊBˆˆˆ‹ˆ
+]Y\Ý[Û›˜Z\™WÚY[\]WÜ]Y\Ý[Û–Èœ]Y\Ý[Û—Ý^—K[\]WÜ]Y\Ý[Û–Èœ]Y\Ý[Û—Ý\H—Kˆ[\]WÜ]Y\Ý[Û‹™Ù]
+\™Ù]ÜØÛÜH‹›Ý™\˜[ŠKˆ[\]WÜ]Y\Ý[Û–È›Z[—ÛX™[—K[\]WÜ]Y\Ý[Û–È›X^ÛX™[—K[\]WÜ]Y\Ý[Û–È˜[Ý×ØÛÛ[Y[—Kˆ[\]WÜ]Y\Ý[Û–Èš\×Ü™\]Z\™Y—K[\]WÜ]Y\Ý[Û–Èœ]Y\Ý[Û—ÛÜ™\ˆ—K˜[ÙK[
+[\]WÜ]Y\Ý[Û–ÈšY—JJKˆ
+Bˆ™]×Ü]Y\Ý[Û—ÚYH[
+Ý\œÛÜ‹›\Ý›ÝÚY
+BˆˆÈÛÜHÜ[ÛœÈ›Üˆ\È]Y\Ý[Û‚ˆ[\]WÛÜ[ÛœÈH[\]WÛÜ[Ûœ×ØžWÜ]Y\Ý[Û—ÚY™Ù]
+[
+[\]WÜ]Y\Ý[Û–ÈšY—JK×JBˆ›ÜˆÜ[Ûˆ[ˆ[\]WÛÜ[ÛœÎ‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆS”ÑT•S•È]Y\Ý[Û—ÛÜ[ÛœÈ
+]Y\Ý[Û—ÚYÜ[Û—Ý^\×Ý[\]JBˆSQTÈ
+	\Ë	\Ë	\ÊBˆˆˆ‹ˆ
+™]×Ü]Y\Ý[Û—ÚYÜ[Û–È›Ü[Û—Ý^—K˜[ÙJKˆ
+BˆˆÞ[˜ÙYØÛÝ[
+ÏHBˆˆÛÛ›‹˜ÛÛ[Z]
+
+BˆˆÈÙÈHÞ[˜ÈXÝ[Û‚ˆÙ×Ø]Y]
+ˆ[]WÝ\OHœ]Y\Ý[Û›˜Z\™H‹ˆ[]WÚY][\]WÚYˆXÝ[ÛHœÞ[˜ÙY‹ˆ™]×Ý˜[Y\ÏYˆ”Þ[˜ÙYÈÜÞ[˜ÙYØÛÝ[HÝÜ™JÊH‚ˆ
+Bˆˆ™]\›ˆÈœÝXØÙ\ÜÈŽˆYK˜ÛÝ[ŽˆÞ[˜ÙYØÛÝ[Bˆˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+Bˆˆ^Ù\˜[YQ\œ›Üˆ\ÈN‚ˆÙÙÙ\‹Ø\›š[™Êˆ”]Y\Ý[Û›˜Z\™HÞ[˜È›ØÚÙYˆÙ_HŠBˆ™]\›ˆÈœÝXØÙ\ÜÈŽˆ˜[ÙK™\œ›ÜˆŽˆÝŠJ_KBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ‘\œ›ÜˆÞ[˜Ú[™ÈÈÝÜ™\ÎˆÙ_HŠBˆ™]\›ˆÈœÝXØÙ\ÜÈŽˆ˜[ÙK™\œ›ÜˆŽˆÝŠJ_KL‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KÜÞ[˜Ë\Ý]\È‹Y]ÙÏVÈ‘ÑU—JBˆYˆÞ[˜×ÜÝ]\Ê
+N‚ˆˆˆÚXÚÈÞ[˜ÈÝ]\ÈÙˆÝÜ™\Èˆˆ‚ˆžN‚ˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+Bˆ[\]WÚYH[
+[\]VÈšY—JBˆˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆˆÈÙ]Ý[ÝÜ™\ÂˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕÓÕS•
+
+ŠH\ÈÝ[”“ÓHÝÜ™\ÈÒT‘H\Ù\—ÚYH	\ÈS‘XÙ[œÙWÚÙ^HOˆ	\È‹ˆ
+Ù\ÜÚ[Û–ÉÝ\Ù\—ÚY	×K[\]K™Ù]
+	ÛXÙ[œÙWÚÙ^IÊJJBˆÝ[ÜÝÜ™\ÈHÝ\œÛÜ‹™™]ÚÛ™J
+VÉÝÝ[	×BˆˆÈÙ]ÝÜ™\ÈÚ]Þ[˜ÙY]Y\Ý[Û›˜Z\™BˆÝ\œÛÜ‹™^XÝ]Jˆˆ‚ˆÑSPÕÓÕS•
+TÕSÕËšY
+H\ÈÞ[˜ÙYˆ”“ÓHÝÜ™\ÈÂˆ“ÒSˆ]Y\Ý[Û›˜Z\™\ÈHÓˆËšYHKœÝÜ™WÚYˆÒT‘HKš\×Ý[\]HHSÑHS‘K[\]WÚYH	\ÈS‘Ë\Ù\—ÚYH	\ÂˆS‘Ë›XÙ[œÙWÚÙ^HOˆ	\Âˆˆˆ‹
+[\]WÚYÙ\ÜÚ[Û–ÉÝ\Ù\—ÚY	×K[\]K™Ù]
+	ÛXÙ[œÙWÚÙ^IÊJJBˆÞ[˜ÙYÜÝÜ™\ÈHÝ\œÛÜ‹™™]ÚÛ™J
+VÉÜÞ[˜ÙY	×BˆˆÝ\œÛÜ‹˜ÛÜÙJ
+BˆÛÛ›‹˜ÛÜÙJ
+Bˆˆ[œÞ[˜ÙYØÛÝ[HÝ[ÜÝÜ™\ÈHÞ[˜ÙYÜÝÜ™\Âˆˆ™]\›ˆœÛÛšYžJÂˆœÞ[˜ÙYŽˆ[œÞ[˜ÙYØÛÝ[OHˆœÞ[˜ÙYØÛÝ[ŽˆÞ[˜ÙYÜÝÜ™\Ëˆ[œÞ[˜ÙYØÛÝ[Žˆ[œÞ[˜ÙYØÛÝ[ˆÝ[ÜÝÜ™\ÈŽˆÝ[ÜÝÜ™\ÂˆJBˆˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ‘\œ›ÜˆÚXÚÚ[™ÈÞ[˜ÈÝ]\ÎˆÙ_HŠBˆ™]\›ˆœÛÛšYžJÈœÞ[˜ÙYŽˆ˜[ÙK™\œ›ÜˆŽˆÝŠJ_JKL‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KÝÙÙÛKXXÝ]™H‹Y]ÙÏVÈ”ÔÕ—JBˆYˆX\Ý\—ÝÙÙÛWØXÝ]™J
+N‚ˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+BˆÝ\œ™[ØXÝ]™HH[\]K™Ù]
+š\×ØXÝ]™H‹˜[ÙJBˆ™]×ØXÝ]™HH›ÝÝ\œ™[ØXÝ]™BˆˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆTUH]Y\Ý[Û›˜Z\™\ÂˆÑU\×ØXÝ]™HH	\ÂˆÒT‘HYH	\ÈS‘\×Ý[\]HH•QBˆˆˆ‹ˆ
+™]×ØXÝ]™K[
+[\]VÈšY—JJKˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+BˆˆÈÙÈHÙÙÛHXÝ[Û‚ˆÙ×Ø]Y]
+ˆ[]WÝ\OHœ]Y\Ý[Û›˜Z\™H‹ˆ[]WÚYZ[
+[\]VÈšY—JKˆXÝ[ÛHÙÙÛY‹ˆÛÝ˜[Y\ÏYˆXÝ]™NˆØÝ\œ™[ØXÝ]™_H8¡¤ˆÛ™]×ØXÝ]™_H‚ˆ
+BˆˆYˆ™]×ØXÝ]™N‚ˆ›\Ú
+”Ý\™^H[˜X›YÝXØÙ\ÜÙ[KˆÝÜ™\ÈØ[ˆ›ÝÈXØÙ\™YY˜XÚËˆ‹œÝXØÙ\ÜÈŠBˆ[ÙN‚ˆ›\Ú
+”Ý\™^H\ØX›YÝXØÙ\ÜÙ[KˆÝÜ™\ÈØ[ˆ›ÈÛ™Ù\ˆXØÙ\™YY˜XÚËˆ‹Ø\›š[™ÈŠBˆˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ›X\Ý\—Ü]Y\Ý[Û›˜Z\™HŠJB‚ˆ\œ›Ý]J‹ØYZ[‹Ü]Y\Ý[Û›˜Z\™KÜ™]šY]ÈŠBˆYˆX\Ý\—Ü™]šY]Ê
+N‚ˆ[\]HH[œÝ\™WÝ[\]WÜ]Y\Ý[Û›˜Z\™J
+Bˆ[\]WÚYH[
+[\]VÈšY—JBˆ]Y\Ý[ÛœÈH™]ÚÝ[\]WÜ]Y\Ý[ÛœÊ[\]WÜ]Y\Ý[Û›˜Z\™WÚY][\]WÚY
+Bˆ]Y\Ý[Û—ÚYÈHÜVÈšY—H›ÜˆH[ˆ]Y\Ý[Ûœ×BˆÜ[Ûœ×ØžWÜ]Y\Ý[Û—ÚYH™]ÚÛÜ[Ûœ×Ù›Ü—Ü]Y\Ý[ÛœÊ]Y\Ý[Û—ÚYÊB‚ˆ™]\›ˆ™[™\—Ý[\]Jˆ›X\Ý\—Ü]Y\Ý[Û›˜Z\™KÜ™]šY]Ëš[‹ˆX\Ý\][\]Kˆ]Y\Ý[ÛœÏ\]Y\Ý[ÛœËˆÜ[Ûœ×ØžWÜ]Y\Ý[Û—ÚY[Ü[Ûœ×ØžWÜ]Y\Ý[Û—ÚYˆ
+B‚ˆÈKKKKKKKKKKKKKKKKKKKKKKKKBˆÈTÒ“ÐT‘SSUPÔÂˆÈKKKKKKKKKKKKKKKKKKKKKKKKBˆÈ˜^Y\ÚX[‹X]™\˜YÙHÛ[ÛÝ[™ÈÛÛœÝ[ˆÝÈX[žH™YY˜XÚÜÈHÝÜ™KÜÝY™‚ˆÈ™YYÈ™Y›Ü™H]ÈÝÛˆ]™\˜YÙHÛZ[˜]\ÈHÛØ˜[š[Ü‹‚ˆVQTÒPS—ÐÈHB‚ˆYˆ™]ÚÙ\Ú›Ø\™Ø[˜[]XÜÊ
+HOˆXÝÜÝ‹[žWN‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJB‚ˆÈÛ™HØÛÜHš]™\È]™\žH\Ú›Ø\™]Y\žHÛÈÝ[Ë˜[šÚ[™ÜËˆÈXÝ]š]K[™ÝY™ˆ™]™\ˆXZÈÝÜ™\ÈÝ]ÚYHH\Ù\‰ÜÈXØÙ\ÜË‚ˆ\Ú›Ø\™Ý\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+Ù\ÜÚ[Û–ÉÝ\Ù\—ÚY	×JBˆØÛÜYÜÝÜ™WÚYÎˆÜ[Û˜[Ó\ÝÚ[WHH›Û™BˆYˆ\Ú›Ø\™Ý\Ù\–ÉÜ›ÛI×HOH	ØYZ[‰Î‚ˆØÛÜYÜÝÜ™WÚYÈHÜÖÉÚY	×H›ÜˆÈ[ˆ™]ÚÜÝÜ™\Ê\Ù\—ÚY\Ù\ÜÚ[Û–ÉÝ\Ù\—ÚY	×JWBˆ[Yˆ\Ú›Ø\™Ý\Ù\–ÉÜ›ÛI×HOH	Ý\Ù\‰Î‚ˆØÛÜYÜÝÜ™WÚYÈHÙ]Ø\ÜÚYÛ™YÜÝÜ™WÚYÊÙ\ÜÚ[Û–ÉÝ\Ù\—ÚY	×JB‚ˆØÛÜWÚ›Ú[ˆHˆ‚ˆYˆØÛÜYÜÝÜ™WÚYÈ\È›Ý›Û™N‚ˆÝ\œÛÜ‹™^XÝ]JÔ‘PUHSTÔT–HP“H\Ú›Ø\™ÜÝÜ™WÜØÛÜH
+ÝÜ™WÚYS•’SPT–HÑVJHŠBˆYˆØÛÜYÜÝÜ™WÚYÎ‚ˆÝ\œÛÜ‹™^XÝ][X[žJˆ’S”ÑT•S•È\Ú›Ø\™ÜÝÜ™WÜØÛÜH
+ÝÜ™WÚY
+HSQTÈ
+	\ÊH‹ˆÊÝÜ™WÚY
+H›ÜˆÝÜ™WÚY[ˆØÛÜYÜÝÜ™WÚY×Kˆ
+BˆØÛÜWÚ›Ú[ˆH’S“‘Tˆ“ÒSˆ\Ú›Ø\™ÜÝÜ™WÜØÛÜHÜÈÓˆÜËœÝÜ™WÚYHËšY‚‚ˆÈÛØ˜[]™\˜YÙH˜][™ÈXÜ›ÜÜÈ[ÝÜ™\È
+š[ÜˆX
+K‚ˆÈ˜[È˜XÚÈÈŒ
+ZYZYÚY˜][
+HÚ[ˆ\™H\™H›È˜][™ÜÈY]‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕU‘ÊKœ˜][™×Ý˜[YJH\ÈÛØ˜[Ø]™Âˆ”“ÓHÝÜ™\ÈÂˆÜØÛÜWÚ›Ú[ŸBˆQ•“ÒSˆ]Y\Ý[Û›˜Z\™\ÈHÓˆËšYHKœÝÜ™WÚYˆQ•“ÒSˆ™\ÜÛœÙ\ÈˆÓˆKšYH‹œ]Y\Ý[Û›˜Z\™WÚYˆQ•“ÒSˆ[œÝÙ\œÈHÓˆ‹šYHKœ™\ÜÛœÙWÚYˆ“ÒSˆ]Y\Ý[ÛœÈLˆÓˆKœ]Y\Ý[Û—ÚYHL‹šYˆÒT‘HL‹œ]Y\Ý[Û—Ý\HH	Ü˜][™ÉÈS‘Kœ˜][™×Ý˜[YHTÈ“Õ•Sˆˆˆ‚ˆ
+Bˆ›ÝÈHÝ\œÛÜ‹™™]ÚÛ™J
+BˆÛØ˜[Ø]™×Ü˜][™ÈH›Ø]
+›ÝÖÉÙÛØ˜[Ø]™É×JHYˆ›ÝÈ[™›ÝÖÉÙÛØ˜[Ø]™É×H\È›Ý›Û™H[ÙHŒ‚ˆÈÝÜ™HÝ™\šY]È]H8 %ÙZYÚYÜØÛÜ™X\È›ÝÈH˜^Y\ÚX[ˆ]™\˜YÙN‚ˆÈ
+È
+ˆH
+ÈÝ[WÛÙ—Ü˜][™ÜÊHÈ
+È
+ÈŠBˆÈÚXÚÙY\ÈHØÛÜ™HÛˆHx $ÍHØØ[H[™[ÈÝË]›Û[YHÝÜ™\ÂˆÈÝØ\™HÛØ˜[YX[ˆ[[^HXØÝ[][]H[›ÝYÚ™YY˜XÚË‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕËšYËœÝÜ™WÛ˜[YKË˜Y™\ÜËË˜Ú]KË˜Ü™X]YØ]ˆÓÕS•
+TÕSÕ‹šY
+H\ÈÝ[Ü™\ÜÛœÙ\ËˆU‘ÊÐTÑHÒSˆL‹œ]Y\Ý[Û—Ý\HH	Ü˜][™ÉÈSˆKœ˜][™×Ý˜[YHS‘
+H\È]™×Ü˜][™ËˆÓÕS•
+TÕSÕÐTÑHÒSˆL‹œ]Y\Ý[Û—Ý\HH	Ü˜][™ÉÈS‘Kœ˜][™×Ý˜[YHTÈ“Õ•SSˆ‹šYS‘
+H\È˜][™×Ù™YY˜XÚ×ØÛÝ[ˆ
+ˆ
+	\È
+ˆ	\ÊH
+ÈÓÐSTÐÑJÕSJÐTÑHÒSˆL‹œ]Y\Ý[Û—Ý\HH	Ü˜][™ÉÈSˆKœ˜][™×Ý˜[YHS‘
+K
+Bˆ
+HÈ
+ˆ	\È
+ÈÓÕS•
+ÐTÑHÒSˆL‹œ]Y\Ý[Û—Ý\HH	Ü˜][™ÉÈS‘Kœ˜][™×Ý˜[YHTÈ“Õ•SSˆHS‘
+Bˆ
+H\ÈÙZYÚYÜØÛÜ™KˆÓÕS•
+TÕSÕ‹\Ù\—Ù[XZ[
+H\È[š\]YWÝ\Ù\œÂˆ”“ÓHÝÜ™\ÈÂˆÜØÛÜWÚ›Ú[ŸBˆQ•“ÒSˆ]Y\Ý[Û›˜Z\™\ÈHÓˆËšYHKœÝÜ™WÚYˆQ•“ÒSˆ™\ÜÛœÙ\ÈˆÓˆKšYH‹œ]Y\Ý[Û›˜Z\™WÚYˆQ•“ÒSˆ[œÝÙ\œÈHÓˆ‹šYHKœ™\ÜÛœÙWÚYˆQ•“ÒSˆ]Y\Ý[ÛœÈLˆÓˆKœ]Y\Ý[Û—ÚYHL‹šYˆÔ“ÕT–HËšYËœÝÜ™WÛ˜[YKË˜Y™\ÜËË˜Ú]KË˜Ü™X]YØ]ˆÔ‘Tˆ–HÙZYÚYÜØÛÜ™HTÐËÝ[Ü™\ÜÛœÙ\ÈTÐÂˆˆˆ‹ˆ
+VQTÒPS—ÐËÛØ˜[Ø]™×Ü˜][™ËVQTÒPS—ÐÊKˆ
+BˆÝÜ™\×Ù]HHÝ\œÛÜ‹™™]Ú[
+
+BˆˆÈÛÛ™\XÚ[X[˜[Y\ÈÈ›Ø]›Üˆ[\]HÛÛ\]Xš[]Bˆ›ÜˆÝÜ™H[ˆÝÜ™\×Ù]N‚ˆÝÜ™VÉØ]™×Ü˜][™É×HH›Ø]
+ÝÜ™VÉØ]™×Ü˜][™É×JHYˆÝÜ™VÉØ]™×Ü˜][™É×H\È›Ý›Û™H[ÙHŒˆÝÜ™VÉÜ˜][™×Ù™YY˜XÚ×ØÛÝ[	×HH[
+ÝÜ™VÉÜ˜][™×Ù™YY˜XÚ×ØÛÝ[	×JHYˆÝÜ™K™Ù]
+	Ü˜][™×Ù™YY˜XÚ×ØÛÝ[	ÊH[ÙHˆÝÜ™VÉÝÙZYÚYÜØÛÜ™I×HH›Ø]
+ÝÜ™VÉÝÙZYÚYÜØÛÜ™I×JHYˆÝÜ™K™Ù]
+	ÝÙZYÚYÜØÛÜ™IÊH\È›Ý›Û™H[ÙHŒˆˆÈÝ™\˜[Ý]\ÝXÜÂˆÝ\œÛÜ‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕˆÓÕS•
+TÕSÕ‹šY
+H\ÈÝ[Ü™\ÜÛœÙ\ËˆÓÕS•
+TÕSÕËšY
+H\ÈÝ[ÜÝÜ™\ËˆÓÕS•
+TÕSÕ‹\Ù\—Ù[XZ[
+H\ÈÝ[Ý[š\]YWÝ\Ù\œËˆU‘ÊÐTÑHÒSˆL‹œ]Y\Ý[Û—Ý\HH	Ü˜][™ÉÈSˆKœ˜][™×Ý˜[YHS‘
+H\ÈÝ™\˜[Ø]™×Ü˜][™ËˆÓÕS•
+TÕSÕKšY
+H\ÈÝ[Ü]Y\Ý[Û›˜Z\™\Âˆ”“ÓHÝÜ™\ÈÂˆÜØÛÜWÚ›Ú[ŸBˆQ•“ÒSˆ]Y\Ý[Û›˜Z\™\ÈHÓˆËšYHKœÝÜ™WÚYˆQ•“ÒSˆ™\ÜÛœÙ\ÈˆÓˆKšYH‹œ]Y\Ý[Û›˜Z\™WÚYˆQ•“ÒSˆ[œÝÙ\œÈHÓˆ‹šYHKœ™\ÜÛœÙWÚYˆQ•“ÒSˆ]Y\Ý[ÛœÈLˆÓˆKœ]Y\Ý[Û—ÚYHL‹šYˆˆˆ‚ˆ
+BˆÝ™\˜[ÜÝ]ÈHÝ\œÛÜ‹™™]ÚÛ™J
+BˆˆYˆÝ™\˜[ÜÝ]Î‚ˆÝ™\˜[ÜÝ]ÖÉÛÝ™\˜[Ø]™×Ü˜][™É×HH›Ø]
+Ý™\˜[ÜÝ]ÖÉÛÝ™\˜[Ø]™×Ü˜][™É×JHYˆÝ™\˜[ÜÝ]ÖÉÛÝ™\˜[Ø]™×Ü˜][™É×H\È›Ý›Û™H[ÙHŒˆ[ÙN‚ˆÝ™\˜[ÜÝ]ÈHÂˆ	ÝÝ[Ü™\ÜÛœÙ\ÉÎˆˆ	ÝÝ[ÜÝÜ™\ÉÎˆˆ	ÝÝ[Ý[š\]YWÝ\Ù\œÉÎˆˆ	ÛÝ™\˜[Ø]™×Ü˜][™ÉÎˆˆ	ÝÝ[Ü]Y\Ý[Û›˜Z\™\ÉÎˆˆBˆˆÈ™XÙ[XÝ]š]H
+\ÝÈ^\Ë[šÙYÈÝÜ™\ÊBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕUJ‹œÝX›Z]YØ]
+H\È]KÓÕS•
+TÕSÕ‹šY
+H\È™\ÜÛœÙ\Âˆ”“ÓH™\ÜÛœÙ\È‚ˆS“‘Tˆ“ÒSˆ]Y\Ý[Û›˜Z\™\ÈHÓˆ‹œ]Y\Ý[Û›˜Z\™WÚYHKšYˆS“‘Tˆ“ÒSˆÝÜ™\ÈÈÓˆKœÝÜ™WÚYHËšYˆÜØÛÜWÚ›Ú[ŸBˆÒT‘H‹œÝX›Z]YØ]HUWÔÕPŠÕT‘UJ
+KS•T•SÈVJBˆÔ“ÕT–HUJ‹œÝX›Z]YØ]
+BˆÔ‘Tˆ–H]Bˆˆˆ‚ˆ
+Bˆ™XÙ[ØXÝ]š]HHÝ\œÛÜ‹™™]Ú[
+
+BˆˆÈÜ\™›Ü›Z[™ÈÝÜ™\ÈžH™YY˜XÚÂˆÝ\œÛÜ‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕËœÝÜ™WÛ˜[YKÓÕS•
+‹šY
+H\È™\ÜÛœÙWØÛÝ[ˆ”“ÓHÝÜ™\ÈÂˆÜØÛÜWÚ›Ú[ŸBˆQ•“ÒSˆ]Y\Ý[Û›˜Z\™\ÈHÓˆËšYHKœÝÜ™WÚYˆQ•“ÒSˆ™\ÜÛœÙ\ÈˆÓˆKšYH‹œ]Y\Ý[Û›˜Z\™WÚYˆÔ“ÕT–HËšYËœÝÜ™WÛ˜[YBˆÔ‘Tˆ–H™\ÜÛœÙWØÛÝ[TÐÂˆSRUBˆˆˆ‚ˆ
+BˆÜÜÝÜ™\ÈHÝ\œÛÜ‹™™]Ú[
+
+B‚ˆÈ™\ÝÝ™\˜[ÝÜ™H˜[šÙYžH˜^Y\ÚX[‹X]™\˜YÙHØÛÜ™HÛÈHÝÜ™BˆÈÚ]Û™HXÚÞHx¦!HÙ\Û‰Ý™X]HÝÜ™HÚ]Ý\ÝZ[™Y¸¦!K‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕËšYËœÝÜ™WÛ˜[YKË˜Y™\ÜËË˜Ú]KˆÓÕS•
+TÕSÕ‹šY
+H\ÈÝ[Ü™\ÜÛœÙ\ËˆU‘ÊÐTÑHÒSˆL‹œ]Y\Ý[Û—Ý\HH	Ü˜][™ÉÈSˆKœ˜][™×Ý˜[YHS‘
+H\È]™×Ü˜][™Ëˆ
+ˆ
+	\È
+ˆ	\ÊH
+ÈÓÐSTÐÑJÕSJÐTÑHÒSˆL‹œ]Y\Ý[Û—Ý\HH	Ü˜][™ÉÈSˆKœ˜][™×Ý˜[YHS‘
+K
+Bˆ
+HÈ
+ˆ	\È
+ÈÓÕS•
+ÐTÑHÒSˆL‹œ]Y\Ý[Û—Ý\HH	Ü˜][™ÉÈS‘Kœ˜][™×Ý˜[YHTÈ“Õ•SSˆHS‘
+Bˆ
+H\ÈÙZYÚYÜØÛÜ™Bˆ”“ÓHÝÜ™\ÈÂˆÜØÛÜWÚ›Ú[ŸBˆQ•“ÒSˆ]Y\Ý[Û›˜Z\™\ÈHÓˆËšYHKœÝÜ™WÚYˆQ•“ÒSˆ™\ÜÛœÙ\ÈˆÓˆKšYH‹œ]Y\Ý[Û›˜Z\™WÚYˆQ•“ÒSˆ[œÝÙ\œÈHÓˆ‹šYHKœ™\ÜÛœÙWÚYˆQ•“ÒSˆ]Y\Ý[ÛœÈLˆÓˆKœ]Y\Ý[Û—ÚYHL‹šYˆÒT‘HL‹œ]Y\Ý[Û—Ý\HH	Ü˜][™ÉÂˆÔ“ÕT–HËšYËœÝÜ™WÛ˜[YKË˜Y™\ÜËË˜Ú]BˆU’S‘ÈÝ[Ü™\ÜÛœÙ\ÈHBˆÔ‘Tˆ–HÙZYÚYÜØÛÜ™HTÐËÝ[Ü™\ÜÛœÙ\ÈTÐÂˆSRUBˆˆˆ‹ˆ
+VQTÒPS—ÐËÛØ˜[Ø]™×Ü˜][™ËVQTÒPS—ÐÊKˆ
+Bˆ™\ÝÛÝ™\˜[ÜÝÜ™HHÝ\œÛÜ‹™™]ÚÛ™J
+BˆYˆ™\ÝÛÝ™\˜[ÜÝÜ™N‚ˆ™\ÝÛÝ™\˜[ÜÝÜ™VÉØ]™×Ü˜][™É×HH›Ø]
+™\ÝÛÝ™\˜[ÜÝÜ™VÉØ]™×Ü˜][™É×JHYˆ™\ÝÛÝ™\˜[ÜÝÜ™VÉØ]™×Ü˜][™É×H\È›Ý›Û™H[ÙHŒ‚ˆÈÛØ˜[]™\˜YÙHÛÛ[Y[™][Ûˆ˜][™È
+˜^Y\ÚX[ˆš[ÜˆX
+K‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆˆ”ÑSPÕU‘ÊØËœ˜][™ÊH\ÈÛØ˜[Ø]™Âˆ”“ÓHÝÜ™\ÈÂˆÜØÛÜWÚ›Ú[ŸBˆQ•“ÒSˆÝY™ˆÝˆÓˆÝ‹œÝÜ™WÚYHËšYˆQ•“ÒSˆÝY™—ØÛÛ[Y[™][ÛœÈØÈÓˆØËœÝY™—ÚYHÝ‹šYˆÒT‘HØËœ˜][™ÈTÈ“Õ•Sˆˆ‚ˆ
+BˆÜ›ÝÈHÝ\œÛÜ‹™™]ÚÛ™J
+BˆÝY™—ÙÛØ˜[Ø]™ÈH›Ø]
+Ü›ÝÖÉÙÛØ˜[Ø]™É×JHYˆÜ›ÝÈ[™Ü›ÝÖÉÙÛØ˜[Ø]™É×H\È›Ý›Û™H[ÙHŒ‚ˆÈ™\ÝÝ™\˜[ÝY™ˆ
+YÚ\Ý˜^Y\ÚX[‹X]™\˜YÙHØÛÜ™JK‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕËšYË™š\œÝÛ˜[YKË›\ÝÛ˜[YKËœÜÚ][Û‹Ëœ›ÛKˆU‘ÊØËœ˜][™ÊH\È]™×Ü˜][™ËˆÓÕS•
+ØËšY
+H\ÈÛÛ[Y[™][Û—ØÛÝ[ˆ
+ˆ
+	\È
+ˆ	\ÊH
+ÈÓÐSTÐÑJÕSJØËœ˜][™ÊK
+Bˆ
+HÈ
+ˆ	\È
+ÈÓÕS•
+ØËœ˜][™ÊBˆ
+H\ÈÙZYÚYÜØÛÜ™KˆÝœÝÜ™WÛ˜[YBˆ”“ÓHÝY™ˆÂˆQ•“ÒSˆÝY™—ØÛÛ[Y[™][ÛœÈØÈÓˆËšYHØËœÝY™—ÚYˆQ•“ÒSˆ™\ÜÛœÙ\ÈˆÓˆØËœ™\ÜÛœÙWÚYH‹šYˆQ•“ÒSˆ]Y\Ý[Û›˜Z\™\ÈHÓˆ‹œ]Y\Ý[Û›˜Z\™WÚYHKšYˆQ•“ÒSˆÝÜ™\ÈÝÓˆKœÝÜ™WÚYHÝšYˆÜØÛÜWÚ›Ú[‹œ™\XÙJ	ÜËšY	Ë	ÜÝšY	Ê_BˆÔ“ÕT–HËšYË™š\œÝÛ˜[YKË›\ÝÛ˜[YKËœÜÚ][Û‹Ëœ›ÛKÝœÝÜ™WÛ˜[YBˆU’S‘È]™×Ü˜][™ÈTÈ“Õ•SˆÔ‘Tˆ–HÙZYÚYÜØÛÜ™HTÐÂˆSRUBˆˆˆ‹ˆ
+VQTÒPS—ÐËÝY™—ÙÛØ˜[Ø]™ËVQTÒPS—ÐÊKˆ
+Bˆ™\ÝÛÝ™\˜[ÜÝY™ˆHÝ\œÛÜ‹™™]ÚÛ™J
+BˆYˆ™\ÝÛÝ™\˜[ÜÝY™Ž‚ˆ™\ÝÛÝ™\˜[ÜÝY™–ÉØ]™×Ü˜][™É×HH›Ø]
+™\ÝÛÝ™\˜[ÜÝY™–ÉØ]™×Ü˜][™É×JHYˆ™\ÝÛÝ™\˜[ÜÝY™–ÉØ]™×Ü˜][™É×H\È›Ý›Û™H[ÙHŒˆ™\ÝÛÝ™\˜[ÜÝY™–ÉÝÙZYÚYÜØÛÜ™I×HH›Ø]
+™\ÝÛÝ™\˜[ÜÝY™–ÉÝÙZYÚYÜØÛÜ™I×JHYˆ™\ÝÛÝ™\˜[ÜÝY™–ÉÝÙZYÚYÜØÛÜ™I×H\È›Ý›Û™H[ÙHŒ‚ˆ™]\›ˆÂˆ	ÜÝÜ™\×Ù]IÎˆÝÜ™\×Ù]Kˆ	ÛÝ™\˜[ÜÝ]ÉÎˆÝ™\˜[ÜÝ]Ëˆ	Ü™XÙ[ØXÝ]š]IÎˆ™XÙ[ØXÝ]š]Kˆ	ÝÜÜÝÜ™\ÉÎˆÜÜÝÜ™\Ëˆ	Ø™\ÝÛÝ™\˜[ÜÝÜ™IÎˆ™\ÝÛÝ™\˜[ÜÝÜ™Kˆ	Ø™\ÝÛÝ™\˜[ÜÝY™‰Îˆ™\ÝÛÝ™\˜[ÜÝY™‚ˆBˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆ\œ›Ý]J‹ØYZ[‹Ù\Ú›Ø\™ŠBˆÙÚ[—Ü™\]Z\™YˆYˆYZ[—Ù\Ú›Ø\™
+
+N‚ˆžN‚ˆ[˜[]XÜÈH™]ÚÙ\Ú›Ø\™Ø[˜[]XÜÊ
+Bˆ™]\›ˆ™[™\—Ý[\]J™\Ú›Ø\™Ù\Ú›Ø\™š[‹
+Š˜[˜[]XÜÊBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆ\œ›Ü—Ù]Z[ÈH˜XÙX˜XÚË™›Ü›X]Ù^Ê
+BˆÙÙÙ\‹™\œ›ÜŠˆ‘\Ú›Ø\™Ü˜\ÚˆÙ_WžÙ\œ›Ü—Ù]Z[ßHŠBˆ™]\›ˆˆ‘\Ú›Ø\™\œ›ÜŽˆÙ_Oœ™OžÙ\œ›Ü—Ù]Z[ßOÜ™Oˆ‹L‚ˆ\œ›Ý]J‹ØYZ[‹Ý\Ù\œÈŠBˆ›ÛWÜ™\]Z\™Y
+	ÜÝ\\˜YZ[‰ÊBˆYˆYZ[—Ý\Ù\œÊ
+N‚ˆˆˆ•\Ù\ˆX[˜YÙ[Y[YÙHˆˆ‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕ
+ˆ”“ÓH\Ù\œÈÔ‘Tˆ–HÜ™X]YØ]TÐÈŠBˆ\Ù\œÈHÝ\œÛÜ‹™™]Ú[
+
+BˆÛÛ™šYÈHÙ]ÛXÙ[œÙWØÛÛ™šYÊ
+BˆÜ[Ý\›H›Ü›X[^™WÜÜ[Ý\›
+ÛÛ™šYË™Ù]
+›XÙ[œÚ[™×ÜÜ[Ý\›ŠHYˆÛÛ™šYÈ[ÙH›Û™JBˆ™]\›ˆ™[™\—Ý[\]J˜YZ[‹Ý\Ù\œËš[‹\Ù\œÏ]\Ù\œËXÙ[œÚ[™×ÜÜ[Ý\›\Ü[Ý\›
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆ\œ›Ý]J‹ØYZ[‹Ý\Ù\œËØY‹Y]ÙÏVÈ”ÔÕ—JBˆ›ÛWÜ™\]Z\™Y
+	ÜÝ\\˜YZ[‰ÊBˆYˆYZ[—ØYÝ\Ù\Š
+N‚ˆˆˆYH™]È\Ù\ˆˆˆ‚ˆ\Ù\›˜[YHH™\]Y\Ý™›Ü›K™Ù]
+\Ù\›˜[YH‹ˆŠKœÝš\
+
+Bˆ[XZ[H™\]Y\Ý™›Ü›K™Ù]
+™[XZ[‹ˆŠKœÝš\
+
+Bˆ\ÜÝÛÜ™H™\]Y\Ý™›Ü›K™Ù]
+œ\ÜÝÛÜ™‹ˆŠBˆ›ÛHH™\]Y\Ý™›Ü›K™Ù]
+œ›ÛH‹\Ù\ˆŠBˆXÙ[œÙWÚÙ^HH™\]Y\Ý™›Ü›K™Ù]
+›XÙ[œÙWÚÙ^H‹ˆŠKœÝš\
+
+BˆX^ÜÝÜ™\ÈHˆˆYˆ›Ý\Ù\›˜[YHÜˆ›Ý[XZ[Üˆ›Ý\ÜÝÛÜ™‚ˆ›\Ú
+•\Ù\›˜[YK[XZ[[™\ÜÝÛÜ™\™H™\]Z\™Yˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJBˆˆYˆ›ÛH›Ý[ˆÉÜÝ\\˜YZ[‰Ë	ØYZ[‰Ë	Ý\Ù\‰×N‚ˆ›\Ú
+’[˜[Y›ÛKˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJB‚ˆÈHXÙ[œÚ[™ÈÜ[\ÈHÛÝ\˜ÙHÙˆ]›ÜˆÛY[[Z]Ë‚ˆYˆ›ÛHOH	ØYZ[‰Î‚ˆYˆ›ÝXÙ[œÙWÚÙ^N‚ˆ›\Ú
+HXÙ[œÙHÙ^Hœ›ÛHHXÙ[œÚ[™ÈÜ[\È™\]Z\™Y›ÜˆHÛY[XØÛÝ[ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJBˆžN‚ˆ[\Ü™\]Y\ÝÈ\ÈÜ™\]Y\ÝÂˆÛÛ™šYÈHÙ]ÛXÙ[œÙWØÛÛ™šYÊ
+BˆÜ[Ý\›H›Ü›X[^™WÜÜ[Ý\›
+ÛÛ™šYË™Ù]
+›XÙ[œÚ[™×ÜÜ[Ý\›ŠHYˆÛÛ™šYÈ[ÙH›Û™JBˆ™\ÜÛœÙHHÜ™\]Y\ÝËœÜÝ
+ˆˆžÜÜ[Ý\›KØ\KÝ˜[Y]KÞÛXÙ[œÙWÚÙ^_H‹ˆXY\œÏ[XÙ[œÚ[™×Ø\WÚXY\œÊ
+K[Y[Ý]LLˆ
+BˆXÙ[œÙWÙ]HH™\ÜÛœÙKšœÛÛŠ
+HYˆ™\ÜÛœÙK˜ÛÛ[[ÙHßBˆYˆ™\ÜÛœÙKœÝ]\×ØÛÙHOHŒÜˆ›ÝXÙ[œÙWÙ]K™Ù]
+˜[YŠN‚ˆ›\Ú
+XÙ[œÙWÙ]K™Ù]
+›Y\ÜØYÙHŠHÜˆ•HXÙ[œÙHÙ^H\È[˜[YÜˆ[˜XÝ]™Kˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJBˆX^ÜÝÜ™\ÈH[
+XÙ[œÙWÙ]K™Ù]
+›X^ÜÝÜ™\ÈŠHÜˆ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™\œ›ÜŠ•[˜X›HÈ˜[Y]HÛY[XÙ[œÙNˆ	\È‹^ÊBˆ›\Ú
+•[˜X›HÈÛÛ›™XÝÈHXÙ[œÚ[™ÈÜ[ˆX\ÙHžHYØZ[‹ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJBˆˆžN‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆˆÈÚXÚÈYˆ\Ù\›˜[YHÜˆ[XZ[[™XYH^\ÝÂˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕY”“ÓH\Ù\œÈÒT‘H\Ù\›˜[YHH	\ÈÔˆ[XZ[H	\È‹
+\Ù\›˜[YK[XZ[
+JBˆYˆÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆ›\Ú
+•\Ù\›˜[YHÜˆ[XZ[[™XYH^\ÝËˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJBˆYˆXÙ[œÙWÚÙ^N‚ˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕY”“ÓH\Ù\œÈÒT‘HXÙ[œÙWÚÙ^HH	\È‹
+XÙ[œÙWÚÙ^K
+JBˆYˆÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆ›\Ú
+•\ÈXÙ[œÙHÙ^H\È[™XYHÛÛ›™XÝYÈ[›Ý\ˆÛY[ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJBˆˆ\ÜÝÛÜ™Ú\ÚH\ÚÜ\ÜÝÛÜ™
+\ÜÝÛÜ™
+BˆÝ\œÛÜ‹™^XÝ]Jˆ’S”ÑT•S•È\Ù\œÈ
+\Ù\›˜[YK[XZ[\ÜÝÛÜ™Ú\Ú›ÛKX^ÜÝÜ™\ËXÙ[œÙWÚÙ^JHSQTÈ
+	\Ë	\Ë	\Ë	\Ë	\Ë	\ÊH‹ˆ
+\Ù\›˜[YK[XZ[\ÜÝÛÜ™Ú\Ú›ÛKX^ÜÝÜ™\ÈYˆ›ÛHOH	ØYZ[‰È[ÙHXÙ[œÙWÚÙ^HYˆ›ÛHOH	ØYZ[‰È[ÙH›Û™JBˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÛÛ›‹˜ÛÜÙJ
+BˆˆYˆ›ÛHOH	ØYZ[‰Î‚ˆ›\Ú
+ˆÛY[XØÛÝ[Ü™X]Y[™ÛÛ›™XÝYÈ]ÈXÙ[œÙH
+ÛX^ÜÝÜ™\ÈÜˆ	Õ[›[Z]Y	ßHÝÜ™\ÊKˆ‹œÝXØÙ\ÜÈŠBˆÙ×Ø]Y]
+ˆ[]WÝ\OH\Ù\ˆ‹ˆ[]WÚYLˆXÝ[ÛH˜Ü™X]Y‹ˆ™]×Ý˜[Y\ÏYˆÛY[Ý\Ù\›˜[Y_HÜ™X]YÚ]X^ÜÝÜ™\Ï^ÛX^ÜÝÜ™\ßH‚ˆ
+Bˆ[ÙN‚ˆ›\Ú
+•\Ù\ˆÜ™X]YÝXØÙ\ÜÙ[Kˆ‹œÝXØÙ\ÜÈŠBˆÙ×Ø]Y]
+ˆ[]WÝ\OH\Ù\ˆ‹ˆ[]WÚYLˆXÝ[ÛH˜Ü™X]Y‹ˆ™]×Ý˜[Y\ÏYˆ•\Ù\ˆÝ\Ù\›˜[Y_HÜ™X]YÚ]›ÛHÜ›Û_H‚ˆ
+Bˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ‘\œ›ÜˆÜ™X][™È\Ù\ŽˆÙ_HŠBˆ›\Ú
+‘˜Z[YÈÜ™X]H\Ù\‹ˆ‹™[™Ù\ˆŠBˆˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJB‚ˆ\œ›Ý]J‹Ø\KØYZ[‹ÛXÙ[œÙ\ËÝ˜[Y]H‹Y]ÙÏVÈ”ÔÕ—JBˆ›ÛWÜ™\]Z\™Y
+	ÜÝ\\˜YZ[‰ÊBˆYˆYZ[—Ý˜[Y]WÛXÙ[œÙJ
+N‚ˆˆˆ•˜[Y]HH\ÝYÜ[Ù^H[™™]\›ˆ]ÈXÙ[œÙY[Z]Ëˆˆˆ‚ˆ]HH™\]Y\Ý™Ù]ÚœÛÛŠÚ[[UYJHÜˆßBˆXÙ[œÙWÚÙ^HH
+]K™Ù]
+›XÙ[œÙWÚÙ^HŠHÜˆˆŠKœÝš\
+
+BˆYˆ›ÝXÙ[œÙWÚÙ^N‚ˆ™]\›ˆœÛÛšYžJÈ˜[YŽˆ˜[ÙK™\œ›ÜˆŽˆ“XÙ[œÙHÙ^H\È™\]Z\™YŸJKˆžN‚ˆ[\Ü™\]Y\ÝÈ\ÈÜ™\]Y\ÝÂˆÛÛ™šYÈHÙ]ÛXÙ[œÙWØÛÛ™šYÊ
+BˆÜ[Ý\›H›Ü›X[^™WÜÜ[Ý\›
+ÛÛ™šYË™Ù]
+›XÙ[œÚ[™×ÜÜ[Ý\›ŠHYˆÛÛ™šYÈ[ÙH›Û™JBˆ™\ÜÛœÙHHÜ™\]Y\ÝËœÜÝ
+ˆˆžÜÜ[Ý\›KØ\KÝ˜[Y]KÞÛXÙ[œÙWÚÙ^_H‹ˆXY\œÏ[XÙ[œÚ[™×Ø\WÚXY\œÊ
+K[Y[Ý]LLˆ
+Bˆ^[ØYH™\ÜÛœÙKšœÛÛŠ
+HYˆ™\ÜÛœÙK˜ÛÛ[[ÙHßBˆ™]\›ˆœÛÛšYžJ^[ØY
+K™\ÜÛœÙKœÝ]\×ØÛÙBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™\œ›ÜŠ“XÙ[œÙH™]šY]È˜[Y][Ûˆ˜Z[Yˆ	\È‹^ÊBˆ™]\›ˆœÛÛšYžJÈ˜[YŽˆ˜[ÙK™\œ›ÜˆŽˆ“XÙ[œÚ[™ÈÜ[\È[˜]˜Z[X›HŸJKL‚‚ˆ\œ›Ý]J‹ØYZ[‹Ý\Ù\œËÏ[\Ù\—ÚY‹ÝÙÙÛH‹Y]ÙÏVÈ”ÔÕ—JBˆ›ÛWÜ™\]Z\™Y
+	ÜÝ\\˜YZ[‰ÊBˆYˆYZ[—ÝÙÙÛWÝ\Ù\Š\Ù\—ÚYˆ[
+N‚ˆˆˆ•ÙÙÛH\Ù\ˆXÝ]™HÝ]\Èˆˆ‚ˆžN‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆˆÈÛ‰Ý[ÝÈXXÝ]˜][™È[Ý\œÙ[‚ˆYˆ\Ù\—ÚYOHÙ\ÜÚ[Û‹™Ù]
+	Ý\Ù\—ÚY	ÊN‚ˆ›\Ú
+–[ÝHØ[››ÝXXÝ]˜]H[Ý\ˆÝÛˆXØÛÝ[ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJBˆˆÝ\œÛÜ‹™^XÝ]J•TUH\Ù\œÈÑU\×ØXÝ]™HH“Õ\×ØXÝ]™HÒT‘HYH	\È‹
+\Ù\—ÚY
+JBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÛÛ›‹˜ÛÜÙJ
+Bˆ›\Ú
+•\Ù\ˆÝ]\È\]YÝXØÙ\ÜÙ[Kˆ‹œÝXØÙ\ÜÈŠBˆÙ×Ø]Y]
+ˆ[]WÝ\OH\Ù\ˆ‹ˆ[]WÚY]\Ù\—ÚYˆXÝ[ÛHÙÙÛY‹ˆÛÝ˜[Y\ÏH•\Ù\ˆÝ]\ÈÙÙÛY‚ˆ
+Bˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ‘\œ›ÜˆÙÙÛ[™È\Ù\ŽˆÙ_HŠBˆ›\Ú
+‘˜Z[YÈ\]H\Ù\ˆÝ]\Ëˆ‹™[™Ù\ˆŠBˆˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJB‚ˆ\œ›Ý]J‹ØYZ[‹Ý\Ù\œËÏ[\Ù\—ÚY‹ÙÙ[™\˜]K[XÙ[œÙH‹Y]ÙÏVÈ”ÔÕ—JBˆ›ÛWÜ™\]Z\™Y
+	ÜÝ\\˜YZ[‰ÊBˆYˆYZ[—ÙÙ[™\˜]WÝ\Ù\—ÛXÙ[œÙJ\Ù\—ÚYˆ[
+N‚ˆˆˆ‘Ù[™\˜]H[™]XÚHÛY[XÙ[œÙHÚ]Ý]HÙXÛÛ™Ü[ÙÚ[‹ˆˆˆ‚ˆ\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+\Ù\—ÚY
+BˆYˆ›Ý\Ù\ˆÜˆ\Ù\‹™Ù]
+œ›ÛHŠHOH˜YZ[ˆŽ‚ˆ›\Ú
+HXÙ[œÙHØ[ˆÛ›H™HÙ[™\˜]Y›Üˆ[ˆYZ[ˆ
+ÛY[
+HXØÛÝ[ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJB‚ˆÛÛ™šYÈHÙ]ÛXÙ[œÙWØÛÛ™šYÊ
+BˆÜ[Ý\›H›Ü›X[^™WÜÜ[Ý\›
+ÛÛ™šYË™Ù]
+›XÙ[œÚ[™×ÜÜ[Ý\›ŠHYˆÛÛ™šYÈ[ÙH›Û™JBˆžN‚ˆ[\Ü™\]Y\ÝÈ\ÈÜ™\]Y\ÝÂˆ™\ÜÛœÙHHÜ™\]Y\ÝËœÜÝ
+ˆˆžÜÜ[Ý\›KØ\KÛXÙ[œÙ\ËÙÙ[™\˜]H‹ˆXY\œÏ[XÙ[œÚ[™×Ø\WÚXY\œÊ
+KˆœÛÛ^Âˆ™^\›˜[Ý\Ù\—ÚYŽˆ\Ù\—ÚYˆ˜ÛÛ\[žWÛ˜[YHŽˆ\Ù\‹™Ù]
+\Ù\›˜[YHŠHÜˆ\Ù\‹™Ù]
+™[XZ[ŠKˆ˜ÛÛXÝÙ[XZ[Žˆ\Ù\‹™Ù]
+™[XZ[ŠKˆ›X^ÜÝÜ™\ÈŽˆ[
+\Ù\‹™Ù]
+›X^ÜÝÜ™\ÈŠHÜˆ
+Kˆ›X^Ü]Y\Ý[Û›˜Z\™\ÈŽˆˆKˆ[Y[Ý]LMKˆ
+Bˆ^[ØYH™\ÜÛœÙKšœÛÛŠ
+HYˆ™\ÜÛœÙK˜ÛÛ[[ÙHßBˆYˆ™\ÜÛœÙKœÝ]\×ØÛÙH›Ý[ˆ
+ŒŒJHÜˆ›Ý^[ØY™Ù]
+›XÙ[œÙWÚÙ^HŠN‚ˆÙÙÙ\‹™\œ›ÜŠ”Ü[XÙ[œÙHÙ[™\˜][Ûˆ˜Z[Yˆ	\È	\È‹™\ÜÛœÙKœÝ]\×ØÛÙK™\ÜÛœÙK^
+Bˆ›\Ú
+^[ØY™Ù]
+™\œ›ÜˆŠHÜˆ•[˜X›HÈÙ[™\˜]HXÙ[œÙHœ›ÛHHXÙ[œÚ[™ÈÜ[ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJB‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]J•TUH\Ù\œÈÑUXÙ[œÙWÚÙ^HH	\ÈÒT‘HYH	\È‹
+^[ØYÈ›XÙ[œÙWÚÙ^H—K\Ù\—ÚY
+JBˆÛÛ›‹˜ÛÛ[Z]
+
+Bˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆ›\Ú
+ˆ“XÙ[œÙHÙ[™\˜]Y[™ÛÛ›™XÝYÈÝ\Ù\–ÉÝ\Ù\›˜[YI×_Kˆ‹œÝXØÙ\ÜÈŠBˆÙ×Ø]Y]
+\Ù\ˆ‹\Ù\—ÚY›XÙ[œÙWÙÙ[™\˜]Y‹™]×Ý˜[Y\ÏYˆ”Ü[ˆÜÜ[Ý\›HŠBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™\œ›ÜŠ‘\œ›ÜˆÙ[™\˜][™ÈÛY[XÙ[œÙNˆ	\È‹^ÊBˆ›\Ú
+•[˜X›HÈÛÛ›™XÝÈHXÙ[œÚ[™ÈÜ[ˆÚXÚÈHÜ[T“[™Ú\™YTHÙ^Kˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJB‚ˆ\œ›Ý]J‹ØXØÛÝ[Ü\ÜÝÛÜ™‹Y]ÙÏVÈ‘ÑU‹”ÔÕ—JBˆÙÚ[—Ü™\]Z\™YˆYˆXØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™
+
+N‚ˆˆˆ”Ù[‹\Ù\šXÙHXØÛÝ[Ù][™ÜÎˆÚ[™ÙH\Ù\›˜[YH[™ÛÜˆ\ÜÝÛÜ™ˆˆˆ‚ˆ\Ù\—ÚYHÙ\ÜÚ[Û‹™Ù]
+	Ý\Ù\—ÚY	ÊBˆYˆ›Ý\Ù\—ÚY‚ˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ	ÛÙÚ[‰ÊJB‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕY\Ù\›˜[YK[XZ[›ÛK\ÜÝÛÜ™Ú\ÚÜ™X]YØ]\×ØXÝ]™H”“ÓH\Ù\œÈÒT‘HYH	\È‹
+\Ù\—ÚY
+JBˆ\Ù\ˆHÝ\œÛÜ‹™™]ÚÛ™J
+B‚ˆYˆ›Ý\Ù\Ž‚ˆÙ\ÜÚ[Û‹˜ÛX\Š
+Bˆ›\Ú
+–[Ý\ˆXØÛÝ[ÛÝ[›Ý™H›Ý[™ˆX\ÙHÙÈ[ˆYØZ[‹ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ	ÛÙÚ[‰ÊJB‚ˆYˆ™\]Y\Ý›Y]ÙOH”ÔÕŽ‚ˆ›Ü›WÝ\HH™\]Y\Ý™›Ü›K™Ù]
+™›Ü›WÝ\H‹œ\ÜÝÛÜ™ŠB‚ˆYˆ›Ü›WÝ\HOH™[XZ[Ž‚ˆ™]×Ù[XZ[H™\]Y\Ý™›Ü›K™Ù]
+›™]×Ù[XZ[‹ˆŠKœÝš\
+
+B‚ˆYˆ›Ý™]×Ù[XZ[‚ˆ›\Ú
+‘[XZ[\È™\]Z\™Yˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆYˆˆ›Ý[ˆ™]×Ù[XZ[Üˆ‹ˆˆ›Ý[ˆ™]×Ù[XZ[œÜ]
+ŠVËLWN‚ˆ›\Ú
+”X\ÙH[\ˆH˜[Y[XZ[Y™\ÜËˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆYˆ™]×Ù[XZ[OH\Ù\–ÉÙ[XZ[	×N‚ˆ›\Ú
+“™]È[XZ[]\Ý™HY™™\™[œ›ÛH[Ý\ˆÝ\œ™[[XZ[ˆ‹Ø\›š[™ÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆÝ\œÛÜ‹™^XÝ]Jˆ”ÑSPÕY”“ÓH\Ù\œÈÒT‘H[XZ[H	\ÈS‘YOH	\È‹ˆ
+™]×Ù[XZ[\Ù\—ÚY
+Bˆ
+BˆYˆÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆ›\Ú
+•][XZ[\È[™XYH[ˆ\ÙHžH[›Ý\ˆXØÛÝ[ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆÝ\œÛÜ‹™^XÝ]Jˆ•TUH\Ù\œÈÑU[XZ[H	\ÈÒT‘HYH	\È‹ˆ
+™]×Ù[XZ[\Ù\—ÚY
+Bˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆžN‚ˆÙ×Ø]Y]
+ˆ[]WÝ\OH\Ù\ˆ‹ˆ[]WÚY]\Ù\—ÚYˆXÝ[ÛH™[XZ[ØÚ[™ÙY‹ˆÛÝ˜[Y\Ï]\Ù\–ÉÙ[XZ[	×Kˆ™]×Ý˜[Y\Ï[™]×Ù[XZ[ˆ\Ù\—ÚY]\Ù\—ÚYˆ
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ\ÜÂ‚ˆ›\Ú
+ˆ‘[XZ[\]YÈÛ™]×Ù[XZ[Kˆ‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆYˆ›Ü›WÝ\HOH\Ù\›˜[YHŽ‚ˆ™]×Ý\Ù\›˜[YHH™\]Y\Ý™›Ü›K™Ù]
+›™]×Ý\Ù\›˜[YH‹ˆŠKœÝš\
+
+B‚ˆYˆ›Ý™]×Ý\Ù\›˜[YN‚ˆ›\Ú
+“™]È\Ù\›˜[YH\È™\]Z\™Yˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆYˆ[Š™]×Ý\Ù\›˜[YJHŽ‚ˆ›\Ú
+•\Ù\›˜[YH]\Ý™H]X\ÝˆÚ\˜XÝ\œÈÛ™Ëˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆYˆ™]×Ý\Ù\›˜[YHOH\Ù\–ÉÝ\Ù\›˜[YI×N‚ˆ›\Ú
+“™]È\Ù\›˜[YH]\Ý™HY™™\™[œ›ÛH[Ý\ˆÝ\œ™[\Ù\›˜[YKˆ‹Ø\›š[™ÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆÈ[š\]Y[™\ÜÈÚXÚÂˆÝ\œÛÜ‹™^XÝ]Jˆ”ÑSPÕY”“ÓH\Ù\œÈÒT‘H\Ù\›˜[YHH	\ÈS‘YOH	\È‹ˆ
+™]×Ý\Ù\›˜[YK\Ù\—ÚY
+Bˆ
+BˆYˆÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆ›\Ú
+•]\Ù\›˜[YH\È[™XYHZÙ[‹ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆÝ\œÛÜ‹™^XÝ]Jˆ•TUH\Ù\œÈÑU\Ù\›˜[YHH	\ÈÒT‘HYH	\È‹ˆ
+™]×Ý\Ù\›˜[YK\Ù\—ÚY
+Bˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÙ\ÜÚ[Û–ÉÝ\Ù\›˜[YI×HH™]×Ý\Ù\›˜[YB‚ˆžN‚ˆÙ×Ø]Y]
+ˆ[]WÝ\OH\Ù\ˆ‹ˆ[]WÚY]\Ù\—ÚYˆXÝ[ÛH\Ù\›˜[YWØÚ[™ÙY‹ˆÛÝ˜[Y\Ï]\Ù\–ÉÝ\Ù\›˜[YI×Kˆ™]×Ý˜[Y\Ï[™]×Ý\Ù\›˜[YKˆ\Ù\—ÚY]\Ù\—ÚYˆ
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ\ÜÂ‚ˆ›\Ú
+ˆ•\Ù\›˜[YHÚ[™ÙYÈÛ™]×Ý\Ù\›˜[Y_Kˆ‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆÈ\ÜÝÛÜ™Ú[™ÙH
+Y˜][
+BˆÝ\œ™[Ü\ÜÝÛÜ™H™\]Y\Ý™›Ü›K™Ù]
+˜Ý\œ™[Ü\ÜÝÛÜ™‹ˆŠBˆ™]×Ü\ÜÝÛÜ™H™\]Y\Ý™›Ü›K™Ù]
+›™]×Ü\ÜÝÛÜ™‹ˆŠBˆÛÛ™š\›WÜ\ÜÝÛÜ™H™\]Y\Ý™›Ü›K™Ù]
+˜ÛÛ™š\›WÜ\ÜÝÛÜ™‹ˆŠB‚ˆYˆ›ÝÝ\œ™[Ü\ÜÝÛÜ™Üˆ›Ý™]×Ü\ÜÝÛÜ™Üˆ›ÝÛÛ™š\›WÜ\ÜÝÛÜ™‚ˆ›\Ú
+[\ÜÝÛÜ™šY[È\™H™\]Z\™Yˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆYˆ›Ý™\šYžWÜ\ÜÝÛÜ™
+Ý\œ™[Ü\ÜÝÛÜ™\Ù\–ÉÜ\ÜÝÛÜ™Ú\Ú	×JN‚ˆ›\Ú
+Ý\œ™[\ÜÝÛÜ™\È[˜ÛÜœ™XÝˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆYˆ[Š™]×Ü\ÜÝÛÜ™
+H‚ˆ›\Ú
+“™]È\ÜÝÛÜ™]\Ý™H]X\ÝÚ\˜XÝ\œÈÛ™Ëˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆYˆ™]×Ü\ÜÝÛÜ™OHÛÛ™š\›WÜ\ÜÝÛÜ™‚ˆ›\Ú
+“™]È\ÜÝÛÜ™[™ÛÛ™š\›X][ÛˆÈ›ÝX]Úˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆYˆ™]×Ü\ÜÝÛÜ™OHÝ\œ™[Ü\ÜÝÛÜ™‚ˆ›\Ú
+“™]È\ÜÝÛÜ™]\Ý™HY™™\™[œ›ÛH[Ý\ˆÝ\œ™[\ÜÝÛÜ™ˆ‹Ø\›š[™ÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆ™]×Ú\ÚH\ÚÜ\ÜÝÛÜ™
+™]×Ü\ÜÝÛÜ™
+BˆÝ\œÛÜ‹™^XÝ]Jˆ•TUH\Ù\œÈÑU\ÜÝÛÜ™Ú\ÚH	\ÈÒT‘HYH	\È‹ˆ
+™]×Ú\Ú\Ù\—ÚY
+Bˆ
+BˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆžN‚ˆÙ×Ø]Y]
+ˆ[]WÝ\OH\Ù\ˆ‹ˆ[]WÚY]\Ù\—ÚYˆXÝ[ÛHœ\ÜÝÛÜ™ØÚ[™ÙY‹ˆ™]×Ý˜[Y\ÏHœÙ[‹\Ù\šXÙH\ÜÝÛÜ™Ú[™ÙH‹ˆ\Ù\—ÚY]\Ù\—ÚYˆ
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ\ÜÂ‚ˆ›\Ú
+”\ÜÝÛÜ™\]YÝXØÙ\ÜÙ[Kˆ‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™ŠJB‚ˆ™]\›ˆ™[™\—Ý[\]J˜XØÛÝ[ØÚ[™ÙWÜ\ÜÝÛÜ™š[‹\Ù\]\Ù\ŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ‘\œ›Üˆ[ˆXØÛÝ[Ù][™ÜÎˆÙ_HŠBˆ›\Ú
+ˆ‘\œ›Üˆ\][™ÈXØÛÝ[ˆÙ_H‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ù\Ú›Ø\™ŠJBˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆ\œ›Ý]J‹ØYZ[‹Ý\Ù\œËÏ[\Ù\—ÚY‹ÙY]‹Y]ÙÏVÈ‘ÑU‹”ÔÕ—JBˆ›ÛWÜ™\]Z\™Y
+	ÜÝ\\˜YZ[‰ÊBˆYˆYZ[—ÙY]Ý\Ù\Š\Ù\—ÚYˆ[
+N‚ˆˆˆ‘Y][ˆ^\Ý[™È\Ù\‹ˆˆˆ‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕ
+ˆ”“ÓH\Ù\œÈÒT‘HYH	\È‹
+\Ù\—ÚY
+JBˆ\Ù\ˆHÝ\œÛÜ‹™™]ÚÛ™J
+B‚ˆYˆ›Ý\Ù\Ž‚ˆ›\Ú
+•\Ù\ˆ›Ý›Ý[™ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJB‚ˆYˆ™\]Y\Ý›Y]ÙOH”ÔÕŽ‚ˆ\Ù\›˜[YHH™\]Y\Ý™›Ü›K™Ù]
+\Ù\›˜[YH‹ˆŠKœÝš\
+
+Bˆ[XZ[H™\]Y\Ý™›Ü›K™Ù]
+™[XZ[‹ˆŠKœÝš\
+
+Bˆ›ÛHH™\]Y\Ý™›Ü›K™Ù]
+œ›ÛH‹\Ù\–ÉÜ›ÛI×JBˆžN‚ˆX^ÜÝÜ™\ÈH[
+™\]Y\Ý™›Ü›K™Ù]
+›X^ÜÝÜ™\È‹ŒŠHÜˆ
+Bˆ^Ù\˜[YQ\œ›ÜŽ‚ˆX^ÜÝÜ™\ÈHˆ\×ØXÝ]™HH™\]Y\Ý™›Ü›K™Ù]
+š\×ØXÝ]™HŠHOH›Ûˆ‚ˆ™]×Ü\ÜÝÛÜ™H™\]Y\Ý™›Ü›K™Ù]
+›™]×Ü\ÜÝÛÜ™‹ˆŠB‚ˆYˆ›Ý\Ù\›˜[YHÜˆ›Ý[XZ[‚ˆ›\Ú
+•\Ù\›˜[YH[™[XZ[\™H™\]Z\™Yˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—ÙY]Ý\Ù\ˆ‹\Ù\—ÚY]\Ù\—ÚY
+JB‚ˆÈ™X]YØXÞH	Ù]‰È\ÈÝ\\˜YZ[ˆ
+[ˆØ\ÙHZYÜ˜][ÛˆY‰Ý[ŠBˆYˆ›ÛHOH	Ù]‰Î‚ˆ›ÛHH	ÜÝ\\˜YZ[‰Â‚ˆYˆ›ÛH›Ý[ˆÉÜÝ\\˜YZ[‰Ë	ØYZ[‰Ë	Ý\Ù\‰×N‚ˆ›\Ú
+ˆ’[˜[Y›ÛNˆÜ›Û_H‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—ÙY]Ý\Ù\ˆ‹\Ù\—ÚY]\Ù\—ÚY
+JB‚ˆÈ›Ü›X[^™HÝÜ™YYØXÞH›ÛH›ÜˆÙ[‹YY]ÛÛ\\š\ÛÛ‚ˆÝÜ™YÜ›ÛHH	ÜÝ\\˜YZ[‰ÈYˆ\Ù\–ÉÜ›ÛI×H[ˆ
+	Ù]‰Ë
+H[ÙH\Ù\–ÉÜ›ÛI×B‚ˆÈÛ‰Ý[ÝÈ[[Ý[™ËÙXXÝ]˜][™È[Ý\œÙ[‚ˆYˆ\Ù\—ÚYOHÙ\ÜÚ[Û‹™Ù]
+	Ý\Ù\—ÚY	ÊN‚ˆYˆ›ÛHOHÝÜ™YÜ›ÛN‚ˆ›\Ú
+–[ÝHØ[››ÝÚ[™ÙH[Ý\ˆÝÛˆ›ÛKˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—ÙY]Ý\Ù\ˆ‹\Ù\—ÚY]\Ù\—ÚY
+JBˆYˆ›Ý\×ØXÝ]™N‚ˆ›\Ú
+–[ÝHØ[››ÝXXÝ]˜]H[Ý\ˆÝÛˆXØÛÝ[ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—ÙY]Ý\Ù\ˆ‹\Ù\—ÚY]\Ù\—ÚY
+JB‚ˆÈÚXÚÈ[š\]Y[™\ÜÈÙˆ\Ù\›˜[YKÙ[XZ[
+^ÛY[™ÈÙ[ŠBˆÝ\œÛÜ‹™^XÝ]Jˆ”ÑSPÕY”“ÓH\Ù\œÈÒT‘H
+\Ù\›˜[YHH	\ÈÔˆ[XZ[H	\ÊHS‘YOH	\È‹ˆ
+\Ù\›˜[YK[XZ[\Ù\—ÚY
+Bˆ
+BˆYˆÝ\œÛÜ‹™™]ÚÛ™J
+N‚ˆ›\Ú
+•\Ù\›˜[YHÜˆ[XZ[[™XYH[ˆ\ÙHžH[›Ý\ˆ\Ù\‹ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—ÙY]Ý\Ù\ˆ‹\Ù\—ÚY]\Ù\—ÚY
+JB‚ˆÛÝ˜[Y\ÈHÂˆ	Ý\Ù\›˜[YIÎˆ\Ù\–ÉÝ\Ù\›˜[YI×K	Ù[XZ[	Îˆ\Ù\–ÉÙ[XZ[	×Kˆ	Ü›ÛIÎˆ\Ù\–ÉÜ›ÛI×K	ÛX^ÜÝÜ™\ÉÎˆ\Ù\‹™Ù]
+	ÛX^ÜÝÜ™\ÉË
+Kˆ	Ú\×ØXÝ]™IÎˆ›ÛÛ
+\Ù\–ÉÚ\×ØXÝ]™I×JBˆB‚ˆÈ\]HšY[ÂˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆTUH\Ù\œÂˆÑU\Ù\›˜[YHH	\Ëˆ[XZ[H	\Ëˆ›ÛHH	\ËˆX^ÜÝÜ™\ÈH	\Ëˆ\×ØXÝ]™HH	\ÂˆÒT‘HYH	\Âˆˆˆ‹ˆ
+\Ù\›˜[YK[XZ[›ÛKX^ÜÝÜ™\ÈYˆ›ÛHOH	ØYZ[‰È[ÙH\×ØXÝ]™K\Ù\—ÚY
+Bˆ
+B‚ˆÈÜ[Û˜[\ÜÝÛÜ™™\Ù]ˆYˆ™]×Ü\ÜÝÛÜ™‚ˆYˆ[Š™]×Ü\ÜÝÛÜ™
+H‚ˆ›\Ú
+”\ÜÝÛÜ™]\Ý™H]X\ÝÚ\˜XÝ\œËˆ‹™[™Ù\ˆŠBˆÛÛ›‹œ›Û˜XÚÊ
+Bˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—ÙY]Ý\Ù\ˆ‹\Ù\—ÚY]\Ù\—ÚY
+JBˆ\ÜÝÛÜ™Ú\ÚH\ÚÜ\ÜÝÛÜ™
+™]×Ü\ÜÝÛÜ™
+BˆÝ\œÛÜ‹™^XÝ]Jˆ•TUH\Ù\œÈÑU\ÜÝÛÜ™Ú\ÚH	\ÈÒT‘HYH	\È‹ˆ
+\ÜÝÛÜ™Ú\Ú\Ù\—ÚY
+Bˆ
+B‚ˆÛÛ›‹˜ÛÛ[Z]
+
+B‚ˆÈYˆY][™ÈÙ[‹™Yœ™\ÚÙ\ÜÚ[ÛˆÛÈ™]È\Ù\›˜[YKÜ›ÛHÚÝÈ[[YYX][BˆYˆ\Ù\—ÚYOHÙ\ÜÚ[Û‹™Ù]
+	Ý\Ù\—ÚY	ÊN‚ˆÙ\ÜÚ[Û–ÉÝ\Ù\›˜[YI×HH\Ù\›˜[YBˆÙ\ÜÚ[Û–ÉÜ›ÛI×HH›ÛB‚ˆ™]×Ý˜[Y\ÈHÂˆ	Ý\Ù\›˜[YIÎˆ\Ù\›˜[YK	Ù[XZ[	Îˆ[XZ[	Ü›ÛIÎˆ›ÛKˆ	ÛX^ÜÝÜ™\ÉÎˆX^ÜÝÜ™\ÈYˆ›ÛHOH	ØYZ[‰È[ÙHˆ	Ú\×ØXÝ]™IÎˆ\×ØXÝ]™Kˆ	Ü\ÜÝÛÜ™ØÚ[™ÙY	Îˆ›ÛÛ
+™]×Ü\ÜÝÛÜ™
+KˆBˆžN‚ˆÙ×Ø]Y]
+ˆ[]WÝ\OH\Ù\ˆ‹ˆ[]WÚY]\Ù\—ÚYˆXÝ[ÛH\]Y‹ˆÛÝ˜[Y\Ï\ÝŠÛÝ˜[Y\ÊKˆ™]×Ý˜[Y\Ï\ÝŠ™]×Ý˜[Y\ÊKˆ\Ù\—ÚY\Ù\ÜÚ[Û‹™Ù]
+	Ý\Ù\—ÚY	ÊBˆ
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ\ÜÂ‚ˆ›\Ú
+•\Ù\ˆ\]YÝXØÙ\ÜÙ[Kˆ‹œÝXØÙ\ÜÈŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJB‚ˆ™]\›ˆ™[™\—Ý[\]J˜YZ[‹ÙY]Ý\Ù\‹š[‹\Ù\]\Ù\ŠBˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ‘\œ›ÜˆY][™È\Ù\ŽˆÙ_HŠBˆ›\Ú
+ˆ‘\œ›ÜˆY][™È\Ù\ŽˆÙ_H‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJBˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆ\œ›Ý]J‹ØYZ[‹Ý\Ù\œËÏ[\Ù\—ÚY‹Ù[]H‹Y]ÙÏVÈ”ÔÕ—JBˆ›ÛWÜ™\]Z\™Y
+	ÜÝ\\˜YZ[‰ÊBˆYˆYZ[—Ù[]WÝ\Ù\Š\Ù\—ÚYˆ[
+N‚ˆˆˆ‘[]HH\Ù\ˆˆˆ‚ˆžN‚ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆˆÈÛ‰Ý[ÝÈ[][™È[Ý\œÙ[‚ˆYˆ\Ù\—ÚYOHÙ\ÜÚ[Û‹™Ù]
+	Ý\Ù\—ÚY	ÊN‚ˆ›\Ú
+–[ÝHØ[››Ý[]H[Ý\ˆÝÛˆXØÛÝ[ˆ‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJBˆˆÝ\œÛÜ‹™^XÝ]J‘SUH”“ÓH\Ù\œÈÒT‘HYH	\È‹
+\Ù\—ÚY
+JBˆÛÛ›‹˜ÛÛ[Z]
+
+BˆÛÛ›‹˜ÛÜÙJ
+Bˆ›\Ú
+•\Ù\ˆ[]YÝXØÙ\ÜÙ[Kˆ‹œÝXØÙ\ÜÈŠBˆÙ×Ø]Y]
+ˆ[]WÝ\OH\Ù\ˆ‹ˆ[]WÚY]\Ù\—ÚYˆXÝ[ÛH™[]Y‹ˆ\Ù\—ÚY\Ù\ÜÚ[Û‹™Ù]
+	Ý\Ù\—ÚY	ÊBˆ
+Bˆ^Ù\^Ù\[Ûˆ\ÈN‚ˆÙÙÙ\‹™\œ›ÜŠˆ‘\œ›Üˆ[][™È\Ù\ŽˆÙ_HŠBˆ›\Ú
+ˆ‘\œ›Üˆ[][™È\Ù\ŽˆÙ_H‹™[™Ù\ˆŠBˆ™]\›ˆ™Y\™XÝ
+\›Ù›ÜŠ˜YZ[—Ý\Ù\œÈŠJB‚ˆÈ8¥ 8¥ \‹\ÝÜ™HšY]Ë[Û›HšY]Ù\œÈ
+YZ[‹ÜÝ\\˜YZ[ˆX[˜YÙHÚÈØ[ˆšY]ÈHÝÜ™JH8¥ 8¥ ˆYˆÝ\Ù\—ØØ[—ÛX[˜YÙWÜÝÜ™J\Ù\ŽˆXÝÜÝ‹[žWKÝÜ™WÚYˆ[
+HOˆ›ÛÛ‚ˆˆˆ”Ý\\˜YZ[ˆØ[ˆX[˜YÙH[žHÝÜ™NÈYZ[ˆ
+ÛY[
+HØ[ˆX[˜YÙHÛ›HÝÜ™\È^HÝÛ‹ˆˆˆ‚ˆYˆ›Ý\Ù\Ž‚ˆ™]\›ˆ˜[ÙBˆYˆ\Ù\–ÉÜ›ÛI×HOH	ÜÝ\\˜YZ[‰Î‚ˆ™]\›ˆYBˆYˆ\Ù\–ÉÜ›ÛI×HOH	ØYZ[‰Î‚ˆ™]\›ˆ˜[ÙBˆÈ™\šYžHÝÛ™\œÚ\ˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÝ\œÛÜ‹™^XÝ]J”ÑSPÕ\Ù\—ÚY”“ÓHÝÜ™\ÈÒT‘HYH	\È‹
+ÝÜ™WÚY
+JBˆ›ÝÈHÝ\œÛÜ‹™™]ÚÛ™J
+Bˆ™]\›ˆ›ÛÛ
+›ÝÈ[™›ÝÖÌHOH\Ù\–ÉÚY	×JBˆš[˜[N‚ˆÛÛ›‹˜ÛÜÙJ
+B‚ˆ\œ›Ý]J‹ØYZ[‹ÜÝÜ™\ËÏ[œÝÜ™WÚY‹ÝšY]Ù\œÈ‹Y]ÙÏVÈ‘ÑU—JBˆ›ÛWÜ™\]Z\™Y
+	ØYZ[‰Ë	ÜÝ\\˜YZ[‰ÊBˆYˆÝÜ™WÝšY]Ù\œ×Û\Ý
+ÝÜ™WÚYˆ[
+N‚ˆˆˆ”™]\›ˆ”ÓÓŽˆ\ÝÙˆšY]Ë[Û›H\Ù\œÈ\ÜÚYÛ™YÈHÝÜ™H
+È]˜Z[X›H\Ù\œÈÈ\ÜÚYÛ‹ˆˆˆ‚ˆ\Ù\ˆHÙ]Ý\Ù\—ØžWÚY
+Ù\ÜÚ[Û–ÉÝ\Ù\—ÚY	×JBˆYˆ›ÝÝ\Ù\—ØØ[—ÛX[˜YÙWÜÝÜ™J\Ù\‹ÝÜ™WÚY
+N‚ˆ™]\›ˆœÛÛšYžJÈœÝXØÙ\ÜÈŽˆ˜[ÙK™\œ›ÜˆŽˆ‘›Ü˜šY[ˆŸJKÂˆÛÛ›ˆHÙ]Ù—ØÛÛ›™XÝ[ÛŠ
+BˆžN‚ˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠXÝ[Û˜\žOUYJBˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ‚ˆÑSPÕKšYK\Ù\›˜[YKK™[XZ[\Ë˜Ü™X]YØ]ˆ”“ÓH\Ù\—ÜÝÜ™\È\Âˆ“ÒSˆ\Ù\œÈHÓˆKšYH\Ë\Ù\—ÚYˆÒT‘H\ËœÝÜ™WÚYH	\ÂˆÔ‘Tˆ–HK\Ù\›˜[YBˆˆˆ‹ˆ
+ÝÜ™WÚY
+Bˆ
+Bˆ\ÜÚYÛ™YHÝ\œÛÜ‹™™]Ú[
+
+B‚ˆÈHXÙ[œÙHX^H]™H][ÜÝÛ™HÝÜ™HšY]Ù\‹ÛX[˜YÙ\ˆ\ˆÝÜ™KˆÈ[™›È[Ü™H\ÜÚYÛ™YšY]Ù\œÈ[ˆHÝÛš[™ÈYZ[‰ÜÈÝÜ™H[Z]‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ”ÑSPÕË\Ù\—ÚYTÈÝÛ™\—Ý\Ù\—ÚYÓÐSTÐÑJK›X^ÜÝÜ™\Ë
+HTÈX^ÝšY]Ù\œËˆK›XÙ[œÙWÚÙ^Bˆ”“ÓHÝÜ™\ÈÂˆQ•“ÒSˆ\Ù\œÈHÓˆKšYHË\Ù\—ÚYˆÒT‘HËšYH	\Èˆˆ‹ˆ
+ÝÜ™WÚY
+Kˆ
+BˆÝÛ™\œÚ\HÝ\œÛÜ‹™™]ÚÛ™J
+HÜˆßBˆÝÛ™\—Ý\Ù\—ÚYHÝÛ™\œÚ\™Ù]
+	ÛÝÛ™\—Ý\Ù\—ÚY	ÊBˆX^ÝšY]Ù\œÈH[
+ÝÛ™\œÚ\™Ù]
+	ÛX^ÝšY]Ù\œÉÊHÜˆ
+BˆYˆÝÛ™\œÚ\™Ù]
+	ÛXÙ[œÙWÚÙ^IÊN‚ˆXÙ[œÙWÜÝ]\ÈH˜[Y]WÝ[˜[ÛXÙ[œÙJÝÛ™\œÚ\ÉÛXÙ[œÙWÚÙ^I×JBˆYˆXÙ[œÙWÜÝ]\Ë™Ù]
+	Ý˜[Y	ÊN‚ˆX^ÝšY]Ù\œÈH[
+XÙ[œÙWÜÝ]\Ë™Ù]
+	ÛX^ÜÝÜ™\ÉÊHÜˆ
+Bˆ\ÜÚYÛ™YÝÝ[HˆYˆÝÛ™\—Ý\Ù\—ÚY‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ”ÑSPÕÓÕS•
+
+ŠHTÈÝ[ˆ”“ÓH\Ù\—ÜÝÜ™\È\Âˆ“ÒSˆÝÜ™\ÈÈÓˆËšYH\ËœÝÜ™WÚYˆÒT‘HË\Ù\—ÚYH	\Èˆˆ‹ˆ
+ÝÛ™\—Ý\Ù\—ÚY
+Kˆ
+Bˆ\ÜÚYÛ™YÝÝ[H[
+
+Ý\œÛÜ‹™™]ÚÛ™J
+HÜˆßJK™Ù]
+	ÝÝ[	ÊHÜˆ
+B‚ˆÝÜ™WÚ\×ÝšY]Ù\ˆH›ÛÛ
+\ÜÚYÛ™Y
+Bˆ[Z]Ü™XXÚYHX^ÝšY]Ù\œÈˆ[™\ÜÚYÛ™YÝÝ[HX^ÝšY]Ù\œÂ‚ˆÈ]˜Z[X›HšY]Ë[Û›H\Ù\œÈ›ÝY]\ÜÚYÛ™YÈ\ÈÝÜ™BˆYˆ›ÝÝÜ™WÚ\×ÝšY]Ù\ˆ[™›Ý[Z]Ü™XXÚY‚ˆÝ\œÛÜ‹™^XÝ]Jˆˆˆ”ÑSPÕKšYK\Ù\›˜[YKK™[XZ[ˆ”“ÓH\Ù\œÈBˆÒT‘HKœ›ÛOIÝ\Ù\‰ÈS‘Kš\×ØXÝ]™OU•QBˆS‘“ÕVTÕÈ
+ˆÑSPÕH”“ÓH\Ù\—ÜÝÜ™\È\ÈÒT‘H\Ë\Ù\—ÚYHKšYˆ
+BˆÔ‘Tˆ–HK\Ù\›˜[YHˆˆ‚ˆ
+Bˆ]˜Z[X›HHÝ\œÛÜ‹™™]Ú[
+
+Bˆ[ÙN‚ˆ]˜Z[X›HH×Bˆ™]\›ˆœÛÛšYžJÂˆœÝXØÙ\ÜÈŽˆYKˆ˜\ÜÚYÛ™YŽˆ\ÜÚYÛ™Yˆ˜]˜Z[X›HŽˆ]˜Z[X›Kˆ˜\ÜÚYÛ™YÝÝ[Žˆ\ÜÚYÛ™Y8ç^-¢G§²ÚîÆ­yÒ‚'fÆ–B"“ ¢fÆ6‚‚$–çfÆ–BÆ–6Vç6R¶W’âÆV6R6†V6²v—F‚–÷W"FÖ–æ—7G&F÷"â"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&6Æ–VçEöÆ–6Vç6Uö6öæf–r"’¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"fÆ–FF–ærÆ–6Vç6Rv—F‚÷'FÃ¢¶WÒ"¢fÆ6‚‚%Væ&ÆRFòfÆ–FFRÆ–6Vç6RâÆV6RG'’v–âÆFW"â"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&6Æ–VçEöÆ–6Vç6Uö6öæf–r"’¢ ¢2–bfÆ–BÂ6fRFòW6W"w266÷Vç@¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢7W'6÷"Ò6öæâæ7W'6÷"‚¢ ¢7W'6÷"æW†V7WFR€¢%UDDRW6W'24UBÆ–6Vç6Uö¶W’ÒW2t„U$R–BÒW2"À¢†Æ–6Vç6Uö¶W’Â6W76–öå²wW6W%ö–BuÒ¢¢ ¢6öæâæ6öÖÖ—B‚¢6öæâæ6Æ÷6R‚¢ ¢fÆ6‚‚$Æ–6Vç6R¶W’6öæf–wW&VB7V66W76gVÆÇ’â–÷R6âæ÷rFB7F÷&W2â"Â'7V66W72"¢ÆöuöVF—B€¢VçF—G•÷G—SÒ'W6W""À¢VçF—G•ö–C×6W76–öå²wW6W%ö–BuÒÀ¢7F–öãÒ&Æ–6Vç6Uö6öæf–wW&VB"À¢æWu÷fÇVW3Öb$Æ–6Vç6R¶W’6öæf–wW&VBf÷"W6W"·6W76–öå²wW6W%ö–Bu×Ò ¢¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"6f–ær6Æ–VçBÆ–6Vç6R6öæf–s¢¶WÒ"¢fÆ6‚‚$f–ÆVBFò6öæf–wW&RÆ–6Vç6R¶W’â"Â&FævW""¢ ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&6Æ–VçEöÆ–6Vç6Uö6öæf–r"’ ¢2)H)H6Æ–VçB7W÷'B÷'FÂ)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H ¢FVb÷W6W%öÆ–6Vç6Uö¶W’‡W6W#¢F–7E·7G"Âç•Ò’Óâ÷F–öæÅ·7G%Ó ¢""%&WGW&âöæÇ’F†RÆ–6Vç6R76–væVBFòF†—26Æ–VçB66÷VçBà ¢æWfW"fÆÂ&6²FòF†R7—7FVÒövÆö&ÂÆ–6Vç6S¢Fö–ær6òv÷VÆBÖ¶P¢7WW&FÖ–ç2æBf–WrÖöæÇ’W6W'26†&RF†R6ÖR7W÷'BF‡&VBà¢"" ¢–bW6W"æBW6W"ævWB‚w&öÆRr’ÓÒvFÖ–âs ¢&WGW&âW6W"ævWB‚vÆ–6Vç6Uö¶W’r’÷"æöæP¢&WGW&âæöæP ¢FVb÷7W÷'Eö–FVçF—G’‡W6W#¢F–7E·7G"Âç•Ò’Óâ7G# ¢""%7F&ÆRÂ&—fFR6öçfW'6F–öâ–FVçF—G’f÷"F†R6–væVBÖ–â66÷VçBâ"" ¢&WGW&â÷W6W%öÆ–6Vç6Uö¶W’‡W6W"’÷"b'W6W#§¶–çB‡W6W%²v–BuÒ—Ò  ¢ç&÷WFR‚"ö6Æ–VçB÷7W÷'B"¢Æöv–å÷&WV—&V@¢FVb6Æ–VçE÷7W÷'B‚“ ¢""$6Æ–VçB7W÷'BvR(	B&VæFW'2–ç7FçFÇ’ÂFFÆöG2f–¤‚"" ¢W6W"ÒvWE÷W6W%ö'•ö–B‡6W76–öå²wW6W%ö–BuÒ¢–bW6W%²w&öÆRuÒæ÷B–â‚wW6W"rÂvFÖ–ârÂw7WW&FÖ–âr“ ¢fÆ6‚‚$66W72FVæ–VBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&FÖ–åöF6†&ö&B"’ ¢Æ–6Vç6Uö¶W’Ò÷W6W%öÆ–6Vç6Uö¶W’‡W6W" ¢&WGW&â&VæFW%÷FV×ÆFR‚&6Æ–VçB÷7W÷'Bæ‡FÖÂ"À¢W6W#×W6W"ÂÆ–6Vç6Uö¶W“ÖÆ–6Vç6Uö¶W’÷"rr ¢ç&÷WFR‚"ö’÷7W÷'B÷7FGW2"¢Æöv–å÷&WV—&V@¢FVb•÷7W÷'E÷7FGW2‚“ ¢""$¤‚VæGö–çB(	BfWF6‚Æ–6Vç6R7FGW2²F–6¶WG2g&öÒ÷'FÂ"" ¢W6W"ÒvWE÷W6W%ö'•ö–B‡6W76–öå²wW6W%ö–BuÒ¢6öæf–rÒvWEöÆ–6Vç6Uö6öæf–r‚¢÷'FÅ÷W&ÂÒæ÷&ÖÆ—¦U÷÷'FÅ÷W&Â†6öæf–rævWB‚&Æ–6Vç6–æu÷÷'FÅ÷W&Â"’–b6öæf–rVÇ6RæöæR¢Æ–6Vç6Uö¶W’Ò÷W6W%öÆ–6Vç6Uö¶W’‡W6W" ¢&W7VÇBÒ²&Æ–6Vç6U÷7FGW2#¢æöæRÂ&Æ–6Vç6UöW'&÷"#¢æöæRÂ'F–6¶WG2#¢µÒÂ'&VæWvÇ2#¢µ×Ð ¢–bæ÷BÆ–6Vç6Uö¶W“ ¢&WGW&â§6öæ–g’‡&W7VÇB ¢–×÷'B&WVW7G22‡GG÷&WVW7G0¢2fWF6‚Æ–6Vç6R7FGW2‡6†÷'BF–ÖV÷WB¢G'“ ¢&W7Ò‡GG÷&WVW7G2ç÷7B†b'·÷'FÅ÷W&ÇÒö’÷fÆ–FFR÷¶Æ–6Vç6Uö¶W—Ò"Â†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓR¢–b&W7ç7FGW5ö6öFRÓÒ# ¢FFÒ&W7æ§6öâ‚¢&W7VÇE²&Æ–6Vç6U÷7FGW2%ÒÒFF¢–bæ÷BFFævWB‚wfÆ–Br“ ¢&W7VÇE²&Æ–6Vç6UöW'&÷"%ÒÒFFævWB‚vÖW76vRrÂtÆ–6Vç6RfÆ–FF–öâf–ÆVBr¢VÇ6S ¢&W7VÇE²&Æ–6Vç6UöW'&÷"%ÒÒb$’W'&÷#¢·&W7ç7FGW5ö6öFWÒ ¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"fWF6†–ærÆ–6Vç6R7FGW3¢¶WÒ"¢&W7VÇE²&Æ–6Vç6UöW'&÷"%ÒÒ%Væ&ÆRFò&V6‚Æ–6Vç6–ær÷'FÂ  ¢2fWF6‚F–6¶WG2‡6†÷'BF–ÖV÷WBÂ&W7BÖVff÷'B¢G'“ ¢&W7Ò‡GG÷&WVW7G2ævWB†b'·÷'FÅ÷W&ÇÒö’÷F–6¶WG2÷¶Æ–6Vç6Uö¶W—Ò"Â†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓR¢–b&W7ç7FGW5ö6öFRÓÒ# ¢&W7VÇE²'F–6¶WG2%ÒÒ&W7æ§6öâ‚’ævWB‚wF–6¶WG2rÂµÒ¢W†6WBW†6WF–öã ¢70 ¢G'“ ¢&W7Ò‡GG÷&WVW7G2ævWB†b'·÷'FÅ÷W&ÇÒö’÷&VæWvÇ2÷¶Æ–6Vç6Uö¶W—Ò"Â†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓR¢–b&W7ç7FGW5ö6öFRÓÒ# ¢&W7VÇE²'&VæWvÇ2%ÒÒ&W7æ§6öâ‚’ævWB‚'&VæWvÇ2"ÂµÒ¢W†6WBW†6WF–öã ¢70 ¢&WGW&â§6öæ–g’‡&W7VÇB ¢ç&÷WFR‚"ö6Æ–VçB÷7W÷'B÷F–6¶WB"ÂÖWF†öG3Õ²%õ5B%Ò¢Æöv–å÷&WV—&V@¢FVb6Æ–VçE÷7V&Ö—E÷F–6¶WB‚“ ¢""%7V&Ö—B7W÷'BF–6¶WBFòF†RÆ–6Vç6–ær÷'FÂ"" ¢W6W"ÒvWE÷W6W%ö'•ö–B‡6W76–öå²wW6W%ö–BuÒ¢6öæf–rÒvWEöÆ–6Vç6Uö6öæf–r‚¢÷'FÅ÷W&ÂÒæ÷&ÖÆ—¦U÷÷'FÅ÷W&Â†6öæf–rævWB‚&Æ–6Vç6–æu÷÷'FÅ÷W&Â"’–b6öæf–rVÇ6RæöæR ¢Æ–6Vç6Uö¶W’Ò÷W6W%öÆ–6Vç6Uö¶W’‡W6W"’÷"" ¢7V&¦V7BÒ&WVW7Bæf÷&ÒævWB‚'7V&¦V7B"Â""’ç7G&—‚¢ÖW76vRÒ&WVW7Bæf÷&ÒævWB‚&ÖW76vR"Â""’ç7G&—‚¢F–6¶WE÷G—RÒ&WVW7Bæf÷&ÒævWB‚'F–6¶WE÷G—R"Â&vVæW&Â"¢6öçF7EöVÖ–ÂÒW6W"ævWB‚vVÖ–ÂrÂrr’÷"W6W"ævWB‚wW6W&æÖRrÂrr ¢–bæ÷B7V&¦V7B÷"æ÷BÖW76vS ¢fÆ6‚‚%7V&¦V7BæBÖW76vR&R&WV—&VBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&6Æ–VçE÷7W÷'B"’ ¢G'“ ¢–×÷'B&WVW7G22‡GG÷&WVW7G0¢&W7Ò‡GG÷&WVW7G2ç÷7B†b'·÷'FÅ÷W&ÇÒö’÷F–6¶WG2ö7&VFR"Â§6öã×°¢&Æ–6Vç6Uö¶W’#¢Æ–6Vç6Uö¶W’À¢&6öçF7EöVÖ–Â#¢6öçF7EöVÖ–ÂÀ¢'7V&¦V7B#¢7V&¦V7BÀ¢&ÖW76vR#¢ÖW76vRÀ¢'F–6¶WE÷G—R#¢F–6¶WE÷G—P¢ÒÂ†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓ¢–b&W7ç7FGW5ö6öFR–âƒ#Â#“ ¢fÆ6‚‚%F–6¶WB7V&Ö—GFVB7V66W76gVÆÇ’âvRvÆÂvWB&6²Fò–÷R6ööââ"Â'7V66W72"¢VÇ6S ¢fÆ6‚‚$f–ÆVBFò7V&Ö—BF–6¶WBâÆV6RG'’v–ââ"Â&FævW""¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"7V&Ö—GF–ærF–6¶WBFò÷'FÃ¢¶WÒ"¢fÆ6‚‚%Væ&ÆRFò&V6‚7W÷'BâÆV6RG'’v–âÆFW"â"Â&FævW"" ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&6Æ–VçE÷7W÷'B"’ ¢ç&÷WFR‚"ö6Æ–VçB÷7W÷'B÷&VæWr"ÂÖWF†öG3Õ²%õ5B%Ò¢Æöv–å÷&WV—&V@¢FVb6Æ–VçE÷&WVW7E÷&VæWvÂ‚“ ¢""$7&VFRâFÖ–âÖ6öæf—&ÖVB&VæWvÂ&WVW7Bf÷"7WW&FÖ–â&Wf–Wrâ"" ¢W6W"ÒvWE÷W6W%ö'•ö–B‡6W76–öå²wW6W%ö–BuÒ¢6öæf–rÒvWEöÆ–6Vç6Uö6öæf–r‚¢÷'FÅ÷W&ÂÒæ÷&ÖÆ—¦U÷÷'FÅ÷W&Â†6öæf–rævWB‚&Æ–6Vç6–æu÷÷'FÅ÷W&Â"’–b6öæf–rVÇ6RæöæR ¢Æ–6Vç6Uö¶W’Ò÷W6W%öÆ–6Vç6Uö¶W’‡W6W"’÷"" ¢6öçF7EöVÖ–ÂÒW6W"ævWB‚vVÖ–ÂrÂrr’÷"W6W"ævWB‚wW6W&æÖRrÂrr ¢–bæ÷BÆ–6Vç6Uö¶W“ ¢fÆ6‚‚$æòÆ–6Vç6R¶W’f÷VæBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&6Æ–VçE÷7W÷'B"’ ¢–b&WVW7Bæf÷&ÒævWB‚&FÖ–åö6öæf—&ÖVB"’Ò'–W2# ¢fÆ6‚‚%ÆV6R6öæf—&ÒF†B–÷RvçBFò7V&Ö—B&VæWvÂ&WVW7Bâ"Â'v&æ–ær"¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&6Æ–VçE÷7W÷'B"’ ¢&WVW7FVE÷ÆâÒ&WVW7Bæf÷&ÒævWB‚'&WVW7FVE÷Æâ"Â$7W'&VçBÆâ"’ç7G&—‚¢–ÖVçE÷&VfW&Væ6RÒ&WVW7Bæf÷&ÒævWB‚'–ÖVçE÷&VfW&Væ6R"Â""’ç7G&—‚¢G'“ ¢&WVW7FVEöF—2Ò–çB‡&WVW7Bæf÷&ÒævWB‚'&WVW7FVEöF—2"Â#3cR"’¢W†6WBfÇVTW'&÷# ¢&WVW7FVEöF—2Ò3cP ¢G'“ ¢–×÷'B&WVW7G22‡GG÷&WVW7G0¢&W7Ò‡GG÷&WVW7G2ç÷7B†b'·÷'FÅ÷W&ÇÒö’÷&VæWvÇ2"Â§6öã×°¢&Æ–6Vç6Uö¶W’#¢Æ–6Vç6Uö¶W’À¢&6öçF7EöVÖ–Â#¢6öçF7EöVÖ–ÂÀ¢'&WVW7FVE÷Æâ#¢&WVW7FVE÷ÆâÀ¢'&WVW7FVEöF—2#¢&WVW7FVEöF—2À¢'–ÖVçE÷&VfW&Væ6R#¢–ÖVçE÷&VfW&Væ6RÀ¢&FÖ–åö6öæf—&ÖVB#¢G'VRÀ¢ÒÂ†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓ¢–b&W7ç7FGW5ö6öFR–âƒ#Â#“ ¢fÆ6‚‚%&VæWvÂ&WVW7B6öæf—&ÖVBæB6VçBf÷"7WW&FÖ–â&÷fÂâ–÷W"Æ–6Vç6R†2æ÷B&VVâW‡FVæFVB–WBâ"Â'7V66W72"¢VÆ–b&W7ç7FGW5ö6öFRÓÒC“ ¢fÆ6‚‚%–÷RÇ&VG’†fR&VæWvÂ&WVW7Bv—F–ærf÷"7WW&FÖ–â&÷fÂâ"Â'v&æ–ær"¢VÇ6S ¢fÆ6‚‚$f–ÆVBFò7V&Ö—B&VæWvÂ&WVW7Bâ"Â&FævW""¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"7V&Ö—GF–ær&VæWvÂ&WVW7C¢¶WÒ"¢fÆ6‚‚%Væ&ÆRFò&V6‚7W÷'BâÆV6RG'’v–âÆFW"â"Â&FævW"" ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&6Æ–VçE÷7W÷'B"’ ¢ç&÷WFR‚"ö6Æ–VçB÷7W÷'B÷&VæWróÆ–çC§&WVW7Eö–Câö6æ6VÂ"ÂÖWF†öG3Õ²%õ5B%Ò¢Æöv–å÷&WV—&V@¢FVb6Æ–VçEö6æ6VÅ÷&VæWvÂ‡&WVW7Eö–B“ ¢W6W"ÒvWE÷W6W%ö'•ö–B‡6W76–öå²wW6W%ö–BuÒ¢Æ–6Vç6Uö¶W’Ò÷W6W%öÆ–6Vç6Uö¶W’‡W6W"’÷"" ¢G'“ ¢–×÷'B&WVW7G22‡GG÷&WVW7G0¢&W7Ò‡GG÷&WVW7G2ç÷7B†b'µövWE÷÷'FÅ÷W&Â‚—Òö’÷&VæWvÇ2÷·&WVW7Eö–GÒö6æ6VÂ"À¢§6öã×²&Æ–6Vç6Uö¶W’#¢Æ–6Vç6Uö¶W—ÒÂ†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓ¢fÆ6‚‚%&VæWvÂ&WVW7B6æ6VÆÆVBâ"–b&W7ç7FGW5ö6öFRÓÒ#VÇ6R%F†—2&WVW7B6âæòÆöævW"&R6æ6VÆÆVBâ"À¢'7V66W72"–b&W7ç7FGW5ö6öFRÓÒ#VÇ6R'v&æ–ær"¢W†6WBW†6WF–öâ2W†3 ¢ÆövvW"æW'&÷"‚%Væ&ÆRFò6æ6VÂ&VæWvÃ¢W2"ÂW†2¢fÆ6‚‚%Væ&ÆRFò6æ6VÂF†R&VæWvÂ&WVW7Bâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&6Æ–VçE÷7W÷'B"’ ¢2)H)H6Æ–VçBÖW76v–ær7—7FVÒ‡&÷†–W2FòÆ–6Vç6–ær÷'FÂ’)H)H)H)H)H)H)H)H ¢FVbövWE÷÷'FÅ÷W&Â‚“ ¢6öæf–rÒvWEöÆ–6Vç6Uö6öæf–r‚¢&WGW&âæ÷&ÖÆ—¦U÷÷'FÅ÷W&Â†6öæf–rævWB‚&Æ–6Vç6–æu÷÷'FÅ÷W&Â"’–b6öæf–rVÇ6RæöæR ¢FVböVç7W&U÷÷'FÅö6öçfW'6F–öâ†6Æ–VçEö–FVçF–f–W"ÂÆ–6Vç6Uö¶W’Â6öçF7EöVÖ–ÂÂ6ö×ç•öæÖSÒ""“ ¢""$Vç7W&R6öçfW'6F–öâW†—7G2öâ÷'FÂæB&WGW&â—G2”B"" ¢2fÆÆ&6²6öçF7EöVÖ–Â–bV×G’‡÷'FÂ&WV—&W2—B¢VffV7F—fUöVÖ–ÂÒ6öçF7EöVÖ–Â÷"6ö×ç•öæÖR÷"6Æ–VçEö–FVçF–f–W"÷"&6Æ–VçDVæ¶æ÷vâ ¢÷'FÅ÷W&ÂÒövWE÷÷'FÅ÷W&Â‚¢–×÷'B&WVW7G22‡GG÷&WVW7G0¢G'“ ¢ÆövvW"æ–æfò†b$Vç7W&–ær÷'FÂ6öçfW'6F–öâB·÷'FÅ÷W&ÇÒf÷"¶6Æ–VçEö–FVçF–f–W'Ò"¢&W7Ò‡GG÷&WVW7G2ç÷7B†b'·÷'FÅ÷W&ÇÒö’ö6öçfW'6F–öç2ö7&VFR"Â§6öã×°¢&6Æ–VçEö–FVçF–f–W"#¢6Æ–VçEö–FVçF–f–W"À¢&Æ–6Vç6Uö¶W’#¢Æ–6Vç6Uö¶W’÷"""À¢&6öçF7EöVÖ–Â#¢VffV7F—fUöVÖ–ÂÀ¢&6ö×ç•öæÖR#¢6ö×ç•öæÖR÷"VffV7F—fUöVÖ–À¢ÒÂ†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓ¢–b&W7ç7FGW5ö6öFR–âƒ#Â#“ ¢6öçeö–BÒ&W7æ§6öâ‚’ævWB‚v6öçfW'6F–öârÂ·Ò’ævWB‚v–Br¢ÆövvW"æ–æfò†b%÷'FÂ6öçfW'6F–öâ”C¢¶6öçeö–GÒ"¢&WGW&â6öçeö–@¢ÆövvW"æW'&÷"†b%÷'FÂ7&VFRf–ÆVC¢·&W7ç7FGW5ö6öFWÒÒ·&W7çFW‡GÒ"¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$f–ÆVBFòVç7W&R÷'FÂ6öçfW'6F–öã¢¶WÒ"¢&WGW&âæöæP ¢ç&÷WFR‚"ö’ö6Æ–VçBöÖW76vW2"ÂÖWF†öG3Õ²$tUB%Ò¢Æöv–å÷&WV—&V@¢FVb•övWEö6Æ–VçEöÖW76vW2‚“ ¢""$vWBÖW76vW2f÷"F†R7W'&VçBW6W"g&öÒÆ–6Vç6–ær÷'FÂ"" ¢W6W"ÒvWE÷W6W%ö'•ö–B‡6W76–öå²wW6W%ö–BuÒ¢Æ–6Vç6Uö¶W’Ò÷W6W%öÆ–6Vç6Uö¶W’‡W6W"¢6Æ–VçEö–FVçF–f–W"Ò÷7W÷'Eö–FVçF—G’‡W6W"¢6öçF7EöVÖ–ÂÒW6W"ævWB‚vVÖ–ÂrÂrr’÷"W6W"ævWB‚wW6W&æÖRrÂrr ¢–bæ÷BÆ–6Vç6Uö¶W’æBæ÷B6öçF7EöVÖ–Ã ¢&WGW&â§6öæ–g’‡²&W'&÷"#¢$æòÆ–6Vç6R¶W’÷"VÖ–Âf÷VæB'Ò’ÂC  ¢2Vç7W&R6öçfW'6F–öâW†—7G2öâ÷'FÀ¢6öçeö–BÒöVç7W&U÷÷'FÅö6öçfW'6F–öâ†6Æ–VçEö–FVçF–f–W"ÂÆ–6Vç6Uö¶W’Â6öçF7EöVÖ–ÂÂW6W"ævWB‚wW6W&æÖRrÂrr’¢–bæ÷B6öçeö–C ¢&WGW&â§6öæ–g’‡²&ÖW76vW2#¢µÒÂ&6öçfW'6F–öåö–B#¢æöæRÂ&W'&÷"#¢%÷'FÂVæf–Æ&ÆR'Ò ¢2fWF6‚ÖW76vW2g&öÒ÷'FÀ¢÷'FÅ÷W&ÂÒövWE÷÷'FÅ÷W&Â‚¢G'“ ¢–×÷'B&WVW7G22‡GG÷&WVW7G0¢&W7Ò‡GG÷&WVW7G2ævWB†b'·÷'FÅ÷W&ÇÒö’ö6öçfW'6F–öç2÷¶6öçeö–GÒöÖW76vW3÷f–WvW#Ö6Æ–VçB"Â†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓ¢–b&W7ç7FGW5ö6öFRÓÒ# ¢FFÒ&W7æ§6öâ‚¢&WGW&â§6öæ–g’‡²&ÖW76vW2#¢FFævWB‚vÖW76vW2rÂµÒ’Â&6öçfW'6F–öåö–B#¢6öçeö–GÒ¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$f–ÆVBFòfWF6‚ÖW76vW2g&öÒ÷'FÃ¢¶WÒ"¢&WGW&â§6öæ–g’‡²&ÖW76vW2#¢µÒÂ&6öçfW'6F–öåö–B#¢6öçeö–GÒ ¢ç&÷WFR‚"ö’ö6Æ–VçBöÖW76vW2÷6VæB"ÂÖWF†öG3Õ²%õ5B%Ò¢Æöv–å÷&WV—&V@¢FVb•÷6VæEö6Æ–VçEöÖW76vR‚“ ¢""%6VæB6Æ–VçBÖW76vRF—&V7FÇ’FòÆ–6Vç6–ær÷'FÂ"" ¢W6W"ÒvWE÷W6W%ö'•ö–B‡6W76–öå²wW6W%ö–BuÒ¢Æ–6Vç6Uö¶W’Ò÷W6W%öÆ–6Vç6Uö¶W’‡W6W"¢6Æ–VçEö–FVçF–f–W"Ò÷7W÷'Eö–FVçF—G’‡W6W"¢6öçF7EöVÖ–ÂÒW6W"ævWB‚vVÖ–ÂrÂrr’÷"W6W"ævWB‚wW6W&æÖRrÂrr ¢FFÒ&WVW7BævWEö§6öâ‚’÷"·Ð¢ÖW76vRÒFFævWB‚&ÖW76vR"Â""’ç7G&—‚¢–bæ÷BÖW76vS ¢&WGW&â§6öæ–g’‡²&W'&÷"#¢$ÖW76vR—2&WV—&VB'Ò’ÂC  ¢2Vç7W&R6öçfW'6F–öâW†—7G2öâ÷'FÀ¢6öçeö–BÒöVç7W&U÷÷'FÅö6öçfW'6F–öâ†6Æ–VçEö–FVçF–f–W"ÂÆ–6Vç6Uö¶W’Â6öçF7EöVÖ–ÂÂW6W"ævWB‚wW6W&æÖRrÂrr’¢–bæ÷B6öçeö–C ¢&WGW&â§6öæ–g’‡²&W'&÷"#¢$f–ÆVBFò&V6‚Æ–6Vç6–ær÷'FÂ'Ò’ÂS  ¢26VæBÖW76vRFò÷'FÀ¢÷'FÅ÷W&ÂÒövWE÷÷'FÅ÷W&Â‚¢G'“ ¢–×÷'B&WVW7G22‡GG÷&WVW7G0¢&W7Ò‡GG÷&WVW7G2ç÷7B†b'·÷'FÅ÷W&ÇÒö’ö6öçfW'6F–öç2÷¶6öçeö–GÒ÷6VæB"Â§6öã×°¢&ÖW76vR#¢ÖW76vRÀ¢'6VæFW%÷G—R#¢&6Æ–VçB"À¢'6VæFW%öæÖR#¢6öçF7EöVÖ–Â÷"W6W"ævWB‚wW6W&æÖRrÂt6Æ–VçBr¢ÒÂ†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓ¢–b&W7ç7FGW5ö6öFR–âƒ#Â#“ ¢&WGW&â§6öæ–g’‡²'7V66W72#¢G'VWÒ¢ÆövvW"æW'&÷"†b$f–ÆVBFò6VæBÖW76vRFò÷'FÃ¢·&W7ç7FGW5ö6öFWÒÒ·&W7çFW‡GÒ"¢&WGW&â§6öæ–g’‡²&W'&÷"#¢$f–ÆVBFò6VæBÖW76vR'Ò’ÂS ¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"6VæF–ærÖW76vRFò÷'FÃ¢¶WÒ"¢&WGW&â§6öæ–g’‡²&W'&÷"#¢$f–ÆVBFò6VæBÖW76vR'Ò’ÂS  ¢2)H)HFÖ–âÖW76v–ær–çFW&f6R)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H ¢ç&÷WFR‚"öFÖ–âöÖW76vW2"¢Æöv–å÷&WV—&V@¢&öÆU÷&WV—&VB‚w7WW&FÖ–âr¢FVbFÖ–åöÖW76vW2‚“ ¢""$FÖ–âÖW76vW2vRÒf–WrÆÂ6Æ–VçB6öçfW'6F–öç2g&öÒÆ–6Vç6–ær÷'FÂ"" ¢2fWF6‚6öçfW'6F–öç2g&öÒÆ–6Vç6–ær÷'FÀ¢6öæf–rÒvWEöÆ–6Vç6Uö6öæf–r‚¢÷'FÅ÷W&ÂÒæ÷&ÖÆ—¦U÷÷'FÅ÷W&Â†6öæf–rævWB‚&Æ–6Vç6–æu÷÷'FÅ÷W&Â"’–b6öæf–rVÇ6RæöæR¢6öçfW'6F–öç2ÒµÐ¢G'“ ¢–×÷'B&WVW7G22‡GG÷&WVW7G0¢&W7Ò‡GG÷&WVW7G2ævWB†b'·÷'FÅ÷W&ÇÒö’ö6öçfW'6F–öç2"Â†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓR¢–b&W7ç7FGW5ö6öFRÓÒ# ¢6öçfW'6F–öç2Ò&W7æ§6öâ‚’ævWB‚v6öçfW'6F–öç2rÂµÒ¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$f–ÆVBFòfWF6‚6öçfW'6F–öç2g&öÒ÷'FÃ¢¶WÒ"¢&WGW&â&VæFW%÷FV×ÆFR‚&FÖ–âöÖW76vW2æ‡FÖÂ"Â6öçfW'6F–öç3Ö6öçfW'6F–öç2 ¢ç&÷WFR‚"ö’öFÖ–âö6öçfW'6F–öç2"¢Æöv–å÷&WV—&V@¢&öÆU÷&WV—&VB‚w7WW&FÖ–âr¢FVb•öFÖ–åövWEö6öçfW'6F–öç2‚“ ¢""$’VæGö–çBFòvWBÆÂ6öçfW'6F–öç2g&öÒÆ–6Vç6–ær÷'FÂ"" ¢6öæf–rÒvWEöÆ–6Vç6Uö6öæf–r‚¢÷'FÅ÷W&ÂÒæ÷&ÖÆ—¦U÷÷'FÅ÷W&Â†6öæf–rævWB‚&Æ–6Vç6–æu÷÷'FÅ÷W&Â"’–b6öæf–rVÇ6RæöæR¢G'“ ¢–×÷'B&WVW7G22‡GG÷&WVW7G0¢ÆövvW"æ–æfò†b$fWF6†–ær6öçfW'6F–öç2g&öÒ÷'FÂB·÷'FÅ÷W&ÇÒ"¢&W7Ò‡GG÷&WVW7G2ævWB†b'·÷'FÅ÷W&ÇÒö’ö6öçfW'6F–öç2"Â†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓR¢–b&W7ç7FGW5ö6öFRÓÒ# ¢ÆövvW"æ–æfò†b%7V66W76gVÆÇ’fWF6†VB¶ÆVâ‡&W7æ§6öâ‚’ævWB‚v6öçfW'6F–öç2rÂµÒ’—Ò6öçfW'6F–öç2g&öÒ÷'FÂ"¢&WGW&â§6öæ–g’‡&W7æ§6öâ‚’¢ÆövvW"æW'&÷"†b$f–ÆVBFòfWF6‚6öçfW'6F–öç3¢·&W7ç7FGW5ö6öFWÒ"¢&WGW&â§6öæ–g’‡²&6öçfW'6F–öç2#¢µ×Ò¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$f–ÆVBFòfWF6‚6öçfW'6F–öç2g&öÒ÷'FÃ¢¶WÒ"¢&WGW&â§6öæ–g’‡²&6öçfW'6F–öç2#¢µ×Ò ¢ç&÷WFR‚"ö’öFÖ–âö6öçfW'6F–öç2óÆ–çC¦6öçfW'6F–öåö–CâöÖW76vW2"¢Æöv–å÷&WV—&V@¢&öÆU÷&WV—&VB‚w7WW&FÖ–âr¢FVb•öFÖ–åövWEö6öçfW'6F–öåöÖW76vW2†6öçfW'6F–öåö–B“ ¢""$’VæGö–çBFòvWBÖW76vW2f÷"6öçfW'6F–öâg&öÒÆ–6Vç6–ær÷'FÂ"" ¢6öæf–rÒvWEöÆ–6Vç6Uö6öæf–r‚¢÷'FÅ÷W&ÂÒæ÷&ÖÆ—¦U÷÷'FÅ÷W&Â†6öæf–rævWB‚&Æ–6Vç6–æu÷÷'FÅ÷W&Â"’–b6öæf–rVÇ6RæöæR¢G'“ ¢–×÷'B&WVW7G22‡GG÷&WVW7G0¢&W7Ò‡GG÷&WVW7G2ævWB†b'·÷'FÅ÷W&ÇÒö’ö6öçfW'6F–öç2÷¶6öçfW'6F–öåö–GÒöÖW76vW2"Â†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓR¢–b&W7ç7FGW5ö6öFRÓÒ# ¢&WGW&â§6öæ–g’‡&W7æ§6öâ‚’¢&WGW&â§6öæ–g’‡²&ÖW76vW2#¢µ×Ò¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$f–ÆVBFòfWF6‚ÖW76vW2g&öÒ÷'FÃ¢¶WÒ"¢&WGW&â§6öæ–g’‡²&ÖW76vW2#¢µ×Ò ¢ç&÷WFR‚"ö’öFÖ–âö6öçfW'6F–öç2óÆ–çC¦6öçfW'6F–öåö–Câ÷6VæB"ÂÖWF†öG3Õ²%õ5B%Ò¢Æöv–å÷&WV—&V@¢&öÆU÷&WV—&VB‚w7WW&FÖ–âr¢FVb•öFÖ–å÷6VæEöÖW76vR†6öçfW'6F–öåö–B“ ¢""$’VæGö–çBFò6VæBÖW76vR2FÖ–âFòÆ–6Vç6–ær÷'FÂ"" ¢FFÒ&WVW7BævWEö§6öâ‚’÷"·Ð¢ÖW76vRÒFFævWB‚&ÖW76vR"Â""’ç7G&—‚¢–bæ÷BÖW76vS ¢&WGW&â§6öæ–g’‡²&W'&÷"#¢$ÖW76vR—2&WV—&VB'Ò’ÂC  ¢6öæf–rÒvWEöÆ–6Vç6Uö6öæf–r‚¢÷'FÅ÷W&ÂÒæ÷&ÖÆ—¦U÷÷'FÅ÷W&Â†6öæf–rævWB‚&Æ–6Vç6–æu÷÷'FÅ÷W&Â"’–b6öæf–rVÇ6RæöæR¢G'“ ¢–×÷'B&WVW7G22‡GG÷&WVW7G0¢&W7Ò‡GG÷&WVW7G2ç÷7B†b'·÷'FÅ÷W&ÇÒö’ö6öçfW'6F–öç2÷¶6öçfW'6F–öåö–GÒ÷6VæB"Â§6öã×°¢&ÖW76vR#¢ÖW76vRÀ¢'6VæFW%÷G—R#¢&FÖ–â"À¢'6VæFW%öæÖR#¢%7W÷'BFVÒ ¢ÒÂ†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓR¢–b&W7ç7FGW5ö6öFR–âƒ#Â#“ ¢&WGW&â§6öæ–g’‡²'7V66W72#¢G'VWÒ¢&WGW&â§6öæ–g’‡²&W'&÷"#¢$f–ÆVBFò6VæBÖW76vR'Ò’ÂS ¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"6VæF–ærÖW76vRFò÷'FÃ¢¶WÒ"¢&WGW&â§6öæ–g’‡²&W'&÷"#¢$f–ÆVBFò6VæBÖW76vR'Ò’ÂS  ¢ç&÷WFR‚"ö’öÖW76vW2÷Vç&VBÖ6÷VçB"¢Æöv–å÷&WV—&V@¢FVb•öÖW76vU÷Vç&VEö6÷VçB‚“ ¢""%&WGW&âF†R&—fFRÖW76vRVç&VBF÷FÂf÷"F†R6–væVBÖ–â66÷VçBâ"" ¢W6W"ÒvWE÷W6W%ö'•ö–B‡6W76–öå²'W6W%ö–B%Ò¢÷'FÅ÷W&ÂÒövWE÷÷'FÅ÷W&Â‚¢G'“ ¢–×÷'B&WVW7G22‡GG÷&WVW7G0¢–bW6W"ævWB‚'&öÆR"’ÓÒ'7WW&FÖ–â# ¢&W7Ò‡GG÷&WVW7G2ævWB†b'·÷'FÅ÷W&ÇÒö’ö6öçfW'6F–öç2"Â†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓR¢6öçfW'6F–öç2Ò&W7æ§6öâ‚’ævWB‚&6öçfW'6F–öç2"ÂµÒ’–b&W7ç7FGW5ö6öFRÓÒ#VÇ6RµÐ¢&WGW&â§6öæ–g’‡²'7V66W72#¢G'VRÂ&6÷VçB#¢7VÒ†–çB†2ævWB‚'Vç&VEö6÷VçB"’÷"’f÷"2–â6öçfW'6F–öç2—Ò ¢Æ–6Vç6Uö¶W’Ò÷W6W%öÆ–6Vç6Uö¶W’‡W6W"¢6öçF7EöVÖ–ÂÒW6W"ævWB‚&VÖ–Â"Â""’÷"W6W"ævWB‚'W6W&æÖR"Â""¢6öçeö–BÒöVç7W&U÷÷'FÅö6öçfW'6F–öâ…÷7W÷'Eö–FVçF—G’‡W6W"’ÂÆ–6Vç6Uö¶W’Â6öçF7EöVÖ–ÂÂW6W"ævWB‚'W6W&æÖR"Â""’¢–bæ÷B6öçeö–C ¢&WGW&â§6öæ–g’‡²'7V66W72#¢G'VRÂ&6÷VçB#¢Ò¢&W7Ò‡GG÷&WVW7G2ævWB†b'·÷'FÅ÷W&ÇÒö’ö6öçfW'6F–öç2÷¶6öçeö–GÒöÖW76vW3÷f–WvW#Ö6÷VçB"Â†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’ÂF–ÖV÷WCÓR¢ÖW76vW2Ò&W7æ§6öâ‚’ævWB‚&ÖW76vW2"ÂµÒ’–b&W7ç7FGW5ö6öFRÓÒ#VÇ6RµÐ¢Vç&VBÒ7VÒƒf÷"Ò–âÖW76vW2–bÒævWB‚'6VæFW%÷G—R"’ÓÒ&FÖ–â"æBæ÷B&ööÂ†ÒævWB‚&—5÷&VB"ÂÒævWB‚'6VVâ"ÂfÇ6R’’’¢&WGW&â§6öæ–g’‡²'7V66W72#¢G'VRÂ&6÷VçB#¢Vç&VGÒ¢W†6WBW†6WF–öâ2W†3 ¢ÆövvW"çv&æ–ær‚%Væ&ÆRFòfWF6‚ÖW76vRVç&VB6÷VçC¢W2"ÂW†2¢&WGW&â§6öæ–g’‡²'7V66W72#¢G'VRÂ&6÷VçB#¢Ò ¢ç&÷WFR‚"öFÖ–â÷&W6WBÖFF&6R"ÂÖWF†öG3Õ²%õ5B%Ò¢&öÆU÷&WV—&VB‚w7WW&FÖ–âr¢FVbFÖ–å÷&W6WEöFF&6R‚“ ¢""%&W6WBÆÂFF–âF†RFF&6R†¶VW2W6W'2’"" ¢G'“ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢7W'6÷"Ò6öæâæ7W'6÷"‚¢ ¢2F—6&ÆRf÷&V–vâ¶W’6†V6·2FV×÷&&–Ç¢7W'6÷"æW†V7WFR‚%4UBdõ$T”tåô´U•ô4„T4µ2Ò"¢ ¢2FVÆWFRÆÂFFg&öÒF&ÆW2†¶VW–ærW6W'2æB66†VÖ¢F&ÆW5÷Fõö6ÆV"Ò°¢&fVVF&6²"À¢'7F÷&W2"À¢'VW7F–öææ—&W2"À¢'VW7F–öç2"À¢&VF—EöÆöw2"À¢&æ÷F–f–6F–öç2 ¢Ð¢ ¢f÷"F&ÆR–âF&ÆW5÷Fõö6ÆV# ¢G'“ ¢7W'6÷"æW†V7WFR†b$DTÄUDRe$ôÒ·F&ÆWÒ"¢W†6WBW†6WF–öâ2S ¢ÆövvW"çv&æ–ær†b$6÷VÆBæ÷B6ÆV"F&ÆR·F&ÆWÓ¢¶WÒ"¢ ¢2&RÖVæ&ÆRf÷&V–vâ¶W’6†V6·0¢7W'6÷"æW†V7WFR‚%4UBdõ$T”tåô´U•ô4„T4µ2Ò"¢ ¢6öæâæ6öÖÖ—B‚¢6öæâæ6Æ÷6R‚¢ ¢fÆ6‚‚$FF&6R&W6WB7V66W76gVÆÇ’âÆÂFF6ÆV&VBW†6WBW6W'2â"Â'7V66W72"¢ÆöuöVF—B€¢VçF—G•÷G—SÒ&FF&6R"À¢VçF—G•ö–CÓÀ¢7F–öãÒ'&W6WB"À¢öÆE÷fÇVW3Ò$FF&6R&W6WB ¢¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"&W6WGF–ærFF&6S¢¶WÒ"¢fÆ6‚†b$f–ÆVBFò&W6WBFF&6S¢¶WÒ"Â&FævW""¢ ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&FÖ–å÷W6W'2"’ ¢ç&÷WFR‚"öF6†&ö&B÷7FfbÖ÷fW&ÆÂ"¢FVb7Ffeö÷fW&ÆÂ‚“ ¢""%7Ffb÷fW&ÆÂvR6†÷v–ærÆÂ7Ffbv—F‚&F–æw2æBW&f÷&Öæ6RÖWG&–72â"" ¢G'“ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR ¢2vÆö&ÂfW&vR6öÖÖVæFF–öâ&F–ær‡&–÷"Ö“²fÆÂ&6²FòBãà¢7W'6÷"æW†V7WFR€¢%4TÄT5Bdr‡&F–ær’2vÆö&Åöfre$ôÒ7Ffeö6öÖÖVæFF–öç2t„U$R&F–ær•2äõBåTÄÂ ¢¢&÷rÒ7W'6÷"æfWF6†öæR‚¢vÆö&Åöfu÷&F–ærÒfÆöB‡&÷u²vvÆö&ÅöfruÒ’–b&÷ræB&÷u²vvÆö&ÅöfruÒ—2æ÷BæöæRVÇ6RBã  ¢2fWF6‚ÆÂ7Ffbv—F‚F†V—"6öÖÖVæFF–öâ&F–æw2æBÖWG&–72à¢2vV–v‡FVE÷66÷&V—2F†R&–W6–âfW&vS ¢2„2¢Ò²7VÕööe÷&F–æw2’ò„2²â¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B2æ–BÂ2æf—'7EöæÖRÂ2æÆ7EöæÖRÂ2æVÖ–ÂÂ2ç†öæRÂ2ç÷6—F–öâÂ2ç&öÆRÂ2ç7FGW2Â7Bç7F÷&UöæÖRÂ2ç7F÷&Uö–BÀ¢dr‡62ç&F–ær’2fu÷&F–ærÀ¢4õTåB‡62æ–B’26öÖÖVæFF–öåö6÷VçBÀ¢€¢‚W2¢W2’²4ôÄU44R…5TÒ‡62ç&F–ær’Â¢’ò€¢W2²4õTåB‡62ç&F–ær¢’2vV–v‡FVE÷66÷&P¢e$ôÒ7Ffb0¢ÄTeB¤ô”â7Ffeö6öÖÖVæFF–öç262ôâ2æ–BÒ62ç7Ffeö–@¢ÄTeB¤ô”â7F÷&W27Bôâ2ç7F÷&Uö–BÒ7Bæ–@¢u$õU%’2æ–BÂ2æf—'7EöæÖRÂ2æÆ7EöæÖRÂ2æVÖ–ÂÂ2ç†öæRÂ2ç÷6—F–öâÂ2ç&öÆRÂ2ç7FGW2Â7Bç7F÷&UöæÖRÂ2ç7F÷&Uö–@¢õ$DU"%’vV–v‡FVE÷66÷&RDU42Â2æÆ7EöæÖRÂ2æf—'7EöæÖP¢"""À¢„$”U4”åô2ÂvÆö&Åöfu÷&F–ærÂ$”U4”åô2’À¢¢7FfeöFFÒ7W'6÷"æfWF6†ÆÂ‚¢ ¢2f÷&ÖBF†RFF¢f÷"7Ffb–â7FfeöFF ¢7Ffe²vfu÷&F–æruÒÒfÆöB‡7Ffe²vfu÷&F–æruÒ’–b7Ffe²vfu÷&F–æruÒVÇ6Rã ¢7Ffe²v6öÖÖVæFF–öåö6÷VçBuÒÒ–çB‡7Ffe²v6öÖÖVæFF–öåö6÷VçBuÒ’–b7Ffe²v6öÖÖVæFF–öåö6÷VçBuÒVÇ6R ¢7Ffe²wvV–v‡FVE÷66÷&RuÒÒfÆöB‡7Ffe²wvV–v‡FVE÷66÷&RuÒ’–b7Ffe²wvV–v‡FVE÷66÷&RuÒVÇ6Rã ¢ ¢6öæâæ6Æ÷6R‚¢&WGW&â&VæFW%÷FV×ÆFR‚&F6†&ö&B÷7Ffeö÷fW&ÆÂæ‡FÖÂ"Â7FfeöFF×7FfeöFF¢W†6WBW†6WF–öâ2S ¢W'&÷%öFWF–Ç2ÒG&6V&6²æf÷&ÖEöW†2‚¢ÆövvW"æW'&÷"†b%7Ffb÷fW&ÆÂW'&÷#¢¶WÕÆç¶W'&÷%öFWF–Ç7Ò"¢&WGW&âb%7Ffb÷fW&ÆÂW'&÷#¢¶WÓÆ'#ãÇ&Sç¶W'&÷%öFWF–Ç7ÓÂ÷&Sâ"ÂS  ¢ç&÷WFR‚"ö’öF6†&ö&BöæÇ—F–72"¢FVb•öF6†&ö&EöæÇ—F–72‚“ ¢""$¥4ôâVæGö–çBf÷"÷fW&ÆÂF6†&ö&BæÇ—F–72‡W6VB'’7F÷&Rf–ÇFW"’â"" ¢G'“ ¢æÇ—F–72ÒfWF6…öF6†&ö&EöæÇ—F–72‚¢26W&–Æ—¦Rf÷"¥4ôà¢7F÷&W5öFFÒæÇ—F–72ævWB‚w7F÷&W5öFFrÂµÒ¢÷fW&ÆÂÒæÇ—F–72ævWB‚v÷fW&ÆÅ÷7FG2rÂ·Ò¢&V6VçBÒæÇ—F–72ævWB‚w&V6VçEö7F—f—G’rÂµÒ¢F÷ÒæÇ—F–72ævWB‚wF÷÷7F÷&W2rÂµÒ¢&W7E÷7F÷&RÒæÇ—F–72ævWB‚v&W7Eö÷fW&ÆÅ÷7F÷&Rr¢&W7E÷7FfbÒæÇ—F–72ævWB‚v&W7Eö÷fW&ÆÅ÷7Ffbr ¢2f÷&ÖB&V6VçEö7F—f—G’FFW0¢f÷&ÖGFVEö7F—f—G’ÒµÐ¢f÷"–â&V6VçC ¢BÒævWB‚vFFRr¢f÷&ÖGFVEö7F—f—G’æVæB‡°¢vFFUöÆ&VÂs¢Bç7G&gF–ÖR‚rV"VBr’–bBVÇ6RsòrÀ¢w&W7öç6W2s¢ævWB‚w&W7öç6W2rÂ¢Ò ¢&WGW&â§6öæ–g’‡°¢w7F÷&W5öFFs¢°¢°¢v–Bs¢5²v–BuÒÀ¢w7F÷&UöæÖRs¢5²w7F÷&UöæÖRuÒÀ¢vFG&W72s¢2ævWB‚vFG&W72rÂrr’À¢v6—G’s¢2ævWB‚v6—G’rÂrr’À¢wF÷FÅ÷&W7öç6W2s¢2ævWB‚wF÷FÅ÷&W7öç6W2rÂ’À¢vfu÷&F–ærs¢fÆöB‡5²vfu÷&F–æruÒ’–b2ævWB‚vfu÷&F–ærr’VÇ6RãÀ¢wVæ—VU÷W6W'2s¢2ævWB‚wVæ—VU÷W6W'2rÂ¢Òf÷"2–â7F÷&W5öFF¢ÒÀ¢v÷fW&ÆÅ÷7FG2s¢°¢wF÷FÅ÷&W7öç6W2s¢÷fW&ÆÂævWB‚wF÷FÅ÷&W7öç6W2rÂ’À¢wF÷FÅ÷7F÷&W2s¢÷fW&ÆÂævWB‚wF÷FÅ÷7F÷&W2rÂ’À¢wF÷FÅ÷Væ—VU÷W6W'2s¢÷fW&ÆÂævWB‚wF÷FÅ÷Væ—VU÷W6W'2rÂ’À¢v÷fW&ÆÅöfu÷&F–ærs¢fÆöB†÷fW&ÆÂævWB‚v÷fW&ÆÅöfu÷&F–ærrÂ’’À¢wF÷FÅ÷VW7F–öææ—&W2s¢÷fW&ÆÂævWB‚wF÷FÅ÷VW7F–öææ—&W2rÂ¢ÒÀ¢w&V6VçEö7F—f—G’s¢f÷&ÖGFVEö7F—f—G’À¢wF÷÷7F÷&W2s¢°¢²w7F÷&UöæÖRs¢E²w7F÷&UöæÖRuÒÂw&W7öç6Uö6÷VçBs¢E²w&W7öç6Uö6÷VçBu×Ð¢f÷"B–âF÷ ¢ÒÀ¢v&W7Eö÷fW&ÆÅ÷7F÷&Rs¢°¢w7F÷&UöæÖRs¢&W7E÷7F÷&U²w7F÷&UöæÖRuÒÀ¢vfu÷&F–ærs¢fÆöB†&W7E÷7F÷&U²vfu÷&F–æruÒ¢Ò–b&W7E÷7F÷&RVÇ6RæöæRÀ¢v&W7Eö÷fW&ÆÅ÷7Ffbs¢°¢vf—'7EöæÖRs¢&W7E÷7Ffe²vf—'7EöæÖRuÒÀ¢vÆ7EöæÖRs¢&W7E÷7Ffe²vÆ7EöæÖRuÒÀ¢vfu÷&F–ærs¢fÆöB†&W7E÷7Ffe²vfu÷&F–æruÒ’–b&W7E÷7FfbævWB‚vfu÷&F–ærr’VÇ6Rã ¢Ò–b&W7E÷7FfbVÇ6RæöæP¢Ò¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$F6†&ö&B’W'&÷#¢¶WÒ"¢&WGW&â§6öæ–g’‡²vW'&÷"s¢7G"†R—Ò’ÂS  ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2÷W&f÷&Öæ6R"¢FVb7F÷&W5÷W&f÷&Öæ6R‚“ ¢æÇ—F–72ÒfWF6…öF6†&ö&EöæÇ—F–72‚¢&WGW&â&VæFW%÷FV×ÆFR€¢&F6†&ö&B÷7F÷&U÷W&f÷&Öæ6Ræ‡FÖÂ"À¢7F÷&W5öFFÖæÇ—F–72ævWB‚'7F÷&W5öFF"ÂµÒ’À¢÷fW&ÆÅ÷7FG3ÖæÇ—F–72ævWB‚&÷fW&ÆÅ÷7FG2"Â·Ò’À¢ ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2"ÂÖWF†öG3Õ²$tUB%Ò¢Æöv–å÷&WV—&V@¢FVb7F÷&W5öÖævVÖVçB‚“ ¢W6W"ÒvWE÷W6W%ö'•ö–B‡6W76–öå²wW6W%ö–BuÒ¢2&öÆRÖ&6VB7F÷&Rf—6–&–Æ—G“ ¢27WW&FÖ–âÓâÆÂ7F÷&W0¢2FÖ–â†6Æ–VçB’Óâ÷vâ7F÷&W2†f–ÇFW&VB'’W6W%ö–B÷væW'6†—¢2W6W"‡f–WrÖöæÇ’’ÓâöæÇ’7F÷&W2W‡Æ–6—FÇ’76–væVBf–W6W%÷7F÷&W0¢–bW6W%²w&öÆRuÒÓÒwW6W"s ¢76–væVEö–G2ÒvWEö76–væVE÷7F÷&Uö–G2‡6W76–öå²wW6W%ö–BuÒ¢ÆövvW"æ–æfò†b%f–WrÖöæÇ’W6W"·6W76–öå²wW6W%ö–Bu×Ò76–væVBFò7F÷&W3¢¶76–væVEö–G7Ò"¢7F÷&W2ÒfWF6…÷7F÷&W2†76–væVE÷7F÷&Uö–G3Ö76–væVEö–G2¢W6W%ö–BÒ6W76–öå²wW6W%ö–BuÐ¢VÇ6S ¢W6W%ö–BÒ6W76–öå²wW6W%ö–BuÒ–bW6W%²w&öÆRuÒÓÒvFÖ–ârVÇ6RæöæP¢ÆövvW"æ–æfò†b%W6W"·6W76–öå²wW6W%ö–Bu×Ò‡&öÆS¢·W6W%²w&öÆRu×Ò’f–Wv–ær7F÷&W2âf–ÇFW&–ær'’W6W%ö–C¢·W6W%ö–GÒ"¢7F÷&W2ÒfWF6…÷7F÷&W2‡W6W%ö–C×W6W%ö–B¢ÆövvW"æ–æfò†b%W6W"·6W76–öå²wW6W%ö–Bu×Ò6VW2¶ÆVâ‡7F÷&W2—Ò7F÷&W2" ¢2&F6‚ÖÆöBfVVF&6²²7Ffb6÷VçG2æB†f÷"æöâÖ6Æ–VçG2’W6W"–æfò–â2VW&–W0¢2–ç7FVBöb'Vææ–ær"VW&–W2W"7F÷&R²W"W6W"à¢7F÷&Uö–G2Ò·5²&–B%Òf÷"2–â7F÷&W5Ð¢fVVF&6µö6÷VçG2Ò·Ð¢7Ffeö6÷VçG2Ò·Ð¢W6W%ö–æfòÒ·Ð¢–b7F÷&Uö–G3 ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢Æ6V†öÆFW'2Ò"Â"æ¦ö–â…²"W2%Ò¢ÆVâ‡7F÷&Uö–G2’¢7W'6÷"æW†V7WFR€¢b%4TÄT5B7F÷&Uö–BÂ4õTåB‚¢’e$ôÒ&W7öç6W2t„U$R7F÷&Uö–B”â‡·Æ6V†öÆFW'7Ò’u$õU%’7F÷&Uö–B"À¢GWÆR‡7F÷&Uö–G2’À¢¢fVVF&6µö6÷VçG2Ò·&÷u³Ó¢–çB‡&÷u³Ò’f÷"&÷r–â7W'6÷"æfWF6†ÆÂ‚—Ð¢7W'6÷"æW†V7WFR€¢b%4TÄT5B7F÷&Uö–BÂ4õTåB‚¢’e$ôÒ7Ffbt„U$R7F÷&Uö–B”â‡·Æ6V†öÆFW'7Ò’u$õU%’7F÷&Uö–B"À¢GWÆR‡7F÷&Uö–G2’À¢¢7Ffeö6÷VçG2Ò·&÷u³Ó¢–çB‡&÷u³Ò’f÷"&÷r–â7W'6÷"æfWF6†ÆÂ‚—Ð ¢–bW6W%²w&öÆRuÒÓÒw7WW&FÖ–âs ¢W6W%ö–G2Ò6÷'FVB‡·2ævWB‚'W6W%ö–B"’f÷"2–â7F÷&W2–b2ævWB‚'W6W%ö–B"—Ò¢–bW6W%ö–G3 ¢W‚Ò"Â"æ¦ö–â…²"W2%Ò¢ÆVâ‡W6W%ö–G2’¢7W'6÷#"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢7W'6÷#"æW†V7WFR€¢b%4TÄT5B–BÂW6W&æÖRÂ&öÆRe$ôÒW6W'2t„U$R–B”â‡·W‡Ò’"À¢GWÆR‡W6W%ö–G2’À¢¢W6W%ö–æfòÒ·U²&–B%Ó¢Rf÷"R–â7W'6÷#"æfWF6†ÆÂ‚—Ð¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢2Væ†æ6R7F÷&W2v—F‚6÷VçG2‡6–ævÆR72¢Væ†æ6VE÷7F÷&W2ÒµÐ¢f÷"7F÷&R–â7F÷&W3 ¢6–BÒ7F÷&U²&–B%Ð¢7F÷&U÷v—F…ö6÷VçG2ÒF–7B‡7F÷&R¢7F÷&U÷v—F…ö6÷VçG5²&fVVF&6µö6÷VçB%ÒÒfVVF&6µö6÷VçG2ævWB‡6–BÂ¢7F÷&U÷v—F…ö6÷VçG5²'7Ffeö6÷VçB%ÒÒ7Ffeö6÷VçG2ævWB‡6–BÂ¢Væ†æ6VE÷7F÷&W2æVæB‡7F÷&U÷v—F…ö6÷VçG2 ¢2w&÷WVæ†æ6VB7F÷&W2'’6Æ–VçB†FÖ–â’f÷"7WW&FÖ–âöæÇ¢7F÷&W5ö'•÷W6W%öVæ†æ6VBÒæöæP¢–bW6W%²w&öÆRuÒÓÒw7WW&FÖ–âræBVæ†æ6VE÷7F÷&W3 ¢7F÷&W5ö'•÷W6W%öVæ†æ6VBÒ·Ð¢f÷"7F÷&R–âVæ†æ6VE÷7F÷&W3 ¢V–BÒ7F÷&RævWB‚'W6W%ö–B"’÷"'Væ76–væVB ¢7F÷&W5ö'•÷W6W%öVæ†æ6VBç6WFFVfVÇB‡V–BÂµÒ’æVæB‡7F÷&R ¢6VÆV7FVE÷7F÷&Uö–E÷&ÒÒ&WVW7Bæ&w2ævWB‚'7F÷&Uö–B"¢6VÆV7FVE÷7F÷&Uö–BÒæöæP¢–b6VÆV7FVE÷7F÷&Uö–E÷&Ó ¢G'“ ¢6VÆV7FVE÷7F÷&Uö–BÒ–çB‡6VÆV7FVE÷7F÷&Uö–E÷&Ò¢W†6WBfÇVTW'&÷# ¢6VÆV7FVE÷7F÷&Uö–BÒæöæP ¢6VÆV7FVE÷7F÷&RÒæöæP¢–b6VÆV7FVE÷7F÷&Uö–B—2æ÷BæöæS ¢f÷"7F÷&R–â7F÷&W3 ¢–b7F÷&U²&–B%ÒÓÒ6VÆV7FVE÷7F÷&Uö–C ¢6VÆV7FVE÷7F÷&RÒ7F÷&P¢'&V° ¢V&Æ–5÷W&ÂÒæöæP¢%öFF÷W&’ÒæöæP¢–b6VÆV7FVE÷7F÷&S ¢V&Æ–5÷W&ÂÒvWE÷7F÷&U÷V&Æ–5÷W&Â‡7F÷&Uö–CÖ–çB‡6VÆV7FVE÷7F÷&U²&–B%Ò’¢%öFF÷W&’ÒvVæW&FU÷%öFF÷W&’‡V&Æ–5÷W&Â ¢&WGW&â&VæFW%÷FV×ÆFR€¢&ÖævU÷7F÷&W2÷7F÷&W2æ‡FÖÂ"À¢7F÷&W3ÖVæ†æ6VE÷7F÷&W2–bW6W%²w&öÆRuÒÒw7WW&FÖ–ârVÇ6RæöæRÀ¢ÆÅ÷7F÷&W3ÖVæ†æ6VE÷7F÷&W2À¢7F÷&W5ö'•÷W6W#×7F÷&W5ö'•÷W6W%öVæ†æ6VB–bW6W%²w&öÆRuÒÓÒw7WW&FÖ–ârVÇ6RæöæRÀ¢W6W%ö–æfó×W6W%ö–æfò–bW6W%²w&öÆRuÒÓÒw7WW&FÖ–ârVÇ6RæöæRÀ¢6VÆV7FVE÷7F÷&S×6VÆV7FVE÷7F÷&RÀ¢V&Æ–5÷W&Ã×V&Æ–5÷W&ÂÀ¢%öFF÷W&“×%öFF÷W&’À¢ ¢FVbvWEöfVVF&6µö6÷VçEöf÷%÷7F÷&R‡7F÷&Uö–C¢–çB’Óâ–çC ¢""$vWBF†RF÷FÂçVÖ&W"öbfVVF&6²&W7öç6W2f÷"7F÷&Râ"" ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢7W'6÷"æW†V7WFR€¢%4TÄT5B4õTåB‚¢’e$ôÒ&W7öç6W2t„U$R7F÷&Uö–BÒW2"À¢‡7F÷&Uö–BÂ¢¢6÷VçBÒ7W'6÷"æfWF6†öæR‚•³Ð¢&WGW&â–çB†6÷VçB’–b6÷VçBVÇ6R ¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢FVbvWE÷7Ffeö6÷VçEöf÷%÷7F÷&R‡7F÷&Uö–C¢–çB’Óâ–çC ¢""$vWBF†RF÷FÂçVÖ&W"öb7FfbÖVÖ&W'2f÷"7F÷&Râ"" ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢7W'6÷"æW†V7WFR€¢%4TÄT5B4õTåB‚¢’e$ôÒ7Ffbt„U$R7F÷&Uö–BÒW2"À¢‡7F÷&Uö–BÂ¢¢6÷VçBÒ7W'6÷"æfWF6†öæR‚•³Ð¢&WGW&â–çB†6÷VçB’–b6÷VçBVÇ6R ¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢FVbvWE÷7Ffe÷W&f÷&Öæ6Uöf÷%÷7F÷&R‡7F÷&Uö–C¢–çB’ÓâÆ—7E´F–7E·7G"Âç•ÕÓ ¢""$vWB7Ffbf÷"7F÷&R&æ¶VB'’&–W6–âÖfW&vR66÷&Rà ¢66÷&RÒ„2¢Ò²7VÕööe÷&F–æw2’ò„2²â’Âv†W&RÒ—2F†RvÆö&À¢6öÖÖVæFF–öâ&F–æræB2—2F†R6Öö÷F†–ær6öç7FçB†$”U4”åô6’à¢"" ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR ¢7W'6÷"æW†V7WFR€¢%4TÄT5Bdr‡&F–ær’2vÆö&Åöfre$ôÒ7Ffeö6öÖÖVæFF–öç2t„U$R&F–ær•2äõBåTÄÂ ¢¢&÷rÒ7W'6÷"æfWF6†öæR‚¢vÆö&Åöfu÷&F–ærÒfÆöB‡&÷u²vvÆö&ÅöfruÒ’–b&÷ræB&÷u²vvÆö&ÅöfruÒ—2æ÷BæöæRVÇ6RBã  ¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B2æ–BÂ2æf—'7EöæÖRÂ2æÆ7EöæÖRÂ2ç÷6—F–öâÂ2ç&öÆRÀ¢dr‡62ç&F–ær’2fu÷&F–ærÀ¢4õTåB‡62æ–B’26öÖÖVæFF–öåö6÷VçBÀ¢€¢‚W2¢W2’²4ôÄU44R…5TÒ‡62ç&F–ær’Â¢’ò€¢W2²4õTåB‡62ç&F–ær¢’2vV–v‡FVE÷66÷&P¢e$ôÒ7Ffb0¢ÄTeB¤ô”â7Ffeö6öÖÖVæFF–öç262ôâ2æ–BÒ62ç7Ffeö–@¢t„U$R2ç7F÷&Uö–BÒW0¢u$õU%’2æ–BÂ2æf—'7EöæÖRÂ2æÆ7EöæÖRÂ2ç÷6—F–öâÂ2ç&öÆP¢õ$DU"%’vV–v‡FVE÷66÷&RDU40¢"""À¢„$”U4”åô2ÂvÆö&Åöfu÷&F–ærÂ$”U4”åô2Â7F÷&Uö–B’À¢¢&WGW&â7W'6÷"æfWF6†ÆÂ‚¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢2’VæGö–çBf÷"7F÷&RfVVF&6²FF¢ç&÷WFR‚"ö’÷7F÷&W2óÆ–çC§7F÷&Uö–CâöfVVF&6²"ÂÖWF†öG3Õ²$tUB%Ò¢Æöv–å÷&WV—&V@¢FVb•÷7F÷&UöfVVF&6²‡7F÷&Uö–C¢–çB“ ¢""$’VæGö–çBFòvWBfVVF&6²FFf÷"7F÷&Râ"" ¢–bæ÷B6åöÖævU÷7F÷&U÷7Ffb‡6W76–öå²wW6W%ö–BuÒÂ7F÷&Uö–B“ ¢&WGW&â§6öæ–g’‡²&W'&÷"#¢%–÷R6âöæÇ’f–Wr–÷W"76–væVB7F÷&Râ'Ò’ÂC0¢7F÷&RÒfWF6…÷7F÷&Uö'•ö–B‡7F÷&Uö–C×7F÷&Uö–B¢–bæ÷B7F÷&S ¢&WGW&â§6öæ–g’‡²&W'&÷"#¢%7F÷&Ræ÷Bf÷VæB'Ò’ÂC@¢ ¢fVVF&6²ÒfWF6…÷&W7öç6W5öf÷%÷7F÷&R‡7F÷&Uö–C×7F÷&Uö–BÂÆ–Ö—CÓR¢&WGW&â§6öæ–g’†fVVF&6² ¢2’VæGö–çBf÷"7F÷&RæÇ—F–72FF¢ç&÷WFR‚"ö’÷7F÷&W2óÆ–çC§7F÷&Uö–CâöæÇ—F–72"ÂÖWF†öG3Õ²$tUB%Ò¢Æöv–å÷&WV—&V@¢FVb•÷7F÷&UöæÇ—F–72‡7F÷&Uö–C¢–çB“ ¢""$’VæGö–çBFòvWBæÇ—F–72FFf÷"7F÷&Râ"" ¢–bæ÷B6åöÖævU÷7F÷&U÷7Ffb‡6W76–öå²wW6W%ö–BuÒÂ7F÷&Uö–B“ ¢&WGW&â§6öæ–g’‡²&W'&÷"#¢%–÷R6âöæÇ’f–Wr–÷W"76–væVB7F÷&Râ'Ò’ÂC0¢7F÷&RÒfWF6…÷7F÷&Uö'•ö–B‡7F÷&Uö–C×7F÷&Uö–B¢–bæ÷B7F÷&S ¢&WGW&â§6öæ–g’‡²&W'&÷"#¢%7F÷&Ræ÷Bf÷VæB'Ò’ÂC@¢ ¢2fWF6‚ÆÂfVVF&6²f÷"æÇ—F–70¢ÆÅöfVVF&6²ÒfWF6…÷&W7öç6W5öf÷%÷7F÷&R‡7F÷&Uö–C×7F÷&Uö–BÂÆ–Ö—CÓ¢F÷FÅöfVVF&6²ÒÆVâ†ÆÅöfVVF&6²¢ ¢2&W6öÇfVBòVç&W6öÇfVB6÷VçG0¢&W6öÇfVEö6÷VçBÒ7VÒƒf÷"b–âÆÅöfVVF&6²–bbævWB‚'7FGW2"’ÓÒ'&W6öÇfVB"¢Vç&W6öÇfVEö6÷VçBÒF÷FÅöfVVF&6²Ò&W6öÇfVEö6÷Vç@¢&W6öÇWF–öå÷&FRÒ&÷VæB‚‡&W6öÇfVEö6÷VçBòF÷FÅöfVVF&6²¢’Â’–bF÷FÅöfVVF&6²âVÇ6R ¢ ¢26Æ7VÆFR&F–æw0¢ÆÅ÷&W7öç6Uö–G2Ò¶–çB‡%²&–B%Ò’f÷""–âÆÅöfVVF&6µÐ¢ç7vW'5ö'•÷&W7öç6Uö–BÒfWF6…öç7vW'5öf÷%÷&W7öç6W2†ÆÅ÷&W7öç6Uö–G2’–bÆÅöfVVF&6²VÇ6R·Ð¢ ¢2&F–ærF—7G&–'WF–öà¢&F–æuöF—7G&–'WF–öâÒ³ÂÂÂÂÒ2ÓR7F'0¢F÷FÅ÷&F–æw2Ò ¢f÷"&W7öç6Uö–BÂç7vW'2–âç7vW'5ö'•÷&W7öç6Uö–Bæ—FV×2‚“ ¢f÷"ç7vW"–âç7vW'3 ¢–bç7vW"ævWB‚'&F–æu÷fÇVR"“ ¢&F–ærÒ–çB†fÆöB†ç7vW%²'&F–æu÷fÇVR%Ò’¢–bÃÒ&F–ærÃÒS ¢&F–æuöF—7G&–'WF–öå·&F–ærÒÒ³Ò¢F÷FÅ÷&F–æw2³Ò¢ ¢26Æ7VÆFRW&6VçFvW0¢f—fU÷7F%ö6÷VçBÒ&F–æuöF—7G&–'WF–öå³EÐ¢f÷W%÷7F%ö6÷VçBÒ&F–æuöF—7G&–'WF–öå³5Ð¢ ¢f—fU÷7F%÷&FRÒ&÷VæB‚†f—fU÷7F%ö6÷VçBòF÷FÅ÷&F–æw2¢’Â’–bF÷FÅ÷&F–æw2âVÇ6R ¢f÷W%÷ÇW5÷7F%÷&FRÒ&÷VæB‚‚†f÷W%÷7F%ö6÷VçB²f—fU÷7F%ö6÷VçB’òF÷FÅ÷&F–æw2¢’Â’–bF÷FÅ÷&F–æw2âVÇ6R ¢ ¢2&F–ærF—7G&–'WF–öâW&6VçFvW0¢&F–æu÷7G2Ò·&÷VæB†2òF÷FÅ÷&F–æw2¢Â’–bF÷FÅ÷&F–æw2âVÇ6Rf÷"2–â&F–æuöF—7G&–'WF–öåÐ¢ ¢2VÆ—G’66÷&P¢VÆ—G•÷66÷&RÒ&÷VæB€¢‡&F–æuöF—7G&–'WF–öå³Ò¢²&F–æuöF—7G&–'WF–öå³Ò¢"² ¢&F–æuöF—7G&–'WF–öå³%Ò¢2²&F–æuöF—7G&–'WF–öå³5Ò¢B² ¢&F–æuöF—7G&–'WF–öå³EÒ¢R’òF÷FÅ÷&F–æw2Â¢’–bF÷FÅ÷&F–æw2âVÇ6R ¢ ¢2ÖöçF†Ç’fVVF&6²G&VæB†Æ7BbÖöçF‡2¢ÖöçF†Ç•÷G&VæBÒFVfVÇFF–7B†–çB¢æ÷rÒFFWF–ÖRææ÷r‚¢f÷"f"–âÆÅöfVVF&6³ ¢7V&Ö—GFVBÒf"ævWB‚'7V&Ö—GFVEöB"¢–b7V&Ö—GFVC ¢–b—6–ç7Fæ6R‡7V&Ö—GFVBÂ7G"“ ¢G'“ ¢7V&Ö—GFVBÒFFWF–ÖRç7G'F–ÖR‡7V&Ö—GFVBÂ"U’ÒVÒÒVBTƒ¢TÓ¢U2"¢W†6WB…fÇVTW'&÷"ÂG—TW'&÷"“ ¢6öçF–çVP¢¶W’Ò7V&Ö—GFVBç7G&gF–ÖR‚"U’ÒVÒ"¢ÖöçF†Ç•÷G&VæE¶¶W•Ò³Ò¢ ¢2'V–ÆBÆ7BbÖöçF‡2Æ&VÇ2æBfÇVW0¢G&VæEöÆ&VÇ2ÒµÐ¢G&VæE÷fÇVW2ÒµÐ¢f÷"’–â&ævRƒRÂÓÂÓ“ ¢BÒæ÷rÒF–ÖVFVÇF†F—3Ö’¢3¢¶W’ÒBç7G&gF–ÖR‚"U’ÒVÒ"¢Æ&VÂÒBç7G&gF–ÖR‚"V""¢G&VæEöÆ&VÇ2æVæB†Æ&VÂ¢G&VæE÷fÇVW2æVæB†ÖöçF†Ç•÷G&VæBævWB†¶W’Â’¢ ¢27Ffb6öÖÖVæFF–öç26÷VçB²F÷7Ff`¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢–bÆÅ÷&W7öç6Uö–G3 ¢Æ6V†öÆFW'2ÒrÂræ¦ö–â…²rW2uÒ¢ÆVâ†ÆÅ÷&W7öç6Uö–G2’¢7W'6÷"æW†V7WFR†b"" ¢4TÄT5B4õTåB‚¢’26çBe$ôÒ7Ffeö6öÖÖVæFF–öç2 ¢t„U$R&W7öç6Uö–B”â‡·Æ6V†öÆFW'7Ò¢"""ÂÆÅ÷&W7öç6Uö–G2¢F÷FÅö6öÖÖVæFF–öç2Ò7W'6÷"æfWF6†öæR‚•²&6çB%Ð¢ ¢2vÆö&ÂfW&vR6öÖÖVæFF–öâ&F–ær„&–W6–â&–÷"Ö’à¢7W'6÷"æW†V7WFR€¢%4TÄT5Bdr‡&F–ær’2vÆö&Åöfre$ôÒ7Ffeö6öÖÖVæFF–öç2t„U$R&F–ær•2äõBåTÄÂ ¢¢w&÷rÒ7W'6÷"æfWF6†öæR‚¢7FfeövÆö&ÅöfrÒfÆöB†w&÷u²vvÆö&ÅöfruÒ’–bw&÷ræBw&÷u²vvÆö&ÅöfruÒ—2æ÷BæöæRVÇ6RBã  ¢2F÷R6öÖÖVæFVB7Ffb&æ¶VB'’&–W6–âÖfW&vR66÷&Rà¢7W'6÷"æW†V7WFR†b"" ¢4TÄT5B2æf—'7EöæÖRÂ2æÆ7EöæÖRÂ2ç÷6—F–öâÂ2ç&öÆRÀ¢dr‡62ç&F–ær’2fu÷&F–ærÀ¢4õTåB‡62æ–B’26öÖÖVæFF–öåö6÷VçBÀ¢€¢‚W2¢W2’²4ôÄU44R…5TÒ‡62ç&F–ær’Â¢’ò€¢W2²4õTåB‡62ç&F–ær¢’2vV–v‡FVE÷66÷&P¢e$ôÒ7Ffeö6öÖÖVæFF–öç260¢¤ô”â7Ffb2ôâ2æ–BÒ62ç7Ffeö–@¢t„U$R62ç&W7öç6Uö–B”â‡·Æ6V†öÆFW'7Ò¢u$õU%’2æ–BÂ2æf—'7EöæÖRÂ2æÆ7EöæÖRÂ2ç÷6—F–öâÂ2ç&öÆP¢õ$DU"%’vV–v‡FVE÷66÷&RDU40¢Ä”Ô•BP¢"""Â´$”U4”åô2Â7FfeövÆö&ÅöfrÂ$”U4”åô2Â¦ÆÅ÷&W7öç6Uö–G5Ò¢F÷÷7FfbÒ7W'6÷"æfWF6†ÆÂ‚¢VÇ6S ¢F÷FÅö6öÖÖVæFF–öç2Ò ¢F÷÷7FfbÒµÐ¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢ ¢f÷&ÖGFVE÷F÷÷7FfbÒµÐ¢f÷"2–âF÷÷7Ffc ¢f÷&ÖGFVE÷F÷÷7FfbæVæB‡°¢&æÖR#¢b'·5²vf—'7EöæÖRu×Ò·5²vÆ7EöæÖRu×Ò"À¢'÷6—F–öâ#¢5²'÷6—F–öâ%Ò÷"‡5²'&öÆR%ÒçF—FÆR‚’–b5²'&öÆR%ÒVÇ6R%7Ffb"’À¢&fu÷&F–ær#¢fÆöB‡5²&fu÷&F–ær%Ò’–b5²&fu÷&F–ær%ÒVÇ6Rã ¢Ò¢ ¢&WGW&â§6öæ–g’‡°¢&÷fW'f–Wr#¢°¢'F÷FÅöfVVF&6²#¢F÷FÅöfVVF&6²À¢'&W6öÇfVB#¢&W6öÇfVEö6÷VçBÀ¢'Vç&W6öÇfVB#¢Vç&W6öÇfVEö6÷VçBÀ¢'&W6öÇWF–öå÷&FR#¢&W6öÇWF–öå÷&FRÀ¢'F÷FÅ÷&F–æw2#¢F÷FÅ÷&F–æw0¢ÒÀ¢'&F–æuöÖWG&–72#¢°¢&f—fU÷7F%÷&FR#¢f—fU÷7F%÷&FRÀ¢&f÷W%÷ÇW5÷7F%÷&FR#¢f÷W%÷ÇW5÷7F%÷&FRÀ¢'VÆ—G•÷66÷&R#¢VÆ—G•÷66÷&RÀ¢&F—7G&–'WF–öâ#¢&F–æuöF—7G&–'WF–öâÀ¢&F—7G&–'WF–öå÷7G2#¢&F–æu÷7G0¢ÒÀ¢'G&VæB#¢°¢&Æ&VÇ2#¢G&VæEöÆ&VÇ2À¢'fÇVW2#¢G&VæE÷fÇVW0¢ÒÀ¢'7FfeöÖWG&–72#¢°¢'F÷FÅö6öÖÖVæFF–öç2#¢F÷FÅö6öÖÖVæFF–öç2À¢'F÷÷7Ffb#¢f÷&ÖGFVE÷F÷÷7Ff`¢Ð¢Ò ¢2’VæGö–çBf÷"7F÷&R7FfbFF¢ç&÷WFR‚"ö’÷7F÷&W2óÆ–çC§7F÷&Uö–Câ÷7Ffb"ÂÖWF†öG3Õ²$tUB%Ò¢Æöv–å÷&WV—&V@¢FVb•÷7F÷&U÷7Ffb‡7F÷&Uö–C¢–çB“ ¢""$’VæGö–çBFòvWB7FfbFFf÷"7F÷&Râ"" ¢–bæ÷B6åöÖævU÷7F÷&U÷7Ffb‡6W76–öå²wW6W%ö–BuÒÂ7F÷&Uö–B“ ¢&WGW&â§6öæ–g’‡²&W'&÷"#¢%–÷R6âöæÇ’f–Wr7Ffb–â–÷W"76–væVB7F÷&Râ'Ò’ÂC0¢7F÷&RÒfWF6…÷7F÷&Uö'•ö–B‡7F÷&Uö–C×7F÷&Uö–B¢–bæ÷B7F÷&S ¢&WGW&â§6öæ–g’‡²&W'&÷"#¢%7F÷&Ræ÷Bf÷VæB'Ò’ÂC@¢ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢ ¢2vÆö&ÂfW&vR6öÖÖVæFF–öâ&F–ær„&–W6–â&–÷"Ö’à¢7W'6÷"æW†V7WFR€¢%4TÄT5Bdr‡&F–ær’2vÆö&Åöfre$ôÒ7Ffeö6öÖÖVæFF–öç2t„U$R&F–ær•2äõBåTÄÂ ¢¢&÷rÒ7W'6÷"æfWF6†öæR‚¢vÆö&Åöfu÷&F–ærÒfÆöB‡&÷u²vvÆö&ÅöfruÒ’–b&÷ræB&÷u²vvÆö&ÅöfruÒ—2æ÷BæöæRVÇ6RBã  ¢2fWF6‚7Ffbv—F‚6öÖÖVæFF–öâ&F–æw3²vV–v‡FVE÷66÷&VW6W2F†P¢2&–W6–âfW&vR6òÆ÷r×föÇVÖR7FfbFöâwB÷WG&æ²†–v‚×föÇVÖP¢27Ffb§W7B&V6W6Röb6–ævÆR^)ˆR6öÖÖVæFF–öâà¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B2æ–BÂ2æf—'7EöæÖRÂ2æÆ7EöæÖRÂ2æVÖ–ÂÂ2ç†öæRÂ2ç÷6—F–öâÂ2ç†÷Fõ÷W&ÂÂ2ç&öÆRÂ2ç7FGW2À¢dr‡62ç&F–ær’2fu÷&F–ærÀ¢4õTåB‡62æ–B’26öÖÖVæFF–öåö6÷VçBÀ¢€¢‚W2¢W2’²4ôÄU44R…5TÒ‡62ç&F–ær’Â¢’ò€¢W2²4õTåB‡62ç&F–ær¢’2vV–v‡FVE÷66÷&P¢e$ôÒ7Ffb0¢ÄTeB¤ô”â7Ffeö6öÖÖVæFF–öç262ôâ2æ–BÒ62ç7Ffeö–@¢t„U$R2ç7F÷&Uö–BÒW0¢u$õU%’2æ–@¢õ$DU"%’vV–v‡FVE÷66÷&RDU42Â2æÆ7EöæÖRÂ2æf—'7EöæÖP¢"""À¢„$”U4”åô2ÂvÆö&Åöfu÷&F–ærÂ$”U4”åô2Â7F÷&Uö–B’À¢¢ ¢7FfeöÖVÖ&W'2Ò7W'6÷"æfWF6†ÆÂ‚¢ ¢2f÷&ÖB7FfbFF¢F÷FÅö6öÖÖVæFF–öç2Ò7VÒ‡5²&6öÖÖVæFF–öåö6÷VçB%Ò÷"f÷"2–â7FfeöÖVÖ&W'2’–b7FfeöÖVÖ&W'2VÇ6R ¢Ö…ö6öÖÖVæFF–öç2ÒÖ‚‚‡5²&6öÖÖVæFF–öåö6÷VçB%Ò÷"f÷"2–â7FfeöÖVÖ&W'2’ÂFVfVÇCÓ¢f÷&ÖGFVE÷7FfbÒµÐ¢f÷"7Ffb–â7FfeöÖVÖ&W'3 ¢f÷&ÖGFVE÷7FfbæVæB‡°¢&–B#¢7Ffe²&–B%ÒÀ¢&æÖR#¢b'·7Ffe²vf—'7EöæÖRu×Ò·7Ffe²vÆ7EöæÖRu×Ò"À¢&f—'7EöæÖR#¢7Ffe²&f—'7EöæÖR%ÒÀ¢&Æ7EöæÖR#¢7Ffe²&Æ7EöæÖR%ÒÀ¢'÷6—F–öâ#¢7Ffe²'÷6—F–öâ%Ò÷"7Ffe²'&öÆR%ÒçF—FÆR‚’À¢&VÖ–Â#¢7FfbævWB‚&VÖ–Â"Â""’÷"""À¢'†öæR#¢7FfbævWB‚'†öæR"Â""’÷"""À¢'†÷Fõ÷W&Â#¢7FfbævWB‚'†÷Fõ÷W&Â"Â""’÷"""À¢'&öÆR#¢7Ffe²'&öÆR%ÒÀ¢'7FGW2#¢7Ffe²'7FGW2%ÒÀ¢&fu÷&F–ær#¢fÆöB‡7Ffe²&fu÷&F–ær%Ò’–b7Ffe²&fu÷&F–ær%ÒVÇ6RãÀ¢&6öÖÖVæFF–öåö6÷VçB#¢7Ffe²&6öÖÖVæFF–öåö6÷VçB%Ò÷"À¢'7F÷&Uö–B#¢7F÷&Uö–@¢Ò¢ ¢&WGW&â§6öæ–g’†f÷&ÖGFVE÷7Ffb¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢2T$Ä”25U%dU¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢ç&÷WFR‚"öF6†&ö&B"ÂÖWF†öG3Õ²$tUB%Ò¢FVbV&Æ–5÷7F÷&UöF6†&ö&E÷7V&FöÖ–â‚“ ¢2W‡G&7B7V&FöÖ–âg&öÒ&WVW7B†÷7@¢†÷7BÒ&WVW7Bæ†÷7Bç7Æ—B‚s¢r•³Ò2&VÖ÷fR÷'B–b&W6Vç@¢'G2Ò†÷7Bç7Æ—B‚râr¢ ¢26†V6²–b66W76–ærf–7V&FöÖ–à¢–bÆVâ‡'G2’ãÒ3 ¢7V&FöÖ–âÒ'G5³Ð¢ ¢2fÆ–FFR7V&FöÖ–âæBfWF6‚7F÷&P¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B–BÂ7F÷&UöæÖRÂFG&W72Â6—G’Â&÷f–æ6RÂ÷7FÅö6öFRÀ¢6öçF7EöçVÖ&W"ÂVÖ–ÂÂ7F÷&UöÖævW%öæÖRÂÖævW%ö6öçF7BÀ¢7F÷&U÷G—RÂ7FGW2ÂÆövõ÷W&À¢e$ôÒ7F÷&W0¢t„U$R7V&FöÖ–âÒW0¢Ä”Ô•B¢"""À¢‡7V&FöÖ–âÂ¢¢7F÷&RÒ7W'6÷"æfWF6†öæR‚¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢–b7F÷&S ¢2fWF6‚7F÷&RW&f÷&Öæ6RFF¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR ¢2F÷FÂfVVF&6²6÷Vç@¢7W'6÷"æW†V7WFR‚%4TÄT5B4õTåB‚¢’2F÷FÂe$ôÒ&W7öç6W2t„U$R7F÷&Uö–BÒW2"Â‡7F÷&U²v–BuÒÂ’¢F÷FÅöfVVF&6²Ò7W'6÷"æfWF6†öæR‚•²wF÷FÂuÐ ¢2fW&vR&F–æp¢7W'6÷"æW†V7WFR‚%4TÄT5Bdr†ç&F–æu÷fÇVR’2fu÷&F–ære$ôÒç7vW'2¤ô”â&W7öç6W2"ôâç&W7öç6Uö–BÒ"æ–Bt„U$R"ç7F÷&Uö–BÒW2äBç&F–æu÷fÇVR•2äõBåTÄÂ"Â‡7F÷&U²v–BuÒÂ’¢fu÷&F–ærÒ7W'6÷"æfWF6†öæR‚•²vfu÷&F–æruÐ ¢2F÷FÂ6öÖÖVæFF–öç0¢7W'6÷"æW†V7WFR‚%4TÄT5B4õTåB‚¢’2F÷FÂe$ôÒ7Ffeö6öÖÖVæFF–öç262¤ô”â&W7öç6W2"ôâ62ç&W7öç6Uö–BÒ"æ–Bt„U$R"ç7F÷&Uö–BÒW2"Â‡7F÷&U²v–BuÒÂ’¢F÷FÅö6öÖÖVæFF–öç2Ò7W'6÷"æfWF6†öæR‚•²wF÷FÂuÐ ¢2F÷FÂ7Ff`¢7W'6÷"æW†V7WFR‚%4TÄT5B4õTåB‚¢’2F÷FÂe$ôÒ7Ffbt„U$R7F÷&Uö–BÒW2"Â‡7F÷&U²v–BuÒÂ’¢F÷FÅ÷7FfbÒ7W'6÷"æfWF6†öæR‚•²wF÷FÂuÐ ¢27FfbW&f÷&Öæ6P¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B2æ–BÂ2æf—'7EöæÖRÂ2æÆ7EöæÖRÂ2ç÷6—F–öâÂ2ç&öÆRÂ2ç7FGW2À¢dr‡62ç&F–ær’2fu÷&F–ærÀ¢4õTåB‡62æ–B’26öÖÖVæFF–öåö6÷Vç@¢e$ôÒ7Ffb0¢ÄTeB¤ô”â7Ffeö6öÖÖVæFF–öç262ôâ2æ–BÒ62ç7Ffeö–@¢ÄTeB¤ô”â&W7öç6W2"ôâ62ç&W7öç6Uö–BÒ"æ–@¢t„U$R2ç7F÷&Uö–BÒW2äB"ç7F÷&Uö–BÒW0¢u$õU%’2æ–BÂ2æf—'7EöæÖRÂ2æÆ7EöæÖRÂ2ç÷6—F–öâÂ2ç&öÆRÂ2ç7FGW0¢õ$DU"%’fu÷&F–ærDU40¢"""À¢‡7F÷&U²v–BuÒÂ7F÷&U²v–BuÒ¢¢7Ffe÷W&f÷&Öæ6RÒ7W'6÷"æfWF6†ÆÂ‚ ¢2&V6VçBfVVF&6°¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5Bç&F–æu÷fÇVR2&F–ærÂæç7vW%÷FW‡B26öÖÖVçBÂ"æ7&VFVEö@¢e$ôÒ&W7öç6W2 ¢ÄTeB¤ô”âç7vW'2ôâ"æ–BÒç&W7öç6Uö–@¢t„U$R"ç7F÷&Uö–BÒW0¢õ$DU"%’"æ7&VFVEöBDU40¢Ä”Ô•B ¢"""À¢‡7F÷&U²v–BuÒÂ¢¢&V6VçEöfVVF&6²Ò7W'6÷"æfWF6†ÆÂ‚ ¢2fWF6‚Ö7FW"VW7F–öææ—&RÆövð¢7W'6÷"æW†V7WFR‚%4TÄT5BÆövõ÷W&Âe$ôÒVW7F–öææ—&W2t„U$R—5÷FV×ÆFRÒäB÷væW%÷W6W%ö–BÒW2äBÆ–6Vç6Uö¶W’ÃÓâW2Ä”Ô•B"Â‡7F÷&U²wW6W%ö–BuÒÂ7F÷&RævWB‚vÆ–6Vç6Uö¶W’r’’¢Ö7FW%öÆövòÒ7W'6÷"æfWF6†öæR‚ ¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢&WGW&â&VæFW%÷FV×ÆFR€¢'V&Æ–2÷7F÷&UöF6†&ö&Bæ‡FÖÂ"À¢7F÷&S×7F÷&RÀ¢Ö7FW%öÆövóÖÖ7FW%öÆövòævWB‚vÆövõ÷W&Âr’–bÖ7FW%öÆövòVÇ6RæöæRÀ¢F÷FÅöfVVF&6³×F÷FÅöfVVF&6²À¢fu÷&F–æsÖfu÷&F–ærÀ¢F÷FÅö6öÖÖVæFF–öç3×F÷FÅö6öÖÖVæFF–öç2À¢F÷FÅ÷7Ffc×F÷FÅ÷7FfbÀ¢7Ffe÷W&f÷&Öæ6S×7Ffe÷W&f÷&Öæ6RÀ¢&V6VçEöfVVF&6³×&V6VçEöfVVF&6°¢¢ ¢2–bæò7V&FöÖ–âÖF6‚Â&VF—&V7BFòÖ–âFöÖ–â÷"6†÷rW'&÷ ¢&WGW&â&VæFW%÷FV×ÆFR‚&Æ–÷WBæ‡FÖÂ"ÂW'&÷#Ò%7F÷&Ræ÷Bf÷VæB÷"–çfÆ–B7V&FöÖ–â"’ÂC@ ¢ç&÷WFR‚"öBóÆ66W75÷Fö¶Vãâ"ÂÖWF†öG3Õ²$tUB%Ò¢FVbV&Æ–5÷7F÷&UöF6†&ö&B†66W75÷Fö¶Vã¢7G"“ ¢2fÆ–FFR66W72Fö¶VâæBfWF6‚7F÷&P¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B–BÂ7F÷&UöæÖRÂFG&W72Â6—G’Â&÷f–æ6RÂ÷7FÅö6öFRÀ¢6öçF7EöçVÖ&W"ÂVÖ–ÂÂ7F÷&UöÖævW%öæÖRÂÖævW%ö6öçF7BÀ¢7F÷&U÷G—RÂ7FGW2ÂÆövõ÷W&À¢e$ôÒ7F÷&W0¢t„U$R66W75÷Fö¶VâÒW0¢Ä”Ô•B¢"""À¢†66W75÷Fö¶VâÂ¢¢7F÷&RÒ7W'6÷"æfWF6†öæR‚¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢–bæ÷B7F÷&S ¢&WGW&â&VæFW%÷FV×ÆFR‚&Æ–÷WBæ‡FÖÂ"ÂW'&÷#Ò$–çfÆ–B66W72Fö¶Vâ÷"7F÷&Ræ÷Bf÷VæB"’ÂC@ ¢2fWF6‚7F÷&RW&f÷&Öæ6RFF¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR ¢2F÷FÂfVVF&6²6÷Vç@¢7W'6÷"æW†V7WFR‚%4TÄT5B4õTåB‚¢’2F÷FÂe$ôÒ&W7öç6W2t„U$R7F÷&Uö–BÒW2"Â‡7F÷&U²v–BuÒÂ’¢F÷FÅöfVVF&6²Ò7W'6÷"æfWF6†öæR‚•²wF÷FÂuÐ ¢2fW&vR&F–æp¢7W'6÷"æW†V7WFR‚%4TÄT5Bdr†ç&F–æu÷fÇVR’2fu÷&F–ære$ôÒç7vW'2¤ô”â&W7öç6W2"ôâç&W7öç6Uö–BÒ"æ–Bt„U$R"ç7F÷&Uö–BÒW2äBç&F–æu÷fÇVR•2äõBåTÄÂ"Â‡7F÷&U²v–BuÒÂ’¢fu÷&F–ærÒ7W'6÷"æfWF6†öæR‚•²vfu÷&F–æruÐ ¢2F÷FÂ6öÖÖVæFF–öç0¢7W'6÷"æW†V7WFR‚%4TÄT5B4õTåB‚¢’2F÷FÂe$ôÒ7Ffeö6öÖÖVæFF–öç262¤ô”â&W7öç6W2"ôâ62ç&W7öç6Uö–BÒ"æ–Bt„U$R"ç7F÷&Uö–BÒW2"Â‡7F÷&U²v–BuÒÂ’¢F÷FÅö6öÖÖVæFF–öç2Ò7W'6÷"æfWF6†öæR‚•²wF÷FÂuÐ ¢2F÷FÂ7Ff`¢7W'6÷"æW†V7WFR‚%4TÄT5B4õTåB‚¢’2F÷FÂe$ôÒ7Ffbt„U$R7F÷&Uö–BÒW2"Â‡7F÷&U²v–BuÒÂ’¢F÷FÅ÷7FfbÒ7W'6÷"æfWF6†öæR‚•²wF÷FÂuÐ ¢27FfbW&f÷&Öæ6P¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B2æ–BÂ2æf—'7EöæÖRÂ2æÆ7EöæÖRÂ2ç÷6—F–öâÂ2ç&öÆRÂ2ç7FGW2À¢dr‡62ç&F–ær’2fu÷&F–ærÀ¢4õTåB‡62æ–B’26öÖÖVæFF–öåö6÷Vç@¢e$ôÒ7Ffb0¢ÄTeB¤ô”â7Ffeö6öÖÖVæFF–öç262ôâ2æ–BÒ62ç7Ffeö–@¢ÄTeB¤ô”â&W7öç6W2"ôâ62ç&W7öç6Uö–BÒ"æ–@¢t„U$R2ç7F÷&Uö–BÒW2äB"ç7F÷&Uö–BÒW0¢u$õU%’2æ–BÂ2æf—'7EöæÖRÂ2æÆ7EöæÖRÂ2ç÷6—F–öâÂ2ç&öÆRÂ2ç7FGW0¢õ$DU"%’fu÷&F–ærDU40¢"""À¢‡7F÷&U²v–BuÒÂ7F÷&U²v–BuÒ¢¢7Ffe÷W&f÷&Öæ6RÒ7W'6÷"æfWF6†ÆÂ‚ ¢2&V6VçBfVVF&6°¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5Bç&F–æu÷fÇVR2&F–ærÂæç7vW%÷FW‡B26öÖÖVçBÂ"æ7&VFVEö@¢e$ôÒ&W7öç6W2 ¢ÄTeB¤ô”âç7vW'2ôâ"æ–BÒç&W7öç6Uö–@¢t„U$R"ç7F÷&Uö–BÒW0¢õ$DU"%’"æ7&VFVEöBDU40¢Ä”Ô•B ¢"""À¢‡7F÷&U²v–BuÒÂ¢¢&V6VçEöfVVF&6²Ò7W'6÷"æfWF6†ÆÂ‚ ¢2fWF6‚Ö7FW"VW7F–öææ—&RÆövð¢7W'6÷"æW†V7WFR‚%4TÄT5BÆövõ÷W&Âe$ôÒVW7F–öææ—&W2t„U$R—5÷FV×ÆFRÒäB÷væW%÷W6W%ö–BÒW2äBÆ–6Vç6Uö¶W’ÃÓâW2Ä”Ô•B"Â‡7F÷&U²wW6W%ö–BuÒÂ7F÷&RævWB‚vÆ–6Vç6Uö¶W’r’’¢Ö7FW%öÆövòÒ7W'6÷"æfWF6†öæR‚ ¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢&WGW&â&VæFW%÷FV×ÆFR€¢'V&Æ–2÷7F÷&UöF6†&ö&Bæ‡FÖÂ"À¢7F÷&S×7F÷&RÀ¢Ö7FW%öÆövóÖÖ7FW%öÆövòævWB‚vÆövõ÷W&Âr’–bÖ7FW%öÆövòVÇ6RæöæRÀ¢F÷FÅöfVVF&6³×F÷FÅöfVVF&6²À¢fu÷&F–æsÖfu÷&F–ærÀ¢F÷FÅö6öÖÖVæFF–öç3×F÷FÅö6öÖÖVæFF–öç2À¢F÷FÅ÷7Ffc×F÷FÅ÷7FfbÀ¢7Ffe÷W&f÷&Öæ6S×7Ffe÷W&f÷&Öæ6RÀ¢&V6VçEöfVVF&6³×&V6VçEöfVVF&6°¢ ¢ç&÷WFR‚"÷2óÆ–çC§7F÷&Uö–Câ"ÂÖWF†öG3Õ²$tUB%Ò¢FVbV&Æ–5÷7W'fW’‡7F÷&Uö–C¢–çB“ ¢7F÷&RÒfWF6…÷7F÷&Uö'•ö–B‡7F÷&Uö–C×7F÷&Uö–B¢–bæ÷B7F÷&S ¢&WGW&â&VæFW%÷FV×ÆFR‚'7W'fW•öW'&÷"æ‡FÖÂ"Â7F÷&SÔæöæRÂW'&÷#Ò%vRæ÷Bf÷VæB"’ÂC@ ¢26†V6²–bÖ7FW"VW7F–öææ—&R—27F—fP¢Ö7FW%÷FV×ÆFRÒfWF6…÷FV×ÆFU÷VW7F–öææ—&R†–çB‡7F÷&U²wW6W%ö–BuÒ’Â7F÷&RævWB‚vÆ–6Vç6Uö¶W’r’¢–bæ÷BÖ7FW%÷FV×ÆFR÷"æ÷BÖ7FW%÷FV×ÆFRævWB‚&—5ö7F—fR"“ ¢&WGW&â&VæFW%÷FV×ÆFR‚'7W'fW•öW'&÷"æ‡FÖÂ"Â7F÷&S×7F÷&RÂW'&÷#Ò%6÷''’ÂF†R7—7FVÒ—2æ÷B66WF–ærç’fVVF&6·2&–v‡Bæ÷r"’ÂC@ ¢VW7F–öææ—&RÒfWF6…÷VW7F–öææ—&Uö'•÷7F÷&R‡7F÷&Uö–C×7F÷&Uö–B¢–bæ÷BVW7F–öææ—&S ¢&WGW&â&VæFW%÷FV×ÆFR€¢'7W'fW•öW'&÷"æ‡FÖÂ"Â7F÷&S×7F÷&RÀ¢W'&÷#Ò%F†—27F÷&RFöW2æ÷B†fRV&Æ—6†VBVW7F–öææ—&R–WBâ ¢’ÂC@¢–bæ÷BVW7F–öææ—&RævWB‚&—5ö7F—fR"“ ¢&WGW&â&VæFW%÷FV×ÆFR‚'7W'fW•öW'&÷"æ‡FÖÂ"Â7F÷&S×7F÷&RÂW'&÷#Ò%6÷''’ÂF†R7—7FVÒ—2æ÷B66WF–ærç’fVVF&6·2&–v‡Bæ÷r"’ÂC@ ¢VW7F–öç2ÒfWF6…÷VW7F–öç5öf÷%÷VW7F–öææ—&R‡VW7F–öææ—&Uö–CÖ–çB‡VW7F–öææ—&U²&–B%Ò’¢VW7F–öåö–G2Ò¶–çB‡²&–B%Ò’f÷"–âVW7F–öç5Ð¢÷F–öç5ö'•÷VW7F–öåö–BÒfWF6…ö÷F–öç5öf÷%÷VW7F–öç2‡VW7F–öåö–G3×VW7F–öåö–G2 ¢2F†R&W7FW&çB÷7F÷&RÆövòÇv—2v–ç2÷fW"FV×ÆFR'&æF–ærà¢Ö7FW%öÆövòÒ7F÷&RævWB‚vÆövõ÷W&Âr’÷"VW7F–öææ—&RævWB‚vÆövõ÷W&Âr’÷"Ö7FW%÷FV×ÆFRævWB‚vÆövõ÷W&Âr¢'&æF–ærÒfWF6…÷FVæçEö'&æF–ær†–çB‡7F÷&U²wW6W%ö–BuÒ’Â7F÷&RævWB‚vÆ–6Vç6Uö¶W’r’ ¢2fWF6‚7F—fR7Ffbf÷"F†—27F÷&P¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢7W'6÷"æW†V7WFR‚"" ¢4TÄT5B–BÂf—'7EöæÖRÂÆ7EöæÖRÂ÷6—F–öâÂ&öÆRÂ†÷Fõ÷W&À¢e$ôÒ7Ff`¢t„U$R7F÷&Uö–BÒW2äB7FGW2Òv7F—fRp¢õ$DU"%’&öÆRDU42ÂÆ7EöæÖRÂf—'7EöæÖP¢"""Â‡7F÷&Uö–BÂ’¢7FfeöÖVÖ&W'2Ò7W'6÷"æfWF6†ÆÂ‚¢7W'6÷"æ6Æ÷6R‚¢6öæâæ6Æ÷6R‚ ¢&WGW&â&VæFW%÷FV×ÆFR€¢&Ö7FW%÷VW7F–öææ—&R÷7W'fW’æ‡FÖÂ"À¢7F÷&S×7F÷&RÀ¢Ö7FW%öÆövóÖÖ7FW%öÆövòÀ¢'&æF–æsÖ'&æF–ærÀ¢VW7F–öææ—&S×VW7F–öææ—&RÀ¢VW7F–öç3×VW7F–öç2À¢÷F–öç5ö'•÷VW7F–öåö–CÖ÷F–öç5ö'•÷VW7F–öåö–BÀ¢7FfeöÖVÖ&W'3×7FfeöÖVÖ&W'2À¢7Ffe÷†÷FõöÖ×·7G"†ÖVÖ&W%²v–BuÒ“¢ÖVÖ&W"ævWB‚w†÷Fõ÷W&Âr’f÷"ÖVÖ&W"–â7FfeöÖVÖ&W'2–bÖVÖ&W"ævWB‚w†÷Fõ÷W&Âr—ÒÀ¢ ¢ç&÷WFR‚"÷2óÆ–çC§7F÷&Uö–Câ÷7V&Ö—B"ÂÖWF†öG3Õ²%õ5B%Ò¢FVb7V&Ö—E÷7W'fW’‡7F÷&Uö–C¢–çB“ ¢7F÷&RÒfWF6…÷7F÷&Uö'•ö–B‡7F÷&Uö–C×7F÷&Uö–B¢–bæ÷B7F÷&S ¢&WGW&â&VæFW%÷FV×ÆFR‚'7W'fW•öW'&÷"æ‡FÖÂ"Â7F÷&SÔæöæRÂW'&÷#Ò%vRæ÷Bf÷VæB"’ÂC@ ¢26†V6²–bÖ7FW"VW7F–öææ—&R—27F—fP¢Ö7FW%÷FV×ÆFRÒfWF6…÷FV×ÆFU÷VW7F–öææ—&R†–çB‡7F÷&U²wW6W%ö–BuÒ’Â7F÷&RævWB‚vÆ–6Vç6Uö¶W’r’¢–bæ÷BÖ7FW%÷FV×ÆFR÷"æ÷BÖ7FW%÷FV×ÆFRævWB‚&—5ö7F—fR"“ ¢&WGW&â&VæFW%÷FV×ÆFR‚'7W'fW•öW'&÷"æ‡FÖÂ"Â7F÷&S×7F÷&RÂW'&÷#Ò%6÷''’ÂF†R7—7FVÒ—2æ÷B66WF–ærç’fVVF&6·2&–v‡Bæ÷r"’ÂC@ ¢VW7F–öææ—&RÒfWF6…÷VW7F–öææ—&Uö'•÷7F÷&R‡7F÷&Uö–C×7F÷&Uö–B¢–bæ÷BVW7F–öææ—&R÷"æ÷BVW7F–öææ—&RævWB‚&—5ö7F—fR"“ ¢&WGW&â&VæFW%÷FV×ÆFR‚'7W'fW•öW'&÷"æ‡FÖÂ"Â7F÷&S×7F÷&RÂW'&÷#Ò%6÷''’ÂF†R7—7FVÒ—2æ÷B66WF–ærç’fVVF&6·2&–v‡Bæ÷r"’ÂC@ ¢VW7F–öç2ÒfWF6…÷VW7F–öç5öf÷%÷VW7F–öææ—&R‡VW7F–öææ—&Uö–CÖ–çB‡VW7F–öææ—&U²&–B%Ò’¢÷F–öç5ö'•÷VW7F–öåö–BÒfWF6…ö÷F–öç5öf÷%÷VW7F–öç2…¶–çB‡²&–B%Ò’f÷"–âVW7F–öç5Ò ¢2vWBæBfÆ–FFR&V6V—BçVÖ&W ¢&V6V—EöçVÖ&W"Ò&WVW7Bæf÷&ÒævWB‚'&V6V—EöçVÖ&W""Â""’ç7G&—‚¢–bæ÷B&V6V—EöçVÖ&W# ¢fÆ6‚‚%&V6V—BõG&ç67F–öâçVÖ&W"—2&WV—&VBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'V&Æ–5÷7W'fW’"Â7F÷&Uö–C×7F÷&Uö–B’¢ ¢2F†R4’÷G&ç67F–öâçVÖ&W"&–çFVBöâF†R&V6V—B—2W†7FÇ’‚F–v—G2à¢–bæ÷B&RægVÆÆÖF6‚‡"uÆG³‡ÒrÂ&V6V—EöçVÖ&W"“ ¢fÆ6‚‚%&V6V—BõG&ç67F–öâçVÖ&W"×W7B6öçF–âW†7FÇ’‚F–v—G2â"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'V&Æ–5÷7W'fW’"Â7F÷&Uö–C×7F÷&Uö–B’ ¢2vWBæBfÆ–FFRVÖ–À¢W6W%öVÖ–ÂÒ&WVW7Bæf÷&ÒævWB‚'W6W%öVÖ–Â"Â""’ç7G&—‚¢–bæ÷BW6W%öVÖ–Ã ¢fÆ6‚‚$VÖ–ÂFG&W72—2&WV—&VBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'V&Æ–5÷7W'fW’"Â7F÷&Uö–C×7F÷&Uö–B’¢ ¢2&6–2VÖ–ÂfÆ–FF–öà¢–b$"æ÷B–âW6W%öVÖ–Â÷""â"æ÷B–âW6W%öVÖ–Âç7Æ—B‚$"•³Ó ¢fÆ6‚‚%ÆV6RVçFW"fÆ–BVÖ–ÂFG&W72â"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'V&Æ–5÷7W'fW’"Â7F÷&Uö–C×7F÷&Uö–B’ ¢W'&÷'3¢Æ—7E·7G%ÒÒµÐ¢ç7vW'5÷Fõ÷6fS¢Æ—7E´F–7E·7G"Âç•ÕÒÒµÐ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢7W'6÷"æW†V7WFR‚""%4TÄT5B–BÂ&öÆRe$ôÒ7Ff`¢t„U$R7F÷&Uö–BÒW2äB7FGW2Òv7F—fRr"""Â‡7F÷&Uö–BÂ’¢VÆ–v–&ÆU÷7FfbÒ¶–çB‡&÷u²v–BuÒ“¢&÷u²w&öÆRuÒf÷"&÷r–â7W'6÷"æfWF6†ÆÂ‚—Ð¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢f÷"–âVW7F–öç3 ¢–BÒ–çB‡²&–B%Ò¢¶W’Òb'÷·–GÒ ¢÷G—RÒ²'VW7F–öå÷G—R%Ð¢—5÷&WV—&VBÒ&ööÂ‡²&—5÷&WV—&VB%Ò¢F&vWE÷66÷RÒævWB‚'F&vWE÷66÷R"’÷"&÷fW&ÆÂ ¢F&vWE÷7Ffeö–BÒæöæP¢–bF&vWE÷66÷R–â‚'7Ffb"Â&ÖævW""“ ¢&u÷F&vWBÒ&WVW7Bæf÷&ÒævWB†b'F&vWE÷·–GÒ"Â""’ç7G&—‚¢–b&u÷F&vWBæ—6F–v—B‚“ ¢6æF–FFUö–BÒ–çB‡&u÷F&vWB¢6æF–FFU÷&öÆRÒVÆ–v–&ÆU÷7FfbævWB†6æF–FFUö–B¢&öÆUöÖF6†W2Ò€¢6æF–FFU÷&öÆRÓÒ&ÖævW""–bF&vWE÷66÷RÓÒ&ÖævW" ¢VÇ6R6æF–FFU÷&öÆR–â‚'7Ffb"Â'7WW'f—6÷""¢¢–b&öÆUöÖF6†W3 ¢F&vWE÷7Ffeö–BÒ6æF–FFUö–@¢–bF&vWE÷7Ffeö–B—2æöæRæB—5÷&WV—&VC ¢W'&÷'2æVæB†b%6VÆV7B·F&vWE÷66÷WÓ¢·²wVW7F–öå÷FW‡Bu×Ò"¢6öçF–çVP ¢–b÷G—RÓÒ'&F–ær# ¢&rÒ&WVW7Bæf÷&ÒævWB†¶W’Â""’ç7G&—‚¢–bæ÷B&s ¢–b—5÷&WV—&VC ¢W'&÷'2æVæB†b%&F–ær&WV—&VC¢·²wVW7F–öå÷FW‡Bu×Ò"¢6öçF–çVP¢G'“ ¢&F–æu÷fÇVRÒ–çB‡&r¢W†6WBfÇVTW'&÷# ¢W'&÷'2æVæB†b$–çfÆ–B&F–æs¢·²wVW7F–öå÷FW‡Bu×Ò"¢6öçF–çVP¢–b&F–æu÷fÇVRÂ÷"&F–æu÷fÇVRâS ¢W'&÷'2æVæB†b%&F–ær×W7B&RÓS¢·²wVW7F–öå÷FW‡Bu×Ò"¢6öçF–çVP¢6öÖÖVçBÒ&WVW7Bæf÷&ÒævWB†b'¶¶W—Õö6öÖÖVçB"Â""’ç7G&—‚¢ç7vW'5÷Fõ÷6fRæVæB€¢²'VW7F–öåö–B#¢–BÂ'7Ffeö–B#¢F&vWE÷7Ffeö–BÂ&ç7vW%÷FW‡B#¢6öÖÖVçB–b6öÖÖVçBVÇ6RæöæRÂ'&F–æu÷fÇVR#¢&F–æu÷fÇVWÐ¢ ¢VÆ–b÷G—RÓÒ'FW‡B# ¢FW‡BÒ&WVW7Bæf÷&ÒævWB†¶W’Â""¢FW‡BÒFW‡Bç7G&—‚¢–bæ÷BFW‡C ¢–b—5÷&WV—&VC ¢W'&÷'2æVæB†b$ç7vW"&WV—&VC¢·²wVW7F–öå÷FW‡Bu×Ò"¢6öçF–çVP¢ç7vW'5÷Fõ÷6fRæVæB‡²'VW7F–öåö–B#¢–BÂ'7Ffeö–B#¢F&vWE÷7Ffeö–BÂ&ç7vW%÷FW‡B#¢FW‡BÂ'&F–æu÷fÇVR#¢æöæWÒ ¢VÆ–b÷G—RÓÒ&×VÇF—ÆUö6†ö–6R# ¢&rÒ&WVW7Bæf÷&ÒævWB†¶W’Â""’ç7G&—‚¢–bæ÷B&s ¢–b—5÷&WV—&VC ¢W'&÷'2æVæB†b$6†ö–6R&WV—&VC¢·²wVW7F–öå÷FW‡Bu×Ò"¢6öçF–çVP ¢G'“ ¢6VÆV7FVEö÷F–öåö–BÒ–çB‡&r¢W†6WBfÇVTW'&÷# ¢W'&÷'2æVæB†b$–çfÆ–B6†ö–6S¢·²wVW7F–öå÷FW‡Bu×Ò"¢6öçF–çVP ¢÷F–öç2Ò÷F–öç5ö'•÷VW7F–öåö–BævWB‡–BÂµÒ¢6VÆV7FVE÷FW‡BÒæöæP¢f÷"÷B–â÷F–öç3 ¢–b–çB†÷E²&–B%Ò’ÓÒ6VÆV7FVEö÷F–öåö–C ¢6VÆV7FVE÷FW‡BÒ÷E²&÷F–öå÷FW‡B%Ð¢'&V° ¢–bæ÷B6VÆV7FVE÷FW‡C ¢W'&÷'2æVæB†b$–çfÆ–B6†ö–6S¢·²wVW7F–öå÷FW‡Bu×Ò"¢6öçF–çVP ¢ç7vW'5÷Fõ÷6fRæVæB€¢²'VW7F–öåö–B#¢–BÂ'7Ffeö–B#¢F&vWE÷7Ffeö–BÂ&ç7vW%÷FW‡B#¢6VÆV7FVE÷FW‡BÂ'&F–æu÷fÇVR#¢æöæWÐ¢¢VÇ6S ¢W'&÷'2æVæB†b%Vç7W÷'FVBVW7F–öâG—S¢·÷G—WÒ" ¢–bW'&÷'3 ¢f÷"R–âW'&÷'5³£UÓ ¢fÆ6‚†RÂ&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'V&Æ–5÷7W'fW’"Â7F÷&Uö–C×7F÷&Uö–B’ ¢÷fW&ÆÅ÷VW7F–öåö–G2Ò¶–çB‡²&–B%Ò’f÷"–âVW7F–öç0¢–b‡ævWB‚'F&vWE÷66÷R"’÷"&÷fW&ÆÂ"’ÓÒ&÷fW&ÆÂ'Ð¢&F–æu÷fÇVW2Ò¶fÆöB†²'&F–æu÷fÇVR%Ò’f÷"–âç7vW'5÷Fõ÷6fP¢–bævWB‚'&F–æu÷fÇVR"’—2æ÷BæöæP¢æB–çB†²'VW7F–öåö–B%Ò’–â÷fW&ÆÅ÷VW7F–öåö–G5Ð¢fW&vU÷&F–ærÒ‡7VÒ‡&F–æu÷fÇVW2’òÆVâ‡&F–æu÷fÇVW2’’–b&F–æu÷fÇVW2VÇ6R ¢&Wv&Eö6Æ–Õ÷Fö¶VâÒæöæP ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢2W6R†–Æ—–æRF–ÖR…UD2³ƒ£¢…÷G¢ÒF–ÖW¦öæR‡F–ÖVFVÇF††÷W'3Ó‚’¢æ÷u÷‚ÒFFWF–ÖRææ÷r‡…÷G¢’ç7G&gF–ÖR‚"U’ÒVÒÒVBTƒ¢TÓ¢U2"¢G'“ ¢7W'6÷"æW†V7WFR€¢""$”å4U%B”åDòvÆö&Å÷&V6V—E÷W6vW2‡&V6V—EöçVÖ&W"Â7F÷&Uö–BÂW6VEöB¢dÅTU2‚W2ÂW2ÂW2’"""À¢‡&V6V—EöçVÖ&W"Â7F÷&Uö–BÂæ÷u÷‚’À¢¢W†6WB×—7Âæ6öææV7F÷"ä–çFVw&—G”W'&÷"2W†3 ¢6öæâç&öÆÆ&6²‚¢–bW†2æW'&æòÓÒc# ¢fÆ6‚‚%F†—2&V6V—BõG&ç67F–öâçVÖ&W"6âöæÇ’&RW6VBöæ6R7&÷72ÆÂ'&æ6†W2æB†2Ç&VG’&VVâ7V&Ö—GFVBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'V&Æ–5÷7W'fW’"Â7F÷&Uö–C×7F÷&Uö–B’¢&—6P¢7W'6÷"æW†V7WFR€¢"" ¢”å4U%B”åDò&W7öç6W2‡VW7F–öææ—&Uö–BÂ7F÷&Uö–BÂW6W%öVÖ–ÂÂ&V6V—EöçVÖ&W"Â7V&Ö—GFVEöB¢dÅTU2‚W2ÂW2ÂW2ÂW2ÂW2¢"""À¢†–çB‡VW7F–öææ—&U²&–B%Ò’Â7F÷&Uö–BÂW6W%öVÖ–ÂÂ&V6V—EöçVÖ&W"Âæ÷u÷‚’À¢¢&W7öç6Uö–BÒ–çB†7W'6÷"æÆ7G&÷v–B¢7W'6÷"æW†V7WFR€¢""%UDDRvÆö&Å÷&V6V—E÷W6vW24UB&W7öç6Uö–BÒW0¢t„U$R&V6V—EöçVÖ&W"ÒW2"""À¢‡&W7öç6Uö–BÂ&V6V—EöçVÖ&W"’À¢ ¢6†÷uövöövÆU÷&Wf–WrÒfW&vU÷&F–ærãÒBæB&ööÂ‡7F÷&RævWB‚&vöövÆU÷&Wf–Wu÷W&Â"’¢–b‡6†÷uövöövÆU÷&Wf–WræB7F÷&RævWB‚&vöövÆU÷&Wf–WuöÖöFR"’ÓÒ'&Wv&B"æBW6W%öVÖ–Â“ ¢&Wv&Eö6Æ–Õ÷Fö¶VâÒ6V7&WG2çFö¶Vå÷W&Ç6fRƒ3"¢7W'6÷"æW†V7WFR€¢""$”å4U%B”åDò&Wf–Wu÷&Wv&G0¢‡&W7öç6Uö–BÂ7F÷&Uö–BÂ÷væW%÷W6W%ö–BÂÆ–6Vç6Uö¶W’À¢7W7FöÖW%öVÖ–ÂÂ6Æ–Õ÷Fö¶VâÂ&Wv&E÷G—RÂ7FGW2¢dÅTU2‚W2ÂW2ÂW2ÂW2ÂW2ÂW2ÂW2ÂwVæF–ærr’"""À¢‡&W7öç6Uö–BÂ7F÷&Uö–BÂ–çB‡7F÷&U²'W6W%ö–B%Ò’Â7F÷&RævWB‚&Æ–6Vç6Uö¶W’"’À¢W6W%öVÖ–ÂÂ&Wv&Eö6Æ–Õ÷Fö¶VâÀ¢7F÷&RævWB‚'&Wv&E÷G—R"’÷"%7F÷&R&Wv&B÷"F—66÷VçB"’À¢ ¢f÷"–âç7vW'5÷Fõ÷6fS ¢7W'6÷"æW†V7WFR€¢"" ¢”å4U%B”åDòç7vW'2‡&W7öç6Uö–BÂVW7F–öåö–BÂ7Ffeö–BÂç7vW%÷FW‡BÂ&F–æu÷fÇVR¢dÅTU2‚W2ÂW2ÂW2ÂW2ÂW2¢"""À¢‡&W7öç6Uö–BÂ²'VW7F–öåö–B%ÒÂævWB‚'7Ffeö–B"’Â²&ç7vW%÷FW‡B%ÒÂ²'&F–æu÷fÇVR%Ò’À¢¢–bævWB‚'7Ffeö–B"’æBævWB‚'&F–æu÷fÇVR"’—2æ÷BæöæS ¢7W'6÷"æW†V7WFR€¢""$”å4U%B”åDò7Ffeö6öÖÖVæFF–öç0¢‡&W7öç6Uö–BÂ7Ffeö–BÂ&F–ærÂ6öÖÖVæFF–öå÷G—RÂ6öÖÖVçB¢dÅTU2‚W2ÂW2ÂW2ÂvW†6VÆÆVçE÷6W'f–6RrÂW2’"""À¢‡&W7öç6Uö–BÂ²'7Ffeö–B%ÒÂ–çB†²'&F–æu÷fÇVR%Ò’ÂævWB‚&ç7vW%÷FW‡B"’’À¢ ¢2†æFÆR7Ffb6öÖÖVæFF–öâ–b&÷f–FV@¢7Ffeö6öÖÖVæFF–öâÒ&WVW7Bæf÷&ÒævWB‚'7Ffeö6öÖÖVæFF–öâ"Â""’ç7G&—‚¢–b7Ffeö6öÖÖVæFF–öâæB7Ffeö6öÖÖVæFF–öâæ—6F–v—B‚“ ¢7Ffeö–BÒ–çB‡7Ffeö6öÖÖVæFF–öâ¢6öÖÖVæFF–öå÷G—RÒ&WVW7Bæf÷&ÒævWB‚&6öÖÖVæFF–öå÷G—R"Â&W†6VÆÆVçE÷6W'f–6R"¢6öÖÖVæFF–öåö6öÖÖVçBÒ&WVW7Bæf÷&ÒævWB‚&6öÖÖVæFF–öåö6öÖÖVçB"Â""’ç7G&—‚¢6öÖÖVæFF–öå÷&F–ærÒ&WVW7Bæf÷&ÒævWB‚&6öÖÖVæFF–öå÷&F–ær"Â#R"’ç7G&—‚¢–bæ÷B6öÖÖVæFF–öå÷&F–ær÷"æ÷B6öÖÖVæFF–öå÷&F–æræ—6F–v—B‚“ ¢6öÖÖVæFF–öå÷&F–ærÒP¢6öÖÖVæFF–öå÷&F–ærÒ–çB†6öÖÖVæFF–öå÷&F–ær¢ ¢2fW&–g’7FfbW†—7G2æB&VÆöæw2FòF†—27F÷&P¢7W'6÷"æW†V7WFR‚%4TÄT5B–Be$ôÒ7Ffbt„U$R–BÒW2äB7F÷&Uö–BÒW2"Â‡7Ffeö–BÂ7F÷&Uö–B’¢–b7W'6÷"æfWF6†öæR‚“ ¢7W'6÷"æW†V7WFR‚"" ¢”å4U%B”åDò7Ffeö6öÖÖVæFF–öç2‡&W7öç6Uö–BÂ7Ffeö–BÂ&F–ærÂ6öÖÖVæFF–öå÷G—RÂ6öÖÖVçB¢dÅTU2‚W2ÂW2ÂW2ÂW2ÂW2¢"""Â‡&W7öç6Uö–BÂ7Ffeö–BÂ6öÖÖVæFF–öå÷&F–ærÂ6öÖÖVæFF–öå÷G—RÂ6öÖÖVæFF–öåö6öÖÖVçB–b6öÖÖVæFF–öåö6öÖÖVçBVÇ6RæöæR’ ¢6öæâæ6öÖÖ—B‚¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢–b&Wv&Eö6Æ–Õ÷Fö¶Vã ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7W'fW•÷F†æµ÷–÷R"Â7F÷&Uö–C×7F÷&Uö–BÀ¢6Æ–Ó×&Wv&Eö6Æ–Õ÷Fö¶VâÂ&Wf–WsÓ’¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7W'fW•÷F†æµ÷–÷R"Â7F÷&Uö–C×7F÷&Uö–BÀ¢&Wf–WsÓ–b6†÷uövöövÆU÷&Wf–WrVÇ6RæöæR’ ¢ç&÷WFR‚"÷2óÆ–çC§7F÷&Uö–Câ÷F†æ·2"ÂÖWF†öG3Õ²$tUB%Ò¢FVb7W'fW•÷F†æµ÷–÷R‡7F÷&Uö–C¢–çB“ ¢7F÷&RÒfWF6…÷7F÷&Uö'•ö–B‡7F÷&Uö–C×7F÷&Uö–B¢–bæ÷B7F÷&S ¢&WGW&â&VæFW%÷FV×ÆFR‚&Æ–÷WBæ‡FÖÂ"Â7F÷&SÔæöæRÂW'&÷#Ò%vRæ÷Bf÷VæB"’ÂC@¢6Æ–Õ÷Fö¶VâÒ&WVW7Bæ&w2ævWB‚&6Æ–Ò"Â""’ç7G&—‚¢&Wv&BÒæöæP¢–b6Æ–Õ÷Fö¶Vã ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢7W'6÷"æW†V7WFR€¢""%4TÄT5B'"æ–BÂ'"ç7FGW2Â'"ç&Wv&Eö6öFRÂ'"ç&Wv&E÷G—RÀ¢"ç&V6V—EöçVÖ&W ¢e$ôÒ&Wf–Wu÷&Wv&G2' ¢¤ô”â&W7öç6W2"ôâ"æ–BÒ'"ç&W7öç6Uö–@¢t„U$R'"ç7F÷&Uö–BÒW2äB'"æ6Æ–Õ÷Fö¶VâÒW2"""À¢‡7F÷&Uö–BÂ6Æ–Õ÷Fö¶Vâ’À¢¢&Wv&BÒ7W'6÷"æfWF6†öæR‚¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢6†÷uövöövÆU÷&Wf–WrÒ&WVW7Bæ&w2ævWB‚'&Wf–Wr"’ÓÒ#"æB&ööÂ‡7F÷&RævWB‚&vöövÆU÷&Wf–Wu÷W&Â"’¢&WGW&â&VæFW%÷FV×ÆFR‚&Ö7FW%÷VW7F–öææ—&R÷F†æµ÷–÷Ræ‡FÖÂ"Â7F÷&S×7F÷&RÀ¢&Wv&C×&Wv&BÂ6Æ–Õ÷Fö¶VãÖ6Æ–Õ÷Fö¶VâÀ¢6†÷uövöövÆU÷&Wf–Ws×6†÷uövöövÆU÷&Wf–Wr ¢ç&÷WFR‚"÷2óÆ–çC§7F÷&Uö–Câ÷&Wf–Wr×&Wv&BóÆ6Æ–Õ÷Fö¶Vãâ"ÂÖWF†öG3Õ²%õ5B%Ò¢FVb6Æ–Õ÷&Wf–Wu÷&Wv&B‡7F÷&Uö–C¢–çBÂ6Æ–Õ÷Fö¶Vã¢7G"“ ¢""$—77VR&Wv&BöæÇ’gFW"WÆöFVB&ööb76W2ô5"FW‡BfÆ–FF–öââ"" ¢&Wf–Wuöf–ÆRÒ&WVW7Bæf–ÆW2ævWB‚&vöövÆU÷&Wf–Wu÷&ööb"¢&Wf–Wuöö7%÷FW‡BÒ&WVW7Bæf÷&ÒævWB‚'&Wf–Wuöö7%÷FW‡B"Â""’ç7G&—‚•³£#Ð ¢FVbfÆ–FFVEö–ÖvUöFF‡WÆöB“ ¢–bæ÷BWÆöB÷"æ÷BWÆöBæf–ÆVæÖS ¢&WGW&âæöæP¢–bWÆöBæÖ–ÖWG—Ræ÷B–â²&–ÖvRö§Vr"Â&–ÖvR÷ær"Â&–ÖvR÷vV''Ó ¢&WGW&âæöæP¢6öçFVçBÒWÆöBç&VBƒ"¢#B¢#B²¢–bæ÷B6öçFVçB÷"ÆVâ†6öçFVçB’â"¢#B¢#C ¢&WGW&âæöæP¢&WGW&âb&FF§·WÆöBæÖ–ÖWG—WÓ¶&6ScBÇ¶&6ScBæ#cFVæ6öFR†6öçFVçB’æFV6öFR‚v66–’r—Ò  ¢&Wf–Wu÷&ööbÒfÆ–FFVEö–ÖvUöFF‡&Wf–Wuöf–ÆR¢–bæ÷B&Wf–Wu÷&ööc ¢fÆ6‚‚%WÆöB6ÆV"vöövÆR&Wf–Wr67&VVç6†÷B…ärÂ¥rÂ÷"tT%²Ö†–×VÒ"Ô"’â"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7W'fW•÷F†æµ÷–÷R"Â7F÷&Uö–C×7F÷&Uö–BÂ6Æ–ÓÖ6Æ–Õ÷Fö¶Vâ’ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢7W'6÷"æW†V7WFR€¢""%4TÄT5B'"â¢Â2ç7F÷&UöæÖRÂ"ç&V6V—EöçVÖ&W ¢e$ôÒ&Wf–Wu÷&Wv&G2' ¢¤ô”â7F÷&W22ôâ2æ–BÒ'"ç7F÷&Uö–@¢¤ô”â&W7öç6W2"ôâ"æ–BÒ'"ç&W7öç6Uö–@¢t„U$R'"ç7F÷&Uö–BÒW2äB'"æ6Æ–Õ÷Fö¶VâÒW2dõ"UDDR"""À¢‡7F÷&Uö–BÂ6Æ–Õ÷Fö¶Vâ’À¢¢&Wv&BÒ7W'6÷"æfWF6†öæR‚¢–bæ÷B&Wv&C ¢&WGW&â$–çfÆ–B÷"W‡—&VB&Wv&B6Æ–Ò"ÂC@¢–b&Wv&E²'7FGW2%ÒÓÒ'VæF–ær# ¢&Wf–Wu÷FW‡EöÆ÷vW"Ò&Wf–Wuöö7%÷FW‡BæÆ÷vW"‚¢&Wf–WuöÖF6†W2Ò‚'&Wf–Wr"–â&Wf–Wu÷FW‡EöÆ÷vW"æ@¢ç’‡FW&Ò–â&Wf–Wu÷FW‡EöÆ÷vW"f÷"FW&Ò–â‚&FöæR"Â'ö–çB"Â'÷7FVB"Â&6öçG&–'WFR"Â'V&Æ—6†VB"’’¢–bæ÷B&Wf–WuöÖF6†W3 ¢6öæâç&öÆÆ&6²‚¢fÆ6‚‚$ô5"fW&–f–6F–öâf–ÆVBâWÆöB6ÆV"gVÆÂ67&VVç6†÷B6†÷v–ærF†R6ö×ÆWFVBvöövÆR&Wf–Wrâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7W'fW•÷F†æµ÷–÷R"Â7F÷&Uö–C×7F÷&Uö–BÂ6Æ–ÓÖ6Æ–Õ÷Fö¶Vâ’ ¢6öFRÒ%%tBÒ"²6V7&WG2çFö¶Våö†W‚ƒR’çWW"‚¢7W'6÷"æW†V7WFR€¢""%UDDR&Wf–Wu÷&Wv&G24UB&Wv&Eö6öFRÒW2Â7FGW2Òv—77VVBrÀ¢vöövÆU÷&Wf–Wu÷&ööbÒW2Â&Wf–Wuöö7%÷FW‡BÒW2À¢&ööe÷fW&–f–VEöBÒäõr‚’Â—77VVEöBÒäõr‚¢t„U$R–BÒW2äB7FGW2ÒwVæF–ærr"""À¢†6öFRÂ&Wf–Wu÷&ööbÂ&Wf–Wuöö7%÷FW‡BÂ–çB‡&Wv&E²&–B%Ò’’À¢¢6öæâæ6öÖÖ—B‚¢&Wv&E²'&Wv&Eö6öFR%ÒÒ6öFP¢&Wv&E²'7FGW2%ÒÒ&—77VVB ¢VÇ6S ¢6öæâæ6öÖÖ—B‚¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢–b&Wv&E²'7FGW2%ÒÓÒ&—77VVB"æBæ÷B&Wv&BævWB‚&VÖ–Å÷6VçB"“ ¢ÖW76vRÒ†b%F†æ²–÷Rf÷"&Wf–Wv–ær·&Wv&E²w7F÷&UöæÖRu×ÒöâvöövÆRâ ¢b%–÷W"Væ—VR&Wv&B6öFR—2·&Wv&E²w&Wv&Eö6öFRu×Òâ ¢b%&Wv&C¢·&Wv&E²w&Wv&E÷G—Ru×Òâ'&–ær–÷W"÷&–v–æÂ&V6V—BæB67&VVç6†÷B ¢b&öbF†—26öFRFòF†R7F÷&Rf÷"fW&–f–6F–öââF†—26öFR6âöæÇ’&R&VFVVÖVBöæ6Râ"¢7V66W72ÂVÖ–ÅöÖW76vRÒVÖ–Åö6öæf–rç6VæEöfVVF&6µ÷&WÇ’€¢FõöVÖ–Ã×&Wv&E²&7W7FöÖW%öVÖ–Â%ÒÀ¢7W7FöÖW%öæÖS×&Wv&E²&7W7FöÖW%öVÖ–Â%Òç7Æ—B‚$"•³Òç&WÆ6R‚"â"Â""’çF—FÆR‚’À¢&WÇ•öÖW76vSÖÖW76vRÀ¢7F÷&UöæÖS×&Wv&E²'7F÷&UöæÖR%ÒÀ¢fVVF&6µ÷7VÖÖ'“Ò$vöövÆR&Wf–Wr&Wv&B"À¢FV×ÆFU÷G—SÒ&&V6–F–öâ"À¢¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢7W'6÷"æW†V7WFR€¢%UDDR&Wf–Wu÷&Wv&G24UBVÖ–Å÷6VçBÒW2ÂVÖ–ÅöW'&÷"ÒW2t„U$R–BÒW2"À¢†&ööÂ‡7V66W72’ÂæöæR–b7V66W72VÇ6R7G"†VÖ–ÅöÖW76vR•³£ÒÂ–çB‡&Wv&E²&–B%Ò’’À¢¢6öæâæ6öÖÖ—B‚¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7W'fW•÷F†æµ÷–÷R"Â7F÷&Uö–C×7F÷&Uö–BÂ6Æ–ÓÖ6Æ–Õ÷Fö¶VâÂ—77VVCÓ’ ¢ç&÷WFR‚"öFÖ–â÷&Wv&G2"ÂÖWF†öG3Õ²$tUB%Ò¢&öÆU÷&WV—&VB‚wW6W"rÂvFÖ–ârÂw7WW&FÖ–âr¢FVbFÖ–å÷&Wv&G2‚“ ¢W6W"ÒvWE÷W6W%ö'•ö–B‡6W76–öå²'W6W%ö–B%Ò¢6V&6‚Ò&WVW7Bæ&w2ævWB‚'6V&6‚"Â""’ç7G&—‚•³£Ð¢7FGW5öf–ÇFW"Ò&WVW7Bæ&w2ævWB‚'7FGW2"Â""’ç7G&—‚’æÆ÷vW"‚¢7F÷&Uöf–ÇFW"Ò&WVW7Bæ&w2ævWB‚'7F÷&R"Â""’ç7G&—‚¢G'“ ¢W%÷vRÒ–çB‡&WVW7Bæ&w2ævWB‚'W%÷vR"Â#’¢W†6WB…G—TW'&÷"ÂfÇVTW'&÷"“ ¢W%÷vRÒ# ¢–bW%÷vRæ÷B–âƒ#ÂSÂ“ ¢W%÷vRÒ# ¢G'“ ¢vRÒÖ‚ƒÂ–çB‡&WVW7Bæ&w2ævWB‚'vR"Â’’¢W†6WB…G—TW'&÷"ÂfÇVTW'&÷"“ ¢vRÒ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢–bW6W%²'&öÆR%ÒÓÒ'7WW&FÖ–â# ¢7W'6÷"æW†V7WFR‚%4TÄT5B¢e$ôÒ7F÷&W2õ$DU"%’7F÷&UöæÖR"¢7F÷&W2Ò7W'6÷"æfWF6†ÆÂ‚¢66÷U÷7ÂÒ#Ò ¢66÷U÷&×2ÒµÐ¢VÆ–bW6W%²'&öÆR%ÒÓÒ'W6W"# ¢76–væVE÷7F÷&Uö–G2ÒvWEö76–væVE÷7F÷&Uö–G2‡W6W%²&–B%Ò¢–b76–væVE÷7F÷&Uö–G3 ¢Æ6V†öÆFW'2Ò"Â"æ¦ö–â…²"W2%Ò¢ÆVâ†76–væVE÷7F÷&Uö–G2’¢7W'6÷"æW†V7WFR€¢b%4TÄT5B¢e$ôÒ7F÷&W2t„U$R–B”â‡·Æ6V†öÆFW'7Ò’õ$DU"%’7F÷&UöæÖR"À¢GWÆR†76–væVE÷7F÷&Uö–G2’À¢¢7F÷&W2Ò7W'6÷"æfWF6†ÆÂ‚¢66÷U÷7ÂÒb''"ç7F÷&Uö–B”â‡·Æ6V†öÆFW'7Ò’ ¢66÷U÷&×2ÒÆ—7B†76–væVE÷7F÷&Uö–G2¢VÇ6S ¢7F÷&W2ÒµÐ¢66÷U÷7ÂÒ#Ò ¢66÷U÷&×2ÒµÐ¢VÇ6S ¢7W'6÷"æW†V7WFR‚%4TÄT5B¢e$ôÒ7F÷&W2t„U$RW6W%ö–BÒW2õ$DU"%’7F÷&UöæÖR"Â‡W6W%²&–B%ÒÂ’¢7F÷&W2Ò7W'6÷"æfWF6†ÆÂ‚¢66÷U÷7ÂÒ''"æ÷væW%÷W6W%ö–BÒW2äB'"æÆ–6Vç6Uö¶W’ÃÓâW2 ¢66÷U÷&×2Ò·W6W%²&–B%ÒÂW6W"ævWB‚&Æ–6Vç6Uö¶W’"•Ð ¢f–ÇFW'2Ò·66÷U÷7ÅÐ¢&×2ÒÆ—7B‡66÷U÷&×2¢–b6V&6ƒ ¢FW&ÒÒb"W·6V&6‡ÒR ¢f–ÇFW'2æVæB‚"‡'"ç&Wv&Eö6öFRÄ”´RW2õ"'"æ7W7FöÖW%öVÖ–ÂÄ”´RW2õ"2ç7F÷&UöæÖRÄ”´RW2õ"'"ç&Wv&E÷G—RÄ”´RW2’"¢&×2æW‡FVæB…·FW&ÒÂFW&ÒÂFW&ÒÂFW&ÕÒ¢–b7FGW5öf–ÇFW"–â²'VæF–ær"Â&—77VVB"Â'W6VB'Ó ¢f–ÇFW'2æVæB‚''"ç7FGW2ÒW2"¢&×2æVæB‡7FGW5öf–ÇFW"¢–b7F÷&Uöf–ÇFW"æ—6F–v—B‚“ ¢f–ÇFW'2æVæB‚''"ç7F÷&Uö–BÒW2"¢&×2æVæB†–çB‡7F÷&Uöf–ÇFW"’ ¢v†W&U÷7ÂÒ"äB"æ¦ö–â†f–ÇFW'2¢7W'6÷"æW†V7WFR†b""%4TÄT5B4õTåB‚¢’2F÷FÀ¢e$ôÒ&Wf–Wu÷&Wv&G2' ¢¤ô”â7F÷&W22ôâ2æ–BÒ'"ç7F÷&Uö–@¢t„U$R·v†W&U÷7ÇÒ"""ÂGWÆR‡&×2’¢F÷FÅ÷&Wv&G2Ò–çB†7W'6÷"æfWF6†öæR‚•²'F÷FÂ%Ò¢F÷FÅ÷vW2ÒÖ‚ƒÂ‡F÷FÅ÷&Wv&G2²W%÷vRÒ’òòW%÷vR¢vRÒÖ–â‡vRÂF÷FÅ÷vW2¢7F'E÷vRÒÖ‚ƒÂvRÒ"¢VæE÷vRÒÖ–â‡F÷FÅ÷vW2ÂvR²"¢öfg6WBÒ‡vRÒ’¢W%÷vP¢7W'6÷"æW†V7WFR†b""%4TÄT5B'"â¢Â2ç7F÷&UöæÖRÂ2ævöövÆU÷&Wf–Wu÷W&À¢e$ôÒ&Wf–Wu÷&Wv&G2' ¢¤ô”â7F÷&W22ôâ2æ–BÒ'"ç7F÷&Uö–@¢t„U$R·v†W&U÷7ÇÐ¢õ$DU"%’'"æ7&VFVEöBDU40¢Ä”Ô•BW2ôde4UBW2"""ÂGWÆR‡&×2²·W%÷vRÂöfg6WEÒ’¢&Wv&G2Ò7W'6÷"æfWF6†ÆÂ‚¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢&WGW&â&VæFW%÷FV×ÆFR€¢&FÖ–â÷&Wv&G2æ‡FÖÂ"Â7F÷&W3×7F÷&W2Â&Wv&G3×&Wv&G2À¢6V&6ƒ×6V&6‚Â7FGW5öf–ÇFW#×7FGW5öf–ÇFW"Â7F÷&Uöf–ÇFW#×7F÷&Uöf–ÇFW"À¢W%÷vS×W%÷vRÂvS×vRÂF÷FÅ÷vW3×F÷FÅ÷vW2À¢F÷FÅ÷&Wv&G3×F÷FÅ÷&Wv&G2Â7F'E÷vS×7F'E÷vRÂVæE÷vSÖVæE÷vRÀ¢ ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2óÆ–çC§7F÷&Uö–Câ÷&Wv&B×6WGF–æw2"ÂÖWF†öG3Õ²%õ5B%Ò¢&öÆU÷&WV—&VB‚vFÖ–ârÂw7WW&FÖ–âr¢FVb6fU÷&Wv&E÷6WGF–æw2‡7F÷&Uö–C¢–çB“ ¢–bæ÷B6åöÖævU÷7F÷&R‡6W76–öå²'W6W%ö–B%ÒÂ7F÷&Uö–B“ ¢fÆ6‚‚%–÷RFöâwB†fRW&Ö—76–öâFòWFFRF†—27F÷&Râ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&FÖ–å÷&Wv&G2"’¢&Wv&E÷G—RÒ&WVW7Bæf÷&ÒævWB‚'&Wv&E÷G—R"Â""’ç7G&—‚¢vöövÆU÷&Wf–WuöÖöFRÒ&WVW7Bæf÷&ÒævWB‚&vöövÆU÷&Wf–WuöÖöFR"Â'&Wv&B"’ç7G&—‚¢–bvöövÆU÷&Wf–WuöÖöFRæ÷B–â²'&Wf–WuööæÇ’"Â'&Wv&B'Ó ¢vöövÆU÷&Wf–WuöÖöFRÒ'&Wv&B ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢7W'6÷"æW†V7WFR‚%UDDR7F÷&W24UB&Wv&E÷G—RÒW2ÂvöövÆU÷&Wf–WuöÖöFRÒW2t„U$R–BÒW2"À¢‡&Wv&E÷G—R÷"%7F÷&R&Wv&B÷"F—66÷VçB"ÂvöövÆU÷&Wf–WuöÖöFRÂ7F÷&Uö–B’¢6öæâæ6öÖÖ—B‚¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢fÆ6‚‚$vöövÆR&Wf–Wr÷F–öâ6fVBâ"Â'7V66W72"¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&FÖ–å÷&Wv&G2"’ ¢ç&÷WFR‚"öFÖ–â÷&Wv&G2óÆ–çC§&Wv&Eö–Câ÷W6R"ÂÖWF†öG3Õ²%õ5B%Ò¢&öÆU÷&WV—&VB‚wW6W"rÂvFÖ–ârÂw7WW&FÖ–âr¢FVbW6U÷&Wf–Wu÷&Wv&B‡&Wv&Eö–C¢–çB“ ¢W6W"ÒvWE÷W6W%ö'•ö–B‡6W76–öå²'W6W%ö–B%Ò¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢–bW6W%²'&öÆR%ÒÓÒ'7WW&FÖ–â# ¢7W'6÷"æW†V7WFR‚%UDDR&Wf–Wu÷&Wv&G24UB7FGW3ÒwW6VBrÂW6VEöCÔäõr‚’t„U$R–CÒW2äB7FGW3Òv—77VVBr"Â‡&Wv&Eö–BÂ’¢VÆ–bW6W%²'&öÆR%ÒÓÒ'W6W"# ¢7W'6÷"æW†V7WFR€¢""%UDDR&Wf–Wu÷&Wv&G2' ¢4UB'"ç7FGW3ÒwW6VBrÂ'"çW6VEöCÔäõr‚¢t„U$R'"æ–CÒW2äB'"ç7FGW3Òv—77VVBp¢äBU„•5E2€¢4TÄT5Be$ôÒW6W%÷7F÷&W2W0¢t„U$RW2çW6W%ö–CÒW2äBW2ç7F÷&Uö–C×'"ç7F÷&Uö–@¢’"""À¢‡&Wv&Eö–BÂW6W%²&–B%Ò’À¢¢VÇ6S ¢7W'6÷"æW†V7WFR‚""%UDDR&Wf–Wu÷&Wv&G24UB7FGW3ÒwW6VBrÂW6VEöCÔäõr‚¢t„U$R–CÒW2äB÷væW%÷W6W%ö–CÒW2äBÆ–6Vç6Uö¶W’ÃÓâW2äB7FGW3Òv—77VVBr"""À¢‡&Wv&Eö–BÂW6W%²&–B%ÒÂW6W"ævWB‚&Æ–6Vç6Uö¶W’"’’¢6öæâæ6öÖÖ—B‚¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢fÆ6‚‚%&Wv&B6öFRÖ&¶VB2W6VBâ"Â'7V66W72"¢&VF—&V7E÷&×2Ò°¢'6V&6‚#¢&WVW7Bæf÷&ÒævWB‚'6V&6‚"Â""’ç7G&—‚•³£ÒÀ¢'7FGW2#¢&WVW7Bæf÷&ÒævWB‚'7FGW2"Â""’ç7G&—‚’æÆ÷vW"‚’À¢'7F÷&R#¢&WVW7Bæf÷&ÒævWB‚'7F÷&R"Â""’ç7G&—‚’À¢'W%÷vR#¢&WVW7Bæf÷&ÒævWB‚'W%÷vR"Â##"’ç7G&—‚’À¢'vR#¢&WVW7Bæf÷&ÒævWB‚'vR"Â#"’ç7G&—‚’À¢Ð¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&FÖ–å÷&Wv&G2"Â¢§&VF—&V7E÷&×2’ ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2öFB"ÂÖWF†öG3Õ²%õ5B%Ò¢Æöv–å÷&WV—&V@¢FVbFE÷7F÷&R‚“ ¢7F÷&UöæÖRÒ&WVW7Bæf÷&ÒævWB‚'7F÷&UöæÖR"Â""’ç7G&—‚¢FG&W72Ò&WVW7Bæf÷&ÒævWB‚&FG&W72"Â""’ç7G&—‚¢6—G’Ò&WVW7Bæf÷&ÒævWB‚&6—G’"Â""’ç7G&—‚¢&÷f–æ6RÒ&WVW7Bæf÷&ÒævWB‚'&÷f–æ6R"Â""’ç7G&—‚¢÷7FÅö6öFRÒ&WVW7Bæf÷&ÒævWB‚'÷7FÅö6öFR"Â""’ç7G&—‚¢6öçF7EöçVÖ&W"Ò&WVW7Bæf÷&ÒævWB‚&6öçF7EöçVÖ&W""Â""’ç7G&—‚¢VÖ–ÂÒ&WVW7Bæf÷&ÒævWB‚&VÖ–Â"Â""’ç7G&—‚¢7F÷&UöÖævW%öæÖRÒ&WVW7Bæf÷&ÒævWB‚'7F÷&UöÖævW%öæÖR"Â""’ç7G&—‚¢ÖævW%ö6öçF7BÒ&WVW7Bæf÷&ÒævWB‚&ÖævW%ö6öçF7B"Â""’ç7G&—‚¢7F÷&U÷G—RÒ&WVW7Bæf÷&ÒævWB‚'7F÷&U÷G—R"Â""’ç7G&—‚¢7FGW2Ò&WVW7Bæf÷&ÒævWB‚'7FGW2"Â&7F—fR"¢vöövÆU÷&Wf–Wu÷W&ÂÒ&WVW7Bæf÷&ÒævWB‚&vöövÆU÷&Wf–Wu÷W&Â"Â""’ç7G&—‚¢vöövÆU÷&Wf–WuöÖöFRÒ&WVW7Bæf÷&ÒævWB‚&vöövÆU÷&Wf–WuöÖöFR"Â'&Wv&B"’ç7G&—‚¢–bvöövÆU÷&Wf–WuöÖöFRæ÷B–â²'&Wf–WuööæÇ’"Â'&Wv&B'Ó ¢vöövÆU÷&Wf–WuöÖöFRÒ'&Wv&B  ¢–bæ÷B7F÷&UöæÖS ¢fÆ6‚‚%7F÷&RæÖR—2&WV—&VBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’ ¢2&6–2VÖ–ÂfÆ–FF–öâ–b&÷f–FV@¢–bVÖ–ÂæB‚$"æ÷B–âVÖ–Â÷""â"æ÷B–âVÖ–Âç7Æ—B‚$"•³Ò“ ¢fÆ6‚‚%ÆV6RVçFW"fÆ–BVÖ–ÂFG&W72â"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢–bvöövÆU÷&Wf–Wu÷W&ÂæBæ÷BvöövÆU÷&Wf–Wu÷W&Âç7F'G7v—F‚‚&‡GG3¢òò"“ ¢fÆ6‚‚$vöövÆR&Wf–WrÆ–æ²×W7B7F'Bv—F‚‡GG3¢òò"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’ ¢26†V6²7F÷&RÆ–Ö—B&6VBöâW6W"&öÆRæBÖVÖ&W'6†— ¢W6W"ÒvWE÷W6W%ö'•ö–B‡6W76–öå²wW6W%ö–BuÒ¢ ¢–bW6W%²w&öÆRuÒÓÒvFÖ–âs ¢26Æ–VçB66÷VçBÒ6†V6²–bÆ–6Vç6R—26öæf–wW&V@¢–bæ÷BW6W"ævWB‚vÆ–6Vç6Uö¶W’r“ ¢fÆ6‚‚%ÆV6R6öæf–wW&R–÷W"Æ–6Vç6R¶W’f—'7Bâ6öçF7B–÷W"FÖ–æ—7G&F÷"f÷"–÷W"Æ–6Vç6R¶W’â"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&6Æ–VçEöÆ–6Vç6Uö6öæf–r"’¢ ¢2fÆ–FFRÆ–6Vç6Rv–ç7B÷'FÂæBvWBÖ…÷7F÷&W0¢6öæf–rÒvWEöÆ–6Vç6Uö6öæf–r‚¢÷'FÅ÷W&ÂÒæ÷&ÖÆ—¦U÷÷'FÅ÷W&Â†6öæf–rævWB‚&Æ–6Vç6–æu÷÷'FÅ÷W&Â"’–b6öæf–rVÇ6RæöæR¢ ¢G'“ ¢–×÷'B&WVW7G0¢&W7öç6RÒ&WVW7G2ç÷7B€¢b'·÷'FÅ÷W&ÇÒö’÷fÆ–FFR÷·W6W%²vÆ–6Vç6Uö¶W’u×Ò"À¢†VFW'3ÖÆ–6Vç6–æuö•ö†VFW'2‚’À¢F–ÖV÷WCÓ ¢¢ ¢ÆövvW"æ–æfò†b$Æ–6Vç6RfÆ–FF–öâ&W7öç6R7FGW3¢·&W7öç6Rç7FGW5ö6öFWÒ"¢ ¢–b&W7öç6Rç7FGW5ö6öFRÒ#÷"æ÷B&W7öç6Ræ§6öâ‚’ævWB‚'fÆ–B"“ ¢fÆ6‚‚$–çfÆ–BÆ–6Vç6RâÆV6R6öçF7B–÷W"FÖ–æ—7G&F÷"â"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&6Æ–VçEöÆ–6Vç6Uö6öæf–r"’¢ ¢Æ–6Vç6UöFFÒ&W7öç6Ræ§6öâ‚¢Ö…÷7F÷&W2ÒÆ–6Vç6UöFFævWB‚&Ö…÷7F÷&W2"Â¢ÆövvW"æ–æfò†b$Æ–6Vç6RFF¢¶Æ–6Vç6UöFFÒ"¢ ¢–bÖ…÷7F÷&W2â ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢7W'6÷"æW†V7WFR‚%4TÄT5B4õTåB‚¢’e$ôÒ7F÷&W2t„U$RW6W%ö–BÒW2"Â‡6W76–öå²wW6W%ö–BuÒÂ’¢7W'&VçEö6÷VçBÒ7W'6÷"æfWF6†öæR‚•³Ð¢ ¢7W'6÷"æW†V7WFR‚%4TÄT5B4õTåB‚¢’e$ôÒ7F÷&W2"¢F÷FÅ÷7F÷&W2Ò7W'6÷"æfWF6†öæR‚•³Ð¢ ¢–b7W'&VçEö6÷VçBãÒÖ…÷7F÷&W3 ¢fÆ6‚†b%–÷W"Æ–6Vç6RÆ–Ö—B&V6†VBâ–÷R6âöæÇ’7&VFRWFò¶Ö…÷7F÷&W7Ò7F÷&W2â6öçF7B7W÷'BFòWw&FRâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"fÆ–FF–ærÆ–6Vç6S¢¶WÒ"¢fÆ6‚‚%Væ&ÆRFòfÆ–FFRÆ–6Vç6RâÆV6RG'’v–âÆFW"â"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢VÆ–bW6W%²w&öÆRuÒÒw7WW&FÖ–âs ¢fÆ6‚‚%–÷RFöâwB†fRW&Ö—76–öâFòFB7F÷&W2â"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’ ¢2†æFÆRÆövòWÆö@¢Æövõ÷W&ÂÒæöæP¢–bvÆövòr–â&WVW7Bæf–ÆW3 ¢Æövõöf–ÆRÒ&WVW7Bæf–ÆW5²vÆövòuÐ¢–bÆövõöf–ÆRæBÆövõöf–ÆRæf–ÆVæÖS ¢2fÆ–FFRf–ÆRG—P¢ÆÆ÷vVEöW‡FVç6–öç2Ò²wærrÂv§rrÂv§VrwÐ¢–brâræ÷B–âÆövõöf–ÆRæf–ÆVæÖR÷"Æövõöf–ÆRæf–ÆVæÖRç'7Æ—B‚rârÂ•³ÒæÆ÷vW"‚’æ÷B–âÆÆ÷vVEöW‡FVç6–öç3 ¢fÆ6‚‚$–çfÆ–Bf–ÆRG—RâöæÇ’ärÂ¥rÂæB¥Trf–ÆW2&RÆÆ÷vVBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢ ¢2fÆ–FFRf–ÆR6—¦RƒTÔ"Ö‚¢Æövõöf–ÆRç6VV²ƒÂ÷2å4TTµôTäB¢f–ÆU÷6—¦RÒÆövõöf–ÆRçFVÆÂ‚¢Æövõöf–ÆRç6VV²ƒ¢–bf–ÆU÷6—¦RâR¢#B¢#C ¢fÆ6‚‚$f–ÆR6—¦RW†6VVG2TÔ"Æ–Ö—Bâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢ ¢–×÷'B&6Sc@¢W‡BÒÆövõöf–ÆRæf–ÆVæÖRç'7Æ—B‚rârÂ•³ÒæÆ÷vW"‚¢Ö–ÖRÒ&–ÖvRö§Vr"–bW‡B–â‚v§rrÂv§Vrr’VÇ6R&–ÖvR÷ær ¢Æövõ÷W&ÂÒb&FF§¶Ö–ÖWÓ¶&6ScBÇ¶&6ScBæ#cFVæ6öFR†Æövõöf–ÆRç&VB‚’’æFV6öFR‚wWFbÓ‚r—Ò  ¢æWu÷7F÷&Uö–BÒ7&VFU÷7F÷&R€¢7F÷&UöæÖS×7F÷&UöæÖRÀ¢FG&W73ÖFG&W72–bFG&W72VÇ6RæöæRÀ¢6—G“Ö6—G’–b6—G’VÇ6RæöæRÀ¢&÷f–æ6S×&÷f–æ6R–b&÷f–æ6RVÇ6RæöæRÀ¢÷7FÅö6öFS×÷7FÅö6öFR–b÷7FÅö6öFRVÇ6RæöæRÀ¢6öçF7EöçVÖ&W#Ö6öçF7EöçVÖ&W"–b6öçF7EöçVÖ&W"VÇ6RæöæRÀ¢VÖ–ÃÖVÖ–Â–bVÖ–ÂVÇ6RæöæRÀ¢7F÷&UöÖævW%öæÖS×7F÷&UöÖævW%öæÖR–b7F÷&UöÖævW%öæÖRVÇ6RæöæRÀ¢ÖævW%ö6öçF7CÖÖævW%ö6öçF7B–bÖævW%ö6öçF7BVÇ6RæöæRÀ¢7F÷&U÷G—S×7F÷&U÷G—R–b7F÷&U÷G—RVÇ6RæöæRÀ¢7FGW3×7FGW2À¢Æövõ÷W&ÃÖÆövõ÷W&ÂÀ¢vöövÆU÷&Wf–Wu÷W&ÃÖvöövÆU÷&Wf–Wu÷W&Â÷"æöæRÀ¢vöövÆU÷&Wf–WuöÖöFSÖvöövÆU÷&Wf–WuöÖöFRÀ¢W6W%ö–C×6W76–öâævWB‚wW6W%ö–Br’À¢Æ–6Vç6Uö¶W“×W6W"ævWB‚vÆ–6Vç6Uö¶W’r¢¢ ¢ÆövvW"æ–æfò†b$7&VFVB7F÷&R¶æWu÷7F÷&Uö–GÒf÷"W6W"·6W76–öâævWB‚wW6W%ö–Br—Ò"¢ ¢2ÆörF†R7F÷&RFF—F–öà¢ÆöuöVF—B€¢VçF—G•÷G—SÒ'7F÷&R"À¢VçF—G•ö–CÖæWu÷7F÷&Uö–BÀ¢7F–öãÒ&7&VFVB"À¢æWu÷fÇVW3Öb%7F÷&RæÖS¢·7F÷&UöæÖWÒÂFG&W73¢¶FG&W77ÒÂ6—G“¢¶6—G—ÒÂ7FGW3¢·7FGW7Ò ¢¢ ¢fÆ6‚†b%7F÷&RÂ'·7F÷&UöæÖWÕÂ"FFVB7V66W76gVÆÇ’"Â'7V66W72"¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’ ¢FVbWFFU÷7F÷&R€¢7F÷&Uö–C¢–çBÀ¢7F÷&UöæÖS¢7G"À¢7F÷&U÷G—S¢7G"ÂæöæRÀ¢FG&W73¢7G"ÂæöæRÀ¢6—G“¢7G"ÂæöæRÀ¢&÷f–æ6S¢7G"ÂæöæRÀ¢÷7FÅö6öFS¢7G"ÂæöæRÀ¢6öçF7EöçVÖ&W#¢7G"ÂæöæRÀ¢VÖ–Ã¢7G"ÂæöæRÀ¢7F÷&UöÖævW%öæÖS¢7G"ÂæöæRÀ¢ÖævW%ö6öçF7C¢7G"ÂæöæRÀ¢7FGW3¢7G"À¢Æövõ÷W&Ã¢7G"ÂæöæRÒæöæRÀ¢vöövÆU÷&Wf–Wu÷W&Ã¢7G"ÂæöæRÒæöæRÀ¢vöövÆU÷&Wf–WuöÖöFS¢7G"Ò'&Wv&B ¢’Óâ&ööÃ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢7W'6÷"æW†V7WFR€¢"" ¢UDDR7F÷&W0¢4UB7F÷&UöæÖRÒW2Â7F÷&U÷G—RÒW2ÂFG&W72ÒW2Â6—G’ÒW2À¢&÷f–æ6RÒW2Â÷7FÅö6öFRÒW2Â6öçF7EöçVÖ&W"ÒW2À¢VÖ–ÂÒW2Â7F÷&UöÖævW%öæÖRÒW2ÂÖævW%ö6öçF7BÒW2À¢7FGW2ÒW2ÂÆövõ÷W&ÂÒ4ôÄU44R‚W2ÂÆövõ÷W&Â’ÂvöövÆU÷&Wf–Wu÷W&ÂÒW2À¢vöövÆU÷&Wf–WuöÖöFRÒW0¢t„U$R–BÒW0¢"""À¢€¢7F÷&UöæÖRÀ¢7F÷&U÷G—RÀ¢FG&W72À¢6—G’À¢&÷f–æ6RÀ¢÷7FÅö6öFRÀ¢6öçF7EöçVÖ&W"À¢VÖ–ÂÀ¢7F÷&UöÖævW%öæÖRÀ¢ÖævW%ö6öçF7BÀ¢7FGW2À¢Æövõ÷W&ÂÀ¢vöövÆU÷&Wf–Wu÷W&ÂÀ¢vöövÆU÷&Wf–WuöÖöFRÀ¢7F÷&Uö–BÀ¢’À¢¢6öæâæ6öÖÖ—B‚¢&WGW&â7W'6÷"ç&÷v6÷VçBâ ¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2óÆ–çC§7F÷&Uö–Câ÷WÆöBÖÆövò"ÂÖWF†öG3Õ²%õ5B%Ò¢Æöv–å÷&WV—&V@¢FVbWÆöE÷7F÷&UöÆövò‡7F÷&Uö–C¢–çB“ ¢–bæ÷B6åöÖævU÷7F÷&R‡6W76–öå²wW6W%ö–BuÒÂ7F÷&Uö–B“ ¢fÆ6‚‚%–÷RFöâwB†fRW&Ö—76–öâFòWFFRF†—27F÷&Râ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢2†æFÆRÆövòWÆöBöæÇ¢Æövõ÷W&ÂÒæöæP¢–bvÆövòr–â&WVW7Bæf–ÆW3 ¢Æövõöf–ÆRÒ&WVW7Bæf–ÆW5²vÆövòuÐ¢–bÆövõöf–ÆRæBÆövõöf–ÆRæf–ÆVæÖS ¢2fÆ–FFRf–ÆRG—P¢ÆÆ÷vVEöW‡FVç6–öç2Ò²wærrÂv§rrÂv§VrwÐ¢–brâræ÷B–âÆövõöf–ÆRæf–ÆVæÖR÷"Æövõöf–ÆRæf–ÆVæÖRç'7Æ—B‚rârÂ•³ÒæÆ÷vW"‚’æ÷B–âÆÆ÷vVEöW‡FVç6–öç3 ¢fÆ6‚‚$–çfÆ–Bf–ÆRG—RâöæÇ’ärÂ¥rÂæB¥Trf–ÆW2&RÆÆ÷vVBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöFWF–Ç2"Â7F÷&Uö–C×7F÷&Uö–B’¢ ¢2fÆ–FFRf–ÆR6—¦RƒTÔ"Ö‚¢Æövõöf–ÆRç6VV²ƒÂ÷2å4TTµôTäB¢f–ÆU÷6—¦RÒÆövõöf–ÆRçFVÆÂ‚¢Æövõöf–ÆRç6VV²ƒ¢–bf–ÆU÷6—¦RâR¢#B¢#C ¢fÆ6‚‚$f–ÆR6—¦RW†6VVG2TÔ"Æ–Ö—Bâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöFWF–Ç2"Â7F÷&Uö–C×7F÷&Uö–B’¢ ¢–×÷'B&6Sc@¢W‡BÒÆövõöf–ÆRæf–ÆVæÖRç'7Æ—B‚rârÂ•³ÒæÆ÷vW"‚¢Ö–ÖRÒ&–ÖvRö§Vr"–bW‡B–â‚v§rrÂv§Vrr’VÇ6R&–ÖvR÷ær ¢Æövõ÷W&ÂÒb&FF§¶Ö–ÖWÓ¶&6ScBÇ¶&6ScBæ#cFVæ6öFR†Æövõöf–ÆRç&VB‚’’æFV6öFR‚wWFbÓ‚r—Ò  ¢2WFFRöæÇ’F†RÆövõ÷W&Â–âF†RFF&6P¢–bÆövõ÷W&Ã ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢7W'6÷"æW†V7WFR‚%UDDR7F÷&W24UBÆövõ÷W&ÂÒW2t„U$R–BÒW2"Â†Æövõ÷W&ÂÂ7F÷&Uö–B’¢6öæâæ6öÖÖ—B‚¢fÆ6‚‚$ÆövòWÆöFVB7V66W76gVÆÇ’"Â'7V66W72"¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"WÆöF–ærÆövó¢¶WÒ"¢fÆ6‚†b$W'&÷"WÆöF–ærÆövó¢¶WÒ"Â&FævW""¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢VÇ6S ¢fÆ6‚‚$æòf–ÆR6VÆV7FVB"Â'v&æ–ær" ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöFWF–Ç2"Â7F÷&Uö–C×7F÷&Uö–B’ ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2óÆ–çC§7F÷&Uö–CâöVF—B"ÂÖWF†öG3Õ²%õ5B%Ò¢Æöv–å÷&WV—&V@¢FVbVF—E÷7F÷&R‡7F÷&Uö–C¢–çB“ ¢–bæ÷B6åöÖævU÷7F÷&R‡6W76–öå²wW6W%ö–BuÒÂ7F÷&Uö–B“ ¢fÆ6‚‚%–÷RFöâwB†fRW&Ö—76–öâFòVF—BF†—27F÷&Râ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢7F÷&UöæÖRÒ&WVW7Bæf÷&ÒævWB‚'7F÷&UöæÖR"Â""’ç7G&—‚¢7F÷&U÷G—RÒ&WVW7Bæf÷&ÒævWB‚'7F÷&U÷G—R"Â""’ç7G&—‚’÷"æöæP¢FG&W72Ò&WVW7Bæf÷&ÒævWB‚&FG&W72"Â""’ç7G&—‚’÷"æöæP¢6—G’Ò&WVW7Bæf÷&ÒævWB‚&6—G’"Â""’ç7G&—‚’÷"æöæP¢&÷f–æ6RÒ&WVW7Bæf÷&ÒævWB‚'&÷f–æ6R"Â""’ç7G&—‚’÷"æöæP¢÷7FÅö6öFRÒ&WVW7Bæf÷&ÒævWB‚'÷7FÅö6öFR"Â""’ç7G&—‚’÷"æöæP¢6öçF7EöçVÖ&W"Ò&WVW7Bæf÷&ÒævWB‚&6öçF7EöçVÖ&W""Â""’ç7G&—‚’÷"æöæP¢VÖ–ÂÒ&WVW7Bæf÷&ÒævWB‚&VÖ–Â"Â""’ç7G&—‚’÷"æöæP¢7F÷&UöÖævW%öæÖRÒ&WVW7Bæf÷&ÒævWB‚'7F÷&UöÖævW%öæÖR"Â""’ç7G&—‚’÷"æöæP¢ÖævW%ö6öçF7BÒ&WVW7Bæf÷&ÒævWB‚&ÖævW%ö6öçF7B"Â""’ç7G&—‚’÷"æöæP¢7FGW2Ò&WVW7Bæf÷&ÒævWB‚'7FGW2"Â&7F—fR"¢vöövÆU÷&Wf–Wu÷W&ÂÒ&WVW7Bæf÷&ÒævWB‚&vöövÆU÷&Wf–Wu÷W&Â"Â""’ç7G&—‚¢vöövÆU÷&Wf–WuöÖöFRÒ&WVW7Bæf÷&ÒævWB‚&vöövÆU÷&Wf–WuöÖöFR"Â'&Wv&B"’ç7G&—‚¢–bvöövÆU÷&Wf–WuöÖöFRæ÷B–â²'&Wf–WuööæÇ’"Â'&Wv&B'Ó ¢vöövÆU÷&Wf–WuöÖöFRÒ'&Wv&B  ¢–bæ÷B7F÷&UöæÖS ¢fÆ6‚‚%7F÷&RæÖR—2&WV—&VBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢–bvöövÆU÷&Wf–Wu÷W&ÂæBæ÷BvöövÆU÷&Wf–Wu÷W&Âç7F'G7v—F‚‚&‡GG3¢òò"“ ¢fÆ6‚‚$vöövÆR&Wf–WrÆ–æ²×W7B7F'Bv—F‚‡GG3¢òò"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’ ¢2†æFÆRÆövòWÆö@¢Æövõ÷W&ÂÒæöæP¢–bvÆövòr–â&WVW7Bæf–ÆW3 ¢Æövõöf–ÆRÒ&WVW7Bæf–ÆW5²vÆövòuÐ¢–bÆövõöf–ÆRæBÆövõöf–ÆRæf–ÆVæÖS ¢2fÆ–FFRf–ÆRG—P¢ÆÆ÷vVEöW‡FVç6–öç2Ò²wærrÂv§rrÂv§VrwÐ¢–brâræ÷B–âÆövõöf–ÆRæf–ÆVæÖR÷"Æövõöf–ÆRæf–ÆVæÖRç'7Æ—B‚rârÂ•³ÒæÆ÷vW"‚’æ÷B–âÆÆ÷vVEöW‡FVç6–öç3 ¢fÆ6‚‚$–çfÆ–Bf–ÆRG—RâöæÇ’ärÂ¥rÂæB¥Trf–ÆW2&RÆÆ÷vVBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢ ¢2fÆ–FFRf–ÆR6—¦RƒTÔ"Ö‚¢Æövõöf–ÆRç6VV²ƒÂ÷2å4TTµôTäB¢f–ÆU÷6—¦RÒÆövõöf–ÆRçFVÆÂ‚¢Æövõöf–ÆRç6VV²ƒ¢–bf–ÆU÷6—¦RâR¢#B¢#C ¢fÆ6‚‚$f–ÆR6—¦RW†6VVG2TÔ"Æ–Ö—Bâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢ ¢–×÷'B&6Sc@¢W‡BÒÆövõöf–ÆRæf–ÆVæÖRç'7Æ—B‚rârÂ•³ÒæÆ÷vW"‚¢Ö–ÖRÒ&–ÖvRö§Vr"–bW‡B–â‚v§rrÂv§Vrr’VÇ6R&–ÖvR÷ær ¢Æövõ÷W&ÂÒb&FF§¶Ö–ÖWÓ¶&6ScBÇ¶&6ScBæ#cFVæ6öFR†Æövõöf–ÆRç&VB‚’’æFV6öFR‚wWFbÓ‚r—Ò  ¢7V66W72ÒWFFU÷7F÷&R€¢7F÷&Uö–C×7F÷&Uö–BÀ¢7F÷&UöæÖS×7F÷&UöæÖRÀ¢7F÷&U÷G—S×7F÷&U÷G—RÀ¢FG&W73ÖFG&W72À¢6—G“Ö6—G’À¢&÷f–æ6S×&÷f–æ6RÀ¢÷7FÅö6öFS×÷7FÅö6öFRÀ¢6öçF7EöçVÖ&W#Ö6öçF7EöçVÖ&W"À¢VÖ–ÃÖVÖ–ÂÀ¢7F÷&UöÖævW%öæÖS×7F÷&UöÖævW%öæÖRÀ¢ÖævW%ö6öçF7CÖÖævW%ö6öçF7BÀ¢7FGW3×7FGW2À¢Æövõ÷W&ÃÖÆövõ÷W&ÂÀ¢vöövÆU÷&Wf–Wu÷W&ÃÖvöövÆU÷&Wf–Wu÷W&Â÷"æöæRÀ¢vöövÆU÷&Wf–WuöÖöFSÖvöövÆU÷&Wf–WuöÖöFP¢ ¢–b7V66W73 ¢2ÆörF†R7F÷&RVF—@¢ÆöuöVF—B€¢VçF—G•÷G—SÒ'7F÷&R"À¢VçF—G•ö–C×7F÷&Uö–BÀ¢7F–öãÒ'WFFVB"À¢æWu÷fÇVW3Öb%7F÷&RæÖS¢·7F÷&UöæÖWÒÂFG&W73¢¶FG&W77ÒÂ6—G“¢¶6—G—ÒÂ7FGW3¢·7FGW7Ò ¢¢fÆ6‚†b%7F÷&RÂ'·7F÷&UöæÖWÕÂ"VF—FVB"Â'7V66W72"¢VÇ6S ¢fÆ6‚‚%7F÷&Ræ÷Bf÷VæB÷"WFFRf–ÆVBâ"Â&FævW"" ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"Â7F÷&Uö–C×7F÷&Uö–B’ ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2óÆ–çC§7F÷&Uö–CâöFVÆWFR"ÂÖWF†öG3Õ²%õ5B%Ò¢&öÆU÷&WV—&VB‚vFÖ–ârÂw7WW&FÖ–âr¢FVbFVÆWFU÷7F÷&U÷&÷WFR‡7F÷&Uö–C¢–çB“ ¢–bæ÷B6åöÖævU÷7F÷&R‡6W76–öå²wW6W%ö–BuÒÂ7F÷&Uö–B“ ¢fÆ6‚‚%–÷RFöâwB†fRW&Ö—76–öâFòFVÆWFRF†—27F÷&Râ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢2fWF6‚7F÷&RæÖR&Vf÷&RFVÆWF–öâf÷"F†Ræ÷F–f–6F–öà¢7W'6÷"æW†V7WFR‚%4TÄT5B7F÷&UöæÖRe$ôÒ7F÷&W2t„U$R–BÒW2"Â‡7F÷&Uö–BÂ’¢7F÷&U÷&÷rÒ7W'6÷"æfWF6†öæR‚¢7F÷&UöæÖRÒ7F÷&U÷&÷u³Ò–b7F÷&U÷&÷rVÇ6R%Væ¶æ÷vâ  ¢–bæ÷B7F÷&U÷&÷s ¢fÆ6‚‚%7F÷&Ræ÷Bf÷VæBâ"Â'v&æ–ær"¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’ ¢2F†W6R&V6V—BF&ÆW2–çFVçF–öæÆÇ’†fRæòf÷&V–vâ¶W—2Â6ð¢2&VÖ÷fRF†V—"7F÷&R×66÷VB&V6÷&G2&Vf÷&RFVÆWF–ærF†R7F÷&Rà¢7W'6÷"æW†V7WFR‚$DTÄUDRe$ôÒ&V6V—E÷W6vW2t„U$R7F÷&Uö–BÒW2"Â‡7F÷&Uö–BÂ’¢7W'6÷"æW†V7WFR‚$DTÄUDRe$ôÒvÆö&Å÷&V6V—E÷W6vW2t„U$R7F÷&Uö–BÒW2"Â‡7F÷&Uö–BÂ’ ¢2666F–ærFVÆWFS¢FVÆWFR7Ffeö6öÖÖVæFF–öç2f—'7@¢7W'6÷"æW†V7WFR‚"" ¢DTÄUDR62e$ôÒ7Ffeö6öÖÖVæFF–öç260¢¤ô”â&W7öç6W2"ôâ62ç&W7öç6Uö–BÒ"æ–@¢t„U$R"ç7F÷&Uö–BÒW0¢"""Â‡7F÷&Uö–BÂ’ ¢2FVÆWFRç7vW'0¢7W'6÷"æW†V7WFR‚"" ¢DTÄUDRe$ôÒç7vW'2¢¤ô”â&W7öç6W2"ôâç&W7öç6Uö–BÒ"æ–@¢t„U$R"ç7F÷&Uö–BÒW0¢"""Â‡7F÷&Uö–BÂ’¢ ¢2FVÆWFR&W7öç6W0¢7W'6÷"æW†V7WFR‚$DTÄUDRe$ôÒ&W7öç6W2t„U$R7F÷&Uö–BÒW2"Â‡7F÷&Uö–BÂ’ ¢2FVÆWFR7Ff`¢7W'6÷"æW†V7WFR‚$DTÄUDRe$ôÒ7Ffbt„U$R7F÷&Uö–BÒW2"Â‡7F÷&Uö–BÂ’¢ ¢2FVÆWFRVW7F–öâ÷F–öç2f÷"7F÷&Rw2VW7F–öææ—&W0¢7W'6÷"æW†V7WFR‚"" ¢DTÄUDRòe$ôÒVW7F–öåö÷F–öç2ð¢¤ô”âVW7F–öç2ôâòçVW7F–öåö–BÒæ–@¢¤ô”âVW7F–öææ—&W2âôâçVW7F–öææ—&Uö–BÒâæ–@¢t„U$Râç7F÷&Uö–BÒW0¢"""Â‡7F÷&Uö–BÂ’¢ ¢2FVÆWFRVW7F–öç0¢7W'6÷"æW†V7WFR‚"" ¢DTÄUDRe$ôÒVW7F–öç2¢¤ô”âVW7F–öææ—&W2âôâçVW7F–öææ—&Uö–BÒâæ–@¢t„U$Râç7F÷&Uö–BÒW0¢"""Â‡7F÷&Uö–BÂ’¢ ¢2FVÆWFRVW7F–öææ—&W0¢7W'6÷"æW†V7WFR‚$DTÄUDRe$ôÒVW7F–öææ—&W2t„U$R7F÷&Uö–BÒW2"Â‡7F÷&Uö–BÂ’¢ ¢2FVÆWFR7F÷&R—G6VÆ`¢7W'6÷"æW†V7WFR‚$DTÄUDRe$ôÒ7F÷&W2t„U$R–BÒW2"Â‡7F÷&Uö–BÂ’¢ ¢6öæâæ6öÖÖ—B‚¢ ¢2ÆörF†R7F÷&RFVÆWF–öà¢ÆöuöVF—B€¢VçF—G•÷G—SÒ'7F÷&R"À¢VçF—G•ö–C×7F÷&Uö–BÀ¢7F–öãÒ&FVÆWFVB"À¢öÆE÷fÇVW3Öb%7F÷&RæÖS¢·7F÷&UöæÖWÒ ¢¢ ¢fÆ6‚†b%7F÷&RÂ'·7F÷&UöæÖWÕÂ"FVÆWFVB"Â'7V66W72"¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"FVÆWF–ær7F÷&S¢¶WÒ"¢fÆ6‚†b$W'&÷"FVÆWF–ær7F÷&S¢¶WÒ"Â&FævW""¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢ ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’ ¢ç&÷WFR‚"öFÖ–âö†—7F÷'’"¢&öÆU÷&WV—&VB‚w7WW&FÖ–âr¢FVb†—7F÷'’‚“ ¢2'VâWFöÖF–2'Væ–æröböÆBÆöw2ƒ“F—2&WFVçF–öâ¢G'“ ¢'VæUöVF—EöÆöw2†F—3Ó“¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"'Væ–ærVF—BÆöw3¢¶WÒ"¢ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢7W'6÷"æW†V7WFR‚"" ¢4TÄT5B–BÂVçF—G•÷G—RÂVçF—G•ö–BÂ7F–öâÂöÆE÷fÇVW2ÂæWu÷fÇVW2ÂW6W%ö–BÂ7&VFVEö@¢e$ôÒVF—EöÆöw0¢õ$DU"%’7&VFVEöBDU40¢Ä”Ô•B ¢"""¢Æöw2Ò7W'6÷"æfWF6†ÆÂ‚¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢ ¢&WGW&â&VæFW%÷FV×ÆFR‚&†—7F÷'’æ‡FÖÂ"ÂÆöw3ÖÆöw2 ¢ç&÷WFR‚"öFÖ–âö†—7F÷'’ö6ÆV""ÂÖWF†öG3Õ²%õ5B%Ò¢&öÆU÷&WV—&VB‚w7WW&FÖ–âr¢FVb6ÆV%ö†—7F÷'’‚“ ¢FVÆWFVEö6÷VçBÒ'VæUöVF—EöÆöw2†F—3Ó’2FVÆWFRÆÂÆöw0¢fÆ6‚†b$6ÆV&VB¶FVÆWFVEö6÷VçGÒ†—7F÷'’VçG&–W2"Â'7V66W72"¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&†—7F÷'’"’ ¢ç&÷WFR‚"öFÖ–âö6ÆV"ÖfVVF&6²"ÂÖWF†öG3Õ²%õ5B%Ò¢FVb6ÆV%öfVVF&6µ÷&÷WFR‚“ ¢""$6ÆV"ÆÂfVVF&6²FFv†–ÆR&W6W'f–ær7F÷&W2æBF†V—"6öæf–wW&F–öââ"" ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚ ¢26÷VçB&Vf÷&RFVÆWF–öâf÷"fVVF&6°¢7W'6÷"æW†V7WFR‚%4TÄT5B4õTåB‚¢’e$ôÒ&W7öç6W2"¢&W7öç6W5ö6÷VçBÒ7W'6÷"æfWF6†öæR‚•³Ð¢7W'6÷"æW†V7WFR‚%4TÄT5B4õTåB‚¢’e$ôÒç7vW'2"¢ç7vW'5ö6÷VçBÒ7W'6÷"æfWF6†öæR‚•³Ð¢7W'6÷"æW†V7WFR‚%4TÄT5B4õTåB‚¢’e$ôÒ7Ffeö6öÖÖVæFF–öç2"¢6öÖÖVæFF–öç5ö6÷VçBÒ7W'6÷"æfWF6†öæR‚•³Ð ¢2FVÆWFR–â6÷'&V7B÷&FW"‡&W7V7F–ærf÷&V–vâ¶W—2¢2âFVÆWFR7Ffeö6öÖÖVæFF–öç0¢7W'6÷"æW†V7WFR‚$DTÄUDRe$ôÒ7Ffeö6öÖÖVæFF–öç2" ¢2"âFVÆWFRç7vW'0¢7W'6÷"æW†V7WFR‚$DTÄUDRe$ôÒç7vW'2" ¢22âFVÆWFR&W7öç6W0¢7W'6÷"æW†V7WFR‚$DTÄUDRe$ôÒ&W7öç6W2" ¢6öæâæ6öÖÖ—B‚ ¢fÆ6‚†b$6ÆV&VB·&W7öç6W5ö6÷VçGÒ&W7öç6W2Â¶ç7vW'5ö6÷VçGÒç7vW'2ÂæB¶6öÖÖVæFF–öç5ö6÷VçGÒ6öÖÖVæFF–öç2â7F÷&W2æB6öæf–wW&F–öç2&W6W'fVBâ"Â'7V66W72"¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"6ÆV&–ærfVVF&6²FF¢¶WÒ"¢fÆ6‚†b$W'&÷"6ÆV&–ærfVVF&6²FF¢¶WÒ"Â&FævW""¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’ ¢ç&÷WFR‚"öFÖ–âö&6·Wö77b"ÂÖWF†öG3Õ²$tUB%Ò¢FVb&6·Wö77e÷&÷WFR‚“ ¢""$W‡÷'BÆÂFFFò55b÷&væ—¦VB'’7F÷&Rà ¢Æ–÷WC ¢2dTTD$4²5•5DTÒ$4µU ¢2vVæW&FVC¢ÇF–ÖW7F×à¢2F÷FÂ7F÷&W3¢à ¢ÓÓÒ5Dõ$U25TÔÔ%’ÓÓÐ¢Ç7F÷&W2F&ÆSà ¢ÓÓÒ5Dõ$S¢ÆæÖSâ†–CÓÆ–Câ’ÓÓÐ¢ÒÒ7FfbÒÐ¢Ç7Ffbf÷"F†—27F÷&Sà¢ÒÒfVVF&6²ÒÐ¢Ç&W7öç6W2¦ö–æVBv—F‚ç7vW'2ÂöæR&÷rW"VW7F–öãà¢ÒÒ6öÖÖVæFF–öç2ÒÐ¢Æ6öÖÖVæFF–öç2f÷"F†—27F÷&Sà¢‡&WVBW"7F÷&R¢"" ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR ¢7W'6÷"æW†V7WFR‚%4TÄT5B¢e$ôÒ7F÷&W2õ$DU"%’–B"¢7F÷&W2Ò7W'6÷"æfWF6†ÆÂ‚ ¢÷WGWBÒ–òå7G&–æt”ò‚¢2UDbÓ‚$ôÒ6òW†6VÂ÷Vç2—B6÷'&V7FÇ’v—F‚7V6–Â6†&7FW'0¢÷WGWBçw&—FR‚uÇVfVfbr¢w&—FW"Ò77bçw&—FW"†÷WGWB ¢F–ÖW7F×ö‡VÖâÒFFWF–ÖRææ÷r‚’ç7G&gF–ÖR‚"U’ÒVÒÒVBTƒ¢TÓ¢U2"¢w&—FW"çw&—FW&÷r…²"2dTTD$4²5•5DTÒ$4µU%Ò¢w&—FW"çw&—FW&÷r…¶b"2vVæW&FVC¢·F–ÖW7F×ö‡VÖçÒ%Ò¢w&—FW"çw&—FW&÷r…¶b"2F÷FÂ7F÷&W3¢¶ÆVâ‡7F÷&W2—Ò%Ò¢w&—FW"çw&—FW&÷r…µÒ ¢2ÒÒÒÒ7F÷&W27VÖÖ'’ÒÒÒÐ¢w&—FW"çw&—FW&÷r…²#ÓÓÒ5Dõ$U25TÔÔ%’ÓÓÒ%Ò¢–b7F÷&W3 ¢26÷VçG2W"7F÷&Rf÷"V–6²÷fW'f–Wp¢7W'6÷"æW†V7WFR‚%4TÄT5B7F÷&Uö–BÂ4õTåB‚¢’26çBe$ôÒ&W7öç6W2u$õU%’7F÷&Uö–B"¢&W7ö6÷VçG2Ò·%²w7F÷&Uö–BuÓ¢%²v6çBuÒf÷""–â7W'6÷"æfWF6†ÆÂ‚—Ð¢7W'6÷"æW†V7WFR‚%4TÄT5B7F÷&Uö–BÂ4õTåB‚¢’26çBe$ôÒ7Ffbu$õU%’7F÷&Uö–B"¢7Ffeö6÷VçG2Ò·%²w7F÷&Uö–BuÓ¢%²v6çBuÒf÷""–â7W'6÷"æfWF6†ÆÂ‚—Ð ¢7VÖÖ'•ö6öÇ2ÒÆ—7B‡7F÷&W5³Òæ¶W—2‚’’²²'F÷FÅ÷&W7öç6W2"Â'F÷FÅ÷7Ffb%Ð¢w&—FW"çw&—FW&÷r‡7VÖÖ'•ö6öÇ2¢f÷"2–â7F÷&W3 ¢&÷rÒÆ—7B‡2çfÇVW2‚’’²°¢&W7ö6÷VçG2ævWB‡5²v–BuÒÂ’À¢7Ffeö6÷VçG2ævWB‡5²v–BuÒÂ’À¢Ð¢w&—FW"çw&—FW&÷r‡&÷r¢VÇ6S ¢w&—FW"çw&—FW&÷r…²"†æò7F÷&W2’%Ò¢w&—FW"çw&—FW&÷r…µÒ¢w&—FW"çw&—FW&÷r…µÒ ¢2ÒÒÒÒW"×7F÷&R6V7F–öç2ÒÒÒÐ¢f÷"7F÷&R–â7F÷&W3 ¢7F÷&Uö–BÒ7F÷&U²v–BuÐ¢7F÷&UöæÖRÒ7F÷&RævWB‚w7F÷&UöæÖRr’÷"b%7F÷&R7·7F÷&Uö–GÒ  ¢w&—FW"çw&—FW&÷r…¶b#ÓÓÒ5Dõ$S¢·7F÷&UöæÖWÒ†–C×·7F÷&Uö–GÒ’ÓÓÒ%Ò ¢27Ff`¢7W'6÷"æW†V7WFR‚%4TÄT5B¢e$ôÒ7Ffbt„U$R7F÷&Uö–BÒW2õ$DU"%’–B"Â‡7F÷&Uö–BÂ’¢7Ffe÷&÷w2Ò7W'6÷"æfWF6†ÆÂ‚¢w&—FW"çw&—FW&÷r…²"ÒÒ7FfbÒÒ%Ò¢–b7Ffe÷&÷w3 ¢w&—FW"çw&—FW&÷r‡7Ffe÷&÷w5³Òæ¶W—2‚’¢f÷""–â7Ffe÷&÷w3 ¢w&—FW"çw&—FW&÷r‡"çfÇVW2‚’¢VÇ6S ¢w&—FW"çw&—FW&÷r…²"†æò7Ffb’%Ò¢w&—FW"çw&—FW&÷r…µÒ ¢2fVVF&6²‡&W7öç6W2¦ö–æVBv—F‚ç7vW'2¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B"æ–B2&W7öç6Uö–BÀ¢"çW6W%öVÖ–ÂÀ¢"ç7V&Ö—GFVEöBÀ¢"æ—5÷&VBÀ¢"ç7FGW2À¢æ–B2ç7vW%ö–BÀ¢çVW7F–öåö–BÀ¢æç7vW%÷FW‡BÀ¢ç&F–æu÷fÇVP¢e$ôÒ&W7öç6W2 ¢ÄTeB¤ô”âç7vW'2ôâç&W7öç6Uö–BÒ"æ–@¢t„U$R"ç7F÷&Uö–BÒW0¢õ$DU"%’"ç7V&Ö—GFVEöBDU42Â"æ–BÂæ–@¢"""À¢‡7F÷&Uö–BÂ¢¢fVVF&6µ÷&÷w2Ò7W'6÷"æfWF6†ÆÂ‚¢w&—FW"çw&—FW&÷r…²"ÒÒfVVF&6²ÒÒ%Ò¢–bfVVF&6µ÷&÷w3 ¢w&—FW"çw&—FW&÷r†fVVF&6µ÷&÷w5³Òæ¶W—2‚’¢f÷""–âfVVF&6µ÷&÷w3 ¢w&—FW"çw&—FW&÷r‡"çfÇVW2‚’¢VÇ6S ¢w&—FW"çw&—FW&÷r…²"†æòfVVF&6²’%Ò¢w&—FW"çw&—FW&÷r…µÒ ¢26öÖÖVæFF–öç2f÷"F†—27F÷&Rw27Ff`¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B2â ¢e$ôÒ7Ffeö6öÖÖVæFF–öç20¢¤ô”â7Ffb2ôâ2ç7Ffeö–BÒ2æ–@¢t„U$R2ç7F÷&Uö–BÒW0¢õ$DU"%’2æ–@¢"""À¢‡7F÷&Uö–BÂ¢¢6öÖÖVæE÷&÷w2Ò7W'6÷"æfWF6†ÆÂ‚¢w&—FW"çw&—FW&÷r…²"ÒÒ6öÖÖVæFF–öç2ÒÒ%Ò¢–b6öÖÖVæE÷&÷w3 ¢w&—FW"çw&—FW&÷r†6öÖÖVæE÷&÷w5³Òæ¶W—2‚’¢f÷""–â6öÖÖVæE÷&÷w3 ¢w&—FW"çw&—FW&÷r‡"çfÇVW2‚’¢VÇ6S ¢w&—FW"çw&—FW&÷r…²"†æò6öÖÖVæFF–öç2’%Ò¢w&—FW"çw&—FW&÷r…µÒ¢w&—FW"çw&—FW&÷r…µÒ ¢÷WGWBç6VV²ƒ¢77eöFFÒ÷WGWBævWGfÇVR‚ ¢F–ÖW7F×ÒFFWF–ÖRææ÷r‚’ç7G&gF–ÖR‚"U’VÒVEòT‚TÒU2"¢f–ÆVæÖRÒb&fVVF&6µ÷7—7FVÕö&6·W÷·F–ÖW7F×Òæ77b  ¢&WGW&â6VæEöf–ÆR€¢–òä'—FW4”ò†77eöFFæVæ6öFR‚wWFbÓ‚r’’À¢Ö–ÖWG—SÒwFW‡Bö77brÀ¢5öGF6†ÖVçCÕG'VRÀ¢F÷væÆöEöæÖSÖf–ÆVæÖP¢¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"7&VF–ær55b&6·W¢¶WÒ"¢fÆ6‚†b$W'&÷"7&VF–ær&6·W¢¶WÒ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢ç&÷WFR‚"öFÖ–â÷6VVBÖfVVF&6²"ÂÖWF†öG3Õ²%õ5B%Ò¢FVb6VVEöfVVF&6µ÷&÷WFR‚“ ¢""%6VVB6×ÆRfVVF&6²FFf÷"V6‚7F÷&Rv—F‚ç7vW'2æB7Ffb6öÖÖVæFF–öç2â"" ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR ¢2fWF6‚ÆÂ7F÷&W0¢7W'6÷"æW†V7WFR‚%4TÄT5B¢e$ôÒ7F÷&W2t„U$RW6W%ö–BÒW2"Â‡6W76–öå²wW6W%ö–BuÒÂ’¢7F÷&W2Ò7W'6÷"æfWF6†ÆÂ‚ ¢2fWF6‚FV×ÆFRVW7F–öææ—&P¢W6W"ÒvWE÷W6W%ö'•ö–B‡6W76–öå²wW6W%ö–BuÒ¢7W'6÷"æW†V7WFR‚%4TÄT5B¢e$ôÒVW7F–öææ—&W2t„U$R—5÷FV×ÆFRÒE%TRäB÷væW%÷W6W%ö–BÒW2äBÆ–6Vç6Uö¶W’ÃÓâW2Ä”Ô•B"Â‡6W76–öå²wW6W%ö–BuÒÂW6W"ævWB‚vÆ–6Vç6Uö¶W’r’–bW6W"VÇ6RæöæR’¢FV×ÆFU÷VW7F–öææ—&RÒ7W'6÷"æfWF6†öæR‚ ¢–bæ÷BFV×ÆFU÷VW7F–öææ—&S ¢fÆ6‚‚$æòFV×ÆFRVW7F–öææ—&Rf÷VæBâÆV6R7&VFRöæRf—'7Bâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’ ¢2fWF6‚VW7F–öç2g&öÒFV×ÆFRVW7F–öææ—&P¢7W'6÷"æW†V7WFR‚%4TÄT5B¢e$ôÒVW7F–öç2t„U$RVW7F–öææ—&Uö–BÒW2"Â‡FV×ÆFU÷VW7F–öææ—&U²&–B%ÒÂ’¢FV×ÆFU÷VW7F–öç2Ò7W'6÷"æfWF6†ÆÂ‚ ¢F÷FÅ÷&W7öç6W2Ò ¢F÷FÅöç7vW'2Ò ¢F÷FÅö6öÖÖVæFF–öç2Ò  ¢26×ÆRFFf÷"fVVF&6°¢6×ÆUöVÖ–Ç2Ò°¢&7W7FöÖW#W†×ÆRæ6öÒ"Â&7W7FöÖW#$W†×ÆRæ6öÒ"Â&7W7FöÖW#4W†×ÆRæ6öÒ"À¢&7W7FöÖW#DW†×ÆRæ6öÒ"Â&7W7FöÖW#TW†×ÆRæ6öÒ"Â&7W7FöÖW#dW†×ÆRæ6öÒ"À¢&7W7FöÖW#tW†×ÆRæ6öÒ"Â&7W7FöÖW#„W†×ÆRæ6öÒ"Â&7W7FöÖW#”W†×ÆRæ6öÒ"À¢&7W7FöÖW#W†×ÆRæ6öÒ ¢Ð ¢6×ÆU÷&V6V—G2Ò°¢%$T2Ó"Â%$T2Ó""Â%$T2Ó2"Â%$T2ÓB"Â%$T2ÓR"À¢%$T2Ób"Â%$T2Ór"Â%$T2Ó‚"Â%$T2Ó’"Â%$T2Ó ¢Ð ¢6×ÆUöç7vW'5÷FW‡BÒ°¢$w&VB6W'f–6R"Â%fW'’6F—6f–VB"Â$W†6VÆÆVçBW‡W&–Væ6R"À¢$vööBVÆ—G’"Â$g&–VæFÇ’7Ffb"Â%V–6²6W'f–6R"À¢$6ÆVâVçf—&öæÖVçB"Â$†VÇgVÂFVÒ"Â%&öfW76–öæÂ"À¢%v–ÆÂ&WGW&âv–â ¢Ð ¢f÷"7F÷&R–â7F÷&W3 ¢7F÷&Uö–BÒ–çB‡7F÷&U²&–B%Ò ¢2fWF6‚÷"7&VFR7F÷&R×7V6–f–2VW7F–öææ—&P¢7W'6÷"æW†V7WFR‚%4TÄT5B¢e$ôÒVW7F–öææ—&W2t„U$R7F÷&Uö–BÒW2"Â‡7F÷&Uö–BÂ’¢7F÷&U÷VW7F–öææ—&RÒ7W'6÷"æfWF6†öæR‚ ¢–bæ÷B7F÷&U÷VW7F–öææ—&S ¢27&VFRæWrVW7F–öææ—&Rf÷"F†—27F÷&Rg&öÒFV×ÆFP¢7W'6÷"æW†V7WFR€¢"" ¢”å4U%B”åDòVW7F–öææ—&W2‡F—FÆRÂ7F÷&Uö–BÂ—5ö7F—fRÂ—5÷FV×ÆFR¢dÅTU2‚W2ÂW2ÂW2ÂW2¢"""À¢‡FV×ÆFU÷VW7F–öææ—&U²'F—FÆR%ÒÂ7F÷&Uö–BÂG'VRÂfÇ6R’À¢¢7F÷&U÷VW7F–öææ—&Uö–BÒ–çB†7W'6÷"æÆ7G&÷v–B ¢26÷’VW7F–öç2g&öÒFV×ÆFRFò7F÷&RVW7F–öææ—&P¢f÷"FV×ÆFU÷–âFV×ÆFU÷VW7F–öç3 ¢7W'6÷"æW†V7WFR€¢"" ¢”å4U%B”åDòVW7F–öç2‡VW7F–öææ—&Uö–BÂVW7F–öå÷FW‡BÂVW7F–öå÷G—RÂ—5÷&WV—&VBÂÖ–åöÆ&VÂÂÖ…öÆ&VÂÂÆÆ÷uö6öÖÖVçBÂVW7F–öåö÷&FW"¢dÅTU2‚W2ÂW2ÂW2ÂW2ÂW2ÂW2ÂW2ÂW2¢"""À¢‡7F÷&U÷VW7F–öææ—&Uö–BÂFV×ÆFU÷²'VW7F–öå÷FW‡B%ÒÂFV×ÆFU÷²'VW7F–öå÷G—R%ÒÀ¢FV×ÆFU÷²&—5÷&WV—&VB%ÒÂFV×ÆFU÷²&Ö–åöÆ&VÂ%ÒÂFV×ÆFU÷²&Ö…öÆ&VÂ%ÒÀ¢FV×ÆFU÷²&ÆÆ÷uö6öÖÖVçB%ÒÂFV×ÆFU÷²'VW7F–öåö÷&FW"%Ò’À¢¢æWu÷VW7F–öåö–BÒ–çB†7W'6÷"æÆ7G&÷v–B ¢26÷’÷F–öç2–b—Bw2×VÇF—ÆR6†ö–6RVW7F–öà¢–bFV×ÆFU÷²'VW7F–öå÷G—R%ÒÓÒ&×VÇF—ÆUö6†ö–6R# ¢7W'6÷"æW†V7WFR‚%4TÄT5B¢e$ôÒVW7F–öåö÷F–öç2t„U$RVW7F–öåö–BÒW2"Â‡FV×ÆFU÷²&–B%ÒÂ’¢÷F–öç2Ò7W'6÷"æfWF6†ÆÂ‚¢f÷"÷B–â÷F–öç3 ¢7W'6÷"æW†V7WFR€¢"" ¢”å4U%B”åDòVW7F–öåö÷F–öç2‡VW7F–öåö–BÂ÷F–öå÷FW‡B¢dÅTU2‚W2ÂW2¢"""À¢†æWu÷VW7F–öåö–BÂ÷E²&÷F–öå÷FW‡B%Ò’À¢¢VÇ6S ¢7F÷&U÷VW7F–öææ—&Uö–BÒ–çB‡7F÷&U÷VW7F–öææ—&U²&–B%Ò ¢2fWF6‚VW7F–öç2f÷"F†—27F÷&Rw2VW7F–öææ—&P¢7W'6÷"æW†V7WFR‚%4TÄT5B¢e$ôÒVW7F–öç2t„U$RVW7F–öææ—&Uö–BÒW2"Â‡7F÷&U÷VW7F–öææ—&Uö–BÂ’¢VW7F–öç2Ò7W'6÷"æfWF6†ÆÂ‚ ¢2fWF6‚7Ffbf÷"F†—27F÷&P¢7W'6÷"æW†V7WFR‚%4TÄT5B¢e$ôÒ7Ffbt„U$R7F÷&Uö–BÒW2"Â‡7F÷&Uö–BÂ’¢7FfeöÆ—7BÒ7W'6÷"æfWF6†ÆÂ‚ ¢2FWFW&Ö–æRçVÖ&W"öbfVVF&6·2f÷"F†—27F÷&RƒRÓR¢çVÕöfVVF&6·2Ò&æFöÒç&æF–çBƒRÂR ¢f÷"’–â&ævR†çVÕöfVVF&6·2“ ¢2W6R†–Æ—–æRF–ÖP¢…÷G¢ÒF–ÖW¦öæR‡F–ÖVFVÇF††÷W'3Ó‚’¢æ÷u÷‚ÒFFWF–ÖRææ÷r‡…÷G¢’ç7G&gF–ÖR‚"U’ÒVÒÒVBTƒ¢TÓ¢U2" ¢27&VFR&W7öç6P¢7W'6÷"æW†V7WFR€¢"" ¢”å4U%B”åDò&W7öç6W2‡VW7F–öææ—&Uö–BÂ7F÷&Uö–BÂW6W%öVÖ–ÂÂ&V6V—EöçVÖ&W"Â7V&Ö—GFVEöBÂ7FGW2¢dÅTU2‚W2ÂW2ÂW2ÂW2ÂW2ÂW2¢"""À¢‡7F÷&U÷VW7F–öææ—&Uö–BÂ7F÷&Uö–BÂ6×ÆUöVÖ–Ç5¶’RÆVâ‡6×ÆUöVÖ–Ç2•ÒÀ¢6×ÆU÷&V6V—G5¶’RÆVâ‡6×ÆU÷&V6V—G2•ÒÂæ÷u÷‚Â&æFöÒæ6†ö–6R…²w&W6öÇfVBrÂwVç&W6öÇfVBuÒ’’À¢¢&W7öç6Uö–BÒ–çB†7W'6÷"æÆ7G&÷v–B¢F÷FÅ÷&W7öç6W2³Ò ¢2FBç7vW'2f÷"V6‚VW7F–öà¢f÷"VW7F–öâ–âVW7F–öç3 ¢VW7F–öå÷G—RÒVW7F–öå²'VW7F–öå÷G—R%Ð ¢–bVW7F–öå÷G—RÓÒ'&F–ær# ¢2&æFöÒ&F–ærÓP¢&F–ærÒ7G"‡&æFöÒç&æF–çBƒÂR’¢7W'6÷"æW†V7WFR€¢"" ¢”å4U%B”åDòç7vW'2‡&W7öç6Uö–BÂVW7F–öåö–BÂ&F–æu÷fÇVR¢dÅTU2‚W2ÂW2ÂW2¢"""À¢‡&W7öç6Uö–BÂVW7F–öå²&–B%ÒÂ&F–ær’À¢¢F÷FÅöç7vW'2³Ò¢VÆ–bVW7F–öå÷G—RÓÒ'FW‡B# ¢2&æFöÒFW‡Bç7vW ¢ç7vW%÷FW‡BÒ6×ÆUöç7vW'5÷FW‡E·&æFöÒç&æF–çBƒÂÆVâ‡6×ÆUöç7vW'5÷FW‡B’Ò•Ð¢7W'6÷"æW†V7WFR€¢"" ¢”å4U%B”åDòç7vW'2‡&W7öç6Uö–BÂVW7F–öåö–BÂç7vW%÷FW‡B¢dÅTU2‚W2ÂW2ÂW2¢"""À¢‡&W7öç6Uö–BÂVW7F–öå²&–B%ÒÂç7vW%÷FW‡B’À¢¢F÷FÅöç7vW'2³Ò¢VÆ–bVW7F–öå÷G—RÓÒ&×VÇF—ÆUö6†ö–6R# ¢2fWF6‚÷F–öç2f÷"F†—2VW7F–öà¢7W'6÷"æW†V7WFR‚%4TÄT5B¢e$ôÒVW7F–öåö÷F–öç2t„U$RVW7F–öåö–BÒW2"Â‡VW7F–öå²&–B%ÒÂ’¢÷F–öç2Ò7W'6÷"æfWF6†ÆÂ‚¢–b÷F–öç3 ¢6VÆV7FVEö÷F–öâÒ&æFöÒæ6†ö–6R†÷F–öç2¢7W'6÷"æW†V7WFR€¢"" ¢”å4U%B”åDòç7vW'2‡&W7öç6Uö–BÂVW7F–öåö–BÂç7vW%÷FW‡B¢dÅTU2‚W2ÂW2ÂW2¢"""À¢‡&W7öç6Uö–BÂVW7F–öå²&–B%ÒÂ6VÆV7FVEö÷F–öå²&÷F–öå÷FW‡B%Ò’À¢¢F÷FÅöç7vW'2³Ò ¢2FB7Ffb6öÖÖVæFF–öç2†–b7FfbW†—7G2æB&F–ærv2vööB¢–b7FfeöÆ—7BæB&æFöÒç&æFöÒ‚’âãS¢2SR6†æ6P¢çVÕö6öÖÖVæFF–öç2Ò&æFöÒç&æF–çBƒÂÖ–âƒ2ÂÆVâ‡7FfeöÆ—7B’’¢6öÖÖVæFVE÷7FfbÒ&æFöÒç6×ÆR‡7FfeöÆ—7BÂçVÕö6öÖÖVæFF–öç2¢f÷"7Ffb–â6öÖÖVæFVE÷7Ffc ¢7W'6÷"æW†V7WFR€¢"" ¢”å4U%B”åDò7Ffeö6öÖÖVæFF–öç2‡&W7öç6Uö–BÂ7Ffeö–B¢dÅTU2‚W2ÂW2¢"""À¢‡&W7öç6Uö–BÂ7Ffe²&–B%Ò’À¢¢F÷FÅö6öÖÖVæFF–öç2³Ò ¢6öæâæ6öÖÖ—B‚¢fÆ6‚†b%6VVFVB·F÷FÅ÷&W7öç6W7ÒfVVF&6²&W7öç6W2Â·F÷FÅöç7vW'7Òç7vW'2ÂæB·F÷FÅö6öÖÖVæFF–öç7Ò7Ffb6öÖÖVæFF–öç27&÷72¶ÆVâ‡7F÷&W2—Ò7F÷&W2â"Â'7V66W72"¢ÆövvW"æ–æfò†b%6VVFVBfVVF&6²FF¢·F÷FÅ÷&W7öç6W7Ò&W7öç6W2Â·F÷FÅöç7vW'7Òç7vW'2Â·F÷FÅö6öÖÖVæFF–öç7Ò6öÖÖVæFF–öç2"¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"6VVF–ærfVVF&6²FF¢¶WÒ"¢fÆ6‚†b$W'&÷"6VVF–ærfVVF&6²FF¢¶WÒ"Â&FævW""¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’ ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢25DdbÔätTÔTå@¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¢FVb÷WÆöFVE÷7Ffe÷†÷Fò†f–VÆEöæÖS¢7G"Ò'†÷Fò"’Óâ÷F–öæÅ·7G%Ó ¢†÷FòÒ&WVW7Bæf–ÆW2ævWB†f–VÆEöæÖR¢–bæ÷B†÷Fò÷"æ÷B†÷Fòæf–ÆVæÖS ¢&WGW&âæöæP¢–brâræ÷B–â†÷Fòæf–ÆVæÖR÷"†÷Fòæf–ÆVæÖRç'7Æ—B‚rârÂ•³ÒæÆ÷vW"‚’æ÷B–â²wærrÂv§rrÂv§VrwÓ ¢&—6RfÇVTW'&÷"‚%7Ffb†÷Fò×W7B&Rär÷"¥r–ÖvRâ"¢†÷Fòç6VV²ƒÂ÷2å4TTµôTäB¢f–ÆU÷6—¦RÒ†÷FòçFVÆÂ‚¢†÷Fòç6VV²ƒ¢–bf–ÆU÷6—¦RâR¢#B¢#C ¢&—6RfÇVTW'&÷"‚%7Ffb†÷Fò×W7B&RTÔ"÷"6ÖÆÆW"â"¢W‡BÒ†÷Fòæf–ÆVæÖRç'7Æ—B‚rârÂ•³ÒæÆ÷vW"‚¢Ö–ÖRÒ&–ÖvRö§Vr"–bW‡B–â‚v§rrÂv§Vrr’VÇ6R&–ÖvR÷ær ¢&WGW&âb&FF§¶Ö–ÖWÓ¶&6ScBÇ¶&6ScBæ#cFVæ6öFR‡†÷Fòç&VB‚’’æFV6öFR‚wWFbÓ‚r—Ò  ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2óÆ–çC§7F÷&Uö–Câ÷7Ffb"¢&öÆU÷&WV—&VB‚wW6W"rÂvFÖ–ârÂw7WW&FÖ–âr¢FVb7FfeöÖævVÖVçB‡7F÷&Uö–C¢–çB“ ¢–bæ÷B6åöÖævU÷7F÷&U÷7Ffb‡6W76–öå²wW6W%ö–BuÒÂ7F÷&Uö–B“ ¢fÆ6‚‚%–÷R6âöæÇ’ÖævR7Ffb–â–÷W"76–væVB7F÷&Râ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢ ¢2vWB7F÷&R–æf÷&ÖF–öà¢7W'6÷"æW†V7WFR‚%4TÄT5B¢e$ôÒ7F÷&W2t„U$R–BÒW2"Â‡7F÷&Uö–BÂ’¢7F÷&RÒ7W'6÷"æfWF6†öæR‚¢ ¢–bæ÷B7F÷&S ¢fÆ6‚‚%7F÷&Ræ÷Bf÷VæB"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢ ¢2vWB7Ffbf÷"F†—27F÷&P¢7W'6÷"æW†V7WFR‚"" ¢4TÄT5B¢e$ôÒ7Ffb ¢t„U$R7F÷&Uö–BÒW2 ¢õ$DU"%’&öÆRDU42ÂÆ7EöæÖRÂf—'7EöæÖP¢"""Â‡7F÷&Uö–BÂ’¢7FfbÒ7W'6÷"æfWF6†ÆÂ‚¢ ¢2vVæW&FR"6öFRf÷"F†R7F÷&P¢V&Æ–5÷W&ÂÒvWE÷7F÷&U÷V&Æ–5÷W&Â‡7F÷&Uö–C×7F÷&Uö–B¢%öFF÷W&’ÒvVæW&FU÷%öFF÷W&’‡V&Æ–5÷W&Â¢ ¢&WGW&â&VæFW%÷FV×ÆFR‚&ÖævU÷7Ffb÷7Ffbæ‡FÖÂ"Â7F÷&S×7F÷&RÂ7Ffc×7FfbÂV&Æ–5÷W&Ã×V&Æ–5÷W&ÂÂ%öFF÷W&“×%öFF÷W&’¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"ÆöF–ær7FfbÖævVÖVçC¢¶WÒ"¢fÆ6‚†b$W'&÷"ÆöF–ær7Ffc¢¶WÒ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2óÆ–çC§7F÷&Uö–Câ÷7FfböFB"ÂÖWF†öG3Õ²%õ5B%Ò¢&öÆU÷&WV—&VB‚wW6W"rÂvFÖ–ârÂw7WW&FÖ–âr¢FVbFE÷7Ffb‡7F÷&Uö–C¢–çB“ ¢–bæ÷B6åöÖævU÷7F÷&U÷7Ffb‡6W76–öå²wW6W%ö–BuÒÂ7F÷&Uö–B“ ¢fÆ6‚‚%–÷R6âöæÇ’FB7FfbFò–÷W"76–væVB7F÷&Râ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢f—'7EöæÖRÒ&WVW7Bæf÷&ÒævWB‚&f—'7EöæÖR"Â""’ç7G&—‚¢Æ7EöæÖRÒ&WVW7Bæf÷&ÒævWB‚&Æ7EöæÖR"Â""’ç7G&—‚¢VÖ–ÂÒ&WVW7Bæf÷&ÒævWB‚&VÖ–Â"Â""’ç7G&—‚’÷"æöæP¢†öæRÒ&WVW7Bæf÷&ÒævWB‚'†öæR"Â""’ç7G&—‚’÷"æöæP¢÷6—F–öâÒ&WVW7Bæf÷&ÒævWB‚'÷6—F–öâ"Â""’ç7G&—‚’÷"æöæP¢&öÆRÒ&WVW7Bæf÷&ÒævWB‚'&öÆR"Â'7Ffb"¢†—&UöFFRÒ&WVW7Bæf÷&ÒævWB‚&†—&UöFFR"Â""’ç7G&—‚’÷"æöæP¢G'“ ¢†÷Fõ÷W&ÂÒ÷WÆöFVE÷7Ffe÷†÷Fò‚¢W†6WBfÇVTW'&÷"2W†3 ¢fÆ6‚‡7G"†W†2’Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7FfeöÖævVÖVçB"Â7F÷&Uö–C×7F÷&Uö–B’¢ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢ ¢2fW&–g’7F÷&RW†—7G0¢7W'6÷"æW†V7WFR‚%4TÄT5B–Be$ôÒ7F÷&W2t„U$R–BÒW2"Â‡7F÷&Uö–BÂ’¢–bæ÷B7W'6÷"æfWF6†öæR‚“ ¢fÆ6‚‚%7F÷&Ræ÷Bf÷VæB"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢ ¢2–ç6W'BæWr7FfbÖVÖ&W ¢7W'6÷"æW†V7WFR‚"" ¢”å4U%B”åDò7Ffb‡7F÷&Uö–BÂf—'7EöæÖRÂÆ7EöæÖRÂVÖ–ÂÂ†öæRÂ÷6—F–öâÂ†÷Fõ÷W&ÂÂ&öÆRÂ†—&UöFFR¢dÅTU2‚W2ÂW2ÂW2ÂW2ÂW2ÂW2ÂW2ÂW2ÂW2¢"""Â‡7F÷&Uö–BÂf—'7EöæÖRÂÆ7EöæÖRÂVÖ–ÂÂ†öæRÂ÷6—F–öâÂ†÷Fõ÷W&ÂÂ&öÆRÂ†—&UöFFR’¢ ¢æWu÷7Ffeö–BÒ7W'6÷"æÆ7G&÷v–@¢6öæâæ6öÖÖ—B‚¢ ¢2ÆörF†R7FfbFF—F–öà¢ÆöuöVF—B€¢VçF—G•÷G—SÒ'7Ffb"À¢VçF—G•ö–CÖæWu÷7Ffeö–BÀ¢7F–öãÒ&7&VFVB"À¢æWu÷fÇVW3Öb$æÖS¢¶f—'7EöæÖWÒ¶Æ7EöæÖWÒÂ÷6—F–öã¢·÷6—F–öçÒÂ&öÆS¢·&öÆWÒÂ7F÷&R”C¢·7F÷&Uö–GÒ ¢¢ ¢fÆ6‚†b%7FfbÖVÖ&W"Â'¶f—'7EöæÖWÒ¶Æ7EöæÖWÕÂ"FFVB7V66W76gVÆÇ’"Â'7V66W72"¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"FF–ær7Ffc¢¶WÒ"¢fÆ6‚†b$W'&÷"FF–ær7Ffc¢¶WÒ"Â&FævW""¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢ ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’ ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2óÆ–çC§7F÷&Uö–Câ÷7Ffbö–×÷'B×FV×ÆFR"ÂÖWF†öG3Õ²$tUB%Ò¢&öÆU÷&WV—&VB‚wW6W"rÂvFÖ–ârÂw7WW&FÖ–âr¢FVb7Ffeö–×÷'E÷FV×ÆFR‡7F÷&Uö–C¢–çB“ ¢–bæ÷B6åöÖævU÷7F÷&U÷7Ffb‡6W76–öå²wW6W%ö–BuÒÂ7F÷&Uö–B“ ¢fÆ6‚‚%–÷R6âöæÇ’ÖævR7Ffb–â–÷W"76–væVB7F÷&Râ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’ ¢÷WGWBÒ–òå7G&–æt”ò†æWvÆ–æSÒrr¢w&—FW"Ò77bçw&—FW"†÷WGWB¢w&—FW"çw&—FW&÷r…²&f—'7EöæÖR"Â&Æ7EöæÖR"Â&VÖ–Â"Â'†öæR"Â'÷6—F–öâ"Â'&öÆR"Â&†—&UöFFR"Â'7FGW2%Ò¢w&—FW"çw&—FW&÷r…²$§Vâ"Â$FVÆ7'W¢"Â&§VäW†×ÆRæ6öÒ"Â#“s#3CScr"Â%6ÆW276ö6–FR"Â'7Ffb"Â###bÓ’Ó"Â&7F—fR%Ò¢–ÆöBÒ–òä'—FW4”ò†÷WGWBævWGfÇVR‚’æVæ6öFR‚'WFbÓ‚×6–r"’¢–ÆöBç6VV²ƒ¢&WGW&â6VæEöf–ÆR€¢–ÆöBÀ¢Ö–ÖWG—SÒ'FW‡Bö77c²6†'6WC×WFbÓ‚"À¢5öGF6†ÖVçCÕG'VRÀ¢F÷væÆöEöæÖSÖb'7Ffeö–×÷'E÷FV×ÆFU÷7F÷&U÷·7F÷&Uö–GÒæ77b"À¢ ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2óÆ–çC§7F÷&Uö–Câ÷7Ffbö–×÷'B"ÂÖWF†öG3Õ²%õ5B%Ò¢&öÆU÷&WV—&VB‚wW6W"rÂvFÖ–ârÂw7WW&FÖ–âr¢FVb–×÷'E÷7Ffb‡7F÷&Uö–C¢–çB“ ¢""$'VÆ²Ö–×÷'B7Ffbg&öÒ55b÷"„Å5‚â†÷F÷2&VÖ–âÖçVÂW"7Ffb&öf–ÆRâ"" ¢–bæ÷B6åöÖævU÷7F÷&U÷7Ffb‡6W76–öå²wW6W%ö–BuÒÂ7F÷&Uö–B“ ¢fÆ6‚‚%–÷R6âöæÇ’–×÷'B7Ffb–çFò–÷W"76–væVB7F÷&Râ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’ ¢WÆöBÒ&WVW7Bæf–ÆW2ævWB‚'7Ffeöf–ÆR"¢–bæ÷BWÆöB÷"æ÷BWÆöBæf–ÆVæÖS ¢fÆ6‚‚%ÆV6R6†ö÷6R55b÷"W†6VÂ‚ç†Ç7‚’f–ÆRâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’ ¢f–ÆVæÖRÒWÆöBæf–ÆVæÖRæÆ÷vW"‚¢–bæ÷Bf–ÆVæÖRæVæG7v—F‚‚‚"æ77b"Â"ç†Ç7‚"’“ ¢fÆ6‚‚%Vç7W÷'FVBf–ÆRG—RâÆV6RWÆöBæ77b÷"ç†Ç7‚f–ÆRâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’ ¢&rÒWÆöBç&VBƒR¢#B¢#B²¢–bÆVâ‡&r’âR¢#B¢#C ¢fÆ6‚‚%7Ffb–×÷'Bf–ÆR×W7B&RTÔ"÷"6ÖÆÆW"â"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’ ¢FVbæ÷&ÖÆ—¦Uö†VFW"‡fÇVS¢ç’’Óâ7G# ¢&WGW&â&Rç7V"‡"%µæ×£Ó•Ò²"Â%ò"Â7G"‡fÇVR÷"""’ç7G&—‚’æÆ÷vW"‚’’ç7G&—‚%ò" ¢Æ–6W2Ò°¢&f—'7FæÖR#¢&f—'7EöæÖR"Â&f—'7B#¢&f—'7EöæÖR"À¢&Æ7FæÖR#¢&Æ7EöæÖR"Â&Æ7B#¢&Æ7EöæÖR"Â'7W&æÖR#¢&Æ7EöæÖR"À¢&Öö&–ÆR#¢'†öæR"Â'†öæUöçVÖ&W"#¢'†öæR"Â&6öçF7EöçVÖ&W"#¢'†öæR"À¢&¦ö%÷F—FÆR#¢'÷6—F–öâ"Â&FW6–væF–öâ#¢'÷6—F–öâ"À¢&FFUö†—&VB#¢&†—&UöFFR"Â&†—&VEöFFR#¢&†—&UöFFR"À¢Ð ¢G'“ ¢–bf–ÆVæÖRæVæG7v—F‚‚"æ77b"“ ¢FW‡E÷7G&VÒÒ–òå7G&–æt”ò‡&ræFV6öFR‚'WFbÓ‚×6–r"’¢77e÷&÷w2ÒÆ—7B†77bç&VFW"‡FW‡E÷7G&VÒ’¢–bæ÷B77e÷&÷w3 ¢&—6RfÇVTW'&÷"‚%F†RWÆöFVBf–ÆR—2V×G’â"¢†VFW'2Ò¶Æ–6W2ævWB†æ÷&ÖÆ—¦Uö†VFW"†‚’Âæ÷&ÖÆ—¦Uö†VFW"†‚’’f÷"‚–â77e÷&÷w5³ÕÐ¢&÷w2Ò¶F–7B‡¦—††VFW'2Â&÷r’’f÷"&÷r–â77e÷&÷w5³¥ÕÐ¢VÇ6S ¢g&öÒ÷Vç—†Â–×÷'BÆöE÷v÷&¶&öö°¢v÷&¶&öö²ÒÆöE÷v÷&¶&öö²†–òä'—FW4”ò‡&r’Â&VEööæÇ“ÕG'VRÂFFööæÇ“ÕG'VR¢v÷&·6†VWBÒv÷&¶&öö²æ7F—fP¢fÇVW2Òv÷&·6†VWBæ—FW%÷&÷w2‡fÇVW5ööæÇ“ÕG'VR¢f—'7E÷&÷rÒæW‡B‡fÇVW2ÂæöæR¢–bæ÷Bf—'7E÷&÷s ¢&—6RfÇVTW'&÷"‚%F†RWÆöFVBv÷&¶&öö²—2V×G’â"¢†VFW'2Ò¶Æ–6W2ævWB†æ÷&ÖÆ—¦Uö†VFW"†‚’Âæ÷&ÖÆ—¦Uö†VFW"†‚’’f÷"‚–âf—'7E÷&÷uÐ¢&÷w2Ò¶F–7B‡¦—††VFW'2Â&÷r’’f÷"&÷r–âfÇVW5Ð¢v÷&¶&öö²æ6Æ÷6R‚¢W†6WB…Væ–6öFTFV6öFTW'&÷"ÂfÇVTW'&÷"’2W†3 ¢fÆ6‚†b%Væ&ÆRFò&VB7Ffbf–ÆS¢¶W†7Ò"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’¢W†6WBW†6WF–öâ2W†3 ¢ÆövvW"æW'&÷"‚%7Ffb–×÷'B'6–ærf–ÆVC¢W2"ÂW†2¢fÆ6‚‚%Væ&ÆRFò&VBF†Rf–ÆRâ6†V6²F†B—B—2fÆ–B55b÷"ç†Ç7‚v÷&¶&öö²â"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’ ¢–b&f—'7EöæÖR"æ÷B–â†VFW'2÷"&Æ7EöæÖR"æ÷B–â†VFW'3 ¢fÆ6‚‚$Ö—76–ær&WV—&VB6öÇVÖç3¢f—'7EöæÖRæBÆ7EöæÖRâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’¢–bÆVâ‡&÷w2’â ¢fÆ6‚‚$6–ævÆR–×÷'B6â6öçF–âWFòÃ7Ffb&÷w2â"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’ ¢fÆ–E÷&öÆW2Ò²'7Ffb"Â&ÖævW""Â'7WW'f—6÷"'Ð¢fÆ–E÷7FGW6W2Ò²&7F—fR"Â&–æ7F—fR'Ð¢&W&VBÒµÐ¢W'&÷'2ÒµÐ¢f÷"&÷uöçVÖ&W"Â&÷r–âVçVÖW&FR‡&÷w2Â7F'CÓ"“ ¢6ÆVæVBÒ¶¶W“¢7G"‡fÇVR’ç7G&—‚’–bfÇVR—2æ÷BæöæRVÇ6R""f÷"¶W’ÂfÇVR–â&÷ræ—FV×2‚—Ð¢–bæ÷Bç’†6ÆVæVBçfÇVW2‚’“ ¢6öçF–çVP¢f—'7EöæÖRÒ6ÆVæVBævWB‚&f—'7EöæÖR"Â""¢Æ7EöæÖRÒ6ÆVæVBævWB‚&Æ7EöæÖR"Â""¢VÖ–ÂÒ6ÆVæVBævWB‚&VÖ–Â"Â""¢&öÆRÒ6ÆVæVBævWB‚'&öÆR"Â'7Ffb"’æÆ÷vW"‚’÷"'7Ffb ¢7FGW2Ò6ÆVæVBævWB‚'7FGW2"Â&7F—fR"’æÆ÷vW"‚’÷"&7F—fR ¢†—&UöFFRÒ&÷rævWB‚&†—&UöFFR" ¢–bæ÷Bf—'7EöæÖR÷"æ÷BÆ7EöæÖS ¢W'&÷'2æVæB†b%&÷r·&÷uöçVÖ&W'Ó¢f—'7EöæÖRæBÆ7EöæÖR&R&WV—&VB"¢6öçF–çVP¢–bVÖ–ÂæB‚$"æ÷B–âVÖ–Â÷""â"æ÷B–âVÖ–Âç'7Æ—B‚$"Â•²ÓÒ“ ¢W'&÷'2æVæB†b%&÷r·&÷uöçVÖ&W'Ó¢–çfÆ–BVÖ–Â"¢6öçF–çVP¢–b&öÆRæ÷B–âfÆ–E÷&öÆW3 ¢W'&÷'2æVæB†b%&÷r·&÷uöçVÖ&W'Ó¢&öÆR×W7B&R7FfbÂÖævW"Â÷"7WW'f—6÷""¢6öçF–çVP¢–b7FGW2æ÷B–âfÆ–E÷7FGW6W3 ¢W'&÷'2æVæB†b%&÷r·&÷uöçVÖ&W'Ó¢7FGW2×W7B&R7F—fR÷"–æ7F—fR"¢6öçF–çVP¢–b—6–ç7Fæ6R††—&UöFFRÂFFWF–ÖR“ ¢†—&UöFFRÒ†—&UöFFRæFFR‚’æ—6öf÷&ÖB‚¢VÆ–b—6–ç7Fæ6R††—&UöFFRÂFFR“ ¢†—&UöFFRÒ†—&UöFFRæ—6öf÷&ÖB‚¢VÆ–b†—&UöFFS ¢†—&UöFFRÒ7G"††—&UöFFR’ç7G&—‚¢G'“ ¢FFWF–ÖRç7G'F–ÖR††—&UöFFRÂ"U’ÒVÒÒVB"¢W†6WBfÇVTW'&÷# ¢W'&÷'2æVæB†b%&÷r·&÷uöçVÖ&W'Ó¢†—&UöFFR×W7BW6R•••’ÔÔÒÔDB"¢6öçF–çVP¢VÇ6S ¢†—&UöFFRÒæöæP ¢&W&VBæVæB‚€¢7F÷&Uö–BÂf—'7EöæÖRÂÆ7EöæÖRÂVÖ–Â÷"æöæRÀ¢6ÆVæVBævWB‚'†öæR"’÷"æöæRÂ6ÆVæVBævWB‚'÷6—F–öâ"’÷"æöæRÀ¢&öÆRÂ7FGW2Â†—&UöFFRÀ¢’ ¢–bæ÷B&W&VC ¢FWF–ÂÒW'&÷'5³Ò–bW'&÷'2VÇ6R$æò7Ffb&÷w2vW&Rf÷VæBâ ¢fÆ6‚†b$æò7Ffb–×÷'FVBâ¶FWF–ÇÒ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢7W'6÷"æW†V7WFR‚%4TÄT5B–Be$ôÒ7F÷&W2t„U$R–BÒW2"Â‡7F÷&Uö–BÂ’¢–bæ÷B7W'6÷"æfWF6†öæR‚“ ¢fÆ6‚‚%7F÷&Ræ÷Bf÷VæBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢7W'6÷"æW†V7WFVÖç’€¢""$”å4U%B”åDò7Ff`¢‡7F÷&Uö–BÂf—'7EöæÖRÂÆ7EöæÖRÂVÖ–ÂÂ†öæRÂ÷6—F–öâÂ&öÆRÂ7FGW2Â†—&UöFFR¢dÅTU2‚W2ÂW2ÂW2ÂW2ÂW2ÂW2ÂW2ÂW2ÂW2’"""À¢&W&VBÀ¢¢6öæâæ6öÖÖ—B‚¢W†6WBW†6WF–öâ2W†3 ¢6öæâç&öÆÆ&6²‚¢ÆövvW"æW'&÷"‚%7Ffb'VÆ²–×÷'Bf–ÆVC¢W2"ÂW†2¢fÆ6‚‚%7Ffb–×÷'Bf–ÆVBâæòæWr&÷w2vW&R6fVBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢G'“ ¢ÆöuöVF—B€¢VçF—G•÷G—SÒ'7Ffb"À¢VçF—G•ö–C×7F÷&Uö–BÀ¢7F–öãÒ&'VÆµö–×÷'FVB"À¢æWu÷fÇVW3Öb$–×÷'FVB¶ÆVâ‡&W&VB—Ò7Ffc²6¶—VB¶ÆVâ†W'&÷'2—Ò–çfÆ–B&÷w3²7F÷&R”C¢·7F÷&Uö–GÒ"À¢¢W†6WBW†6WF–öã ¢70 ¢ÖW76vRÒb$–×÷'FVB¶ÆVâ‡&W&VB—Ò7FfbÖVÖ&W"‡2’7V66W76gVÆÇ’âFB&öf–ÆR–7GW&W2ÖçVÆÇ’W6–ærVF—B7Ffbâ ¢–bW'&÷'3 ¢ÖW76vR³Òb"6¶—VB¶ÆVâ†W'&÷'2—Ò–çfÆ–B&÷r‡2“¢"²#²"æ¦ö–â†W'&÷'5³£5Ò¢fÆ6‚†ÖW76vRÂ'v&æ–ær"–bW'&÷'2VÇ6R'7V66W72"¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’ ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2óÆ–çC§7F÷&Uö–Câ÷7FfbóÆ–çC§7Ffeö–CâöVF—B"ÂÖWF†öG3Õ²%õ5B%Ò¢&öÆU÷&WV—&VB‚wW6W"rÂvFÖ–ârÂw7WW&FÖ–âr¢FVbVF—E÷7Ffb‡7F÷&Uö–C¢–çBÂ7Ffeö–C¢–çB“ ¢–bæ÷B6åöÖævU÷7F÷&U÷7Ffb‡6W76–öå²wW6W%ö–BuÒÂ7F÷&Uö–B“ ¢fÆ6‚‚%–÷R6âöæÇ’VF—B7Ffb–â–÷W"76–væVB7F÷&Râ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢f—'7EöæÖRÒ&WVW7Bæf÷&ÒævWB‚&f—'7EöæÖR"Â""’ç7G&—‚¢Æ7EöæÖRÒ&WVW7Bæf÷&ÒævWB‚&Æ7EöæÖR"Â""’ç7G&—‚¢VÖ–ÂÒ&WVW7Bæf÷&ÒævWB‚&VÖ–Â"Â""’ç7G&—‚’÷"æöæP¢†öæRÒ&WVW7Bæf÷&ÒævWB‚'†öæR"Â""’ç7G&—‚’÷"æöæP¢÷6—F–öâÒ&WVW7Bæf÷&ÒævWB‚'÷6—F–öâ"Â""’ç7G&—‚’÷"æöæP¢&öÆRÒ&WVW7Bæf÷&ÒævWB‚'&öÆR"Â'7Ffb"¢7FGW2Ò&WVW7Bæf÷&ÒævWB‚'7FGW2"Â&7F—fR"¢†—&UöFFRÒ&WVW7Bæf÷&ÒævWB‚&†—&UöFFR"Â""’ç7G&—‚’÷"æöæP¢G'“ ¢†÷Fõ÷W&ÂÒ÷WÆöFVE÷7Ffe÷†÷Fò‚¢W†6WBfÇVTW'&÷"2W†3 ¢fÆ6‚‡7G"†W†2’Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7FfeöÖævVÖVçB"Â7F÷&Uö–C×7F÷&Uö–B’¢ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚ ¢2×•5Â&W÷'G2&÷v6÷VçCÓv†Vâ7V&Ö—GFVBfÇVW2&RVæ6†ævVBÂ6ð¢2fW&–g’F†R7Ffb&÷rW‡Æ–6—FÇ’–ç7FVBöbG&VF–ær&÷v6÷VçB2W†—7FVæ6Rà¢7W'6÷"æW†V7WFR€¢%4TÄT5Be$ôÒ7Ffbt„U$R–BÒW2äB7F÷&Uö–BÒW2Ä”Ô•B"À¢‡7Ffeö–BÂ7F÷&Uö–B’À¢¢–bæ÷B7W'6÷"æfWF6†öæR‚“ ¢fÆ6‚‚%7FfbÖVÖ&W"æ÷Bf÷VæB"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’¢ ¢2WFFR7FfbÖVÖ&W ¢7W'6÷"æW†V7WFR‚"" ¢UDDR7Ffb ¢4UBf—'7EöæÖRÒW2ÂÆ7EöæÖRÒW2ÂVÖ–ÂÒW2Â†öæRÒW2À¢÷6—F–öâÒW2Â†÷Fõ÷W&ÂÒ4ôÄU44R‚W2Â†÷Fõ÷W&Â’Â&öÆRÒW2Â7FGW2ÒW2Â†—&UöFFRÒW0¢t„U$R–BÒW2äB7F÷&Uö–BÒW0¢"""Â†f—'7EöæÖRÂÆ7EöæÖRÂVÖ–ÂÂ†öæRÂ÷6—F–öâÂ†÷Fõ÷W&ÂÂ&öÆRÂ7FGW2Â†—&UöFFRÂ7Ffeö–BÂ7F÷&Uö–B’¢ ¢6öæâæ6öÖÖ—B‚ ¢2ÆörF†R7FfbVF—@¢ÆöuöVF—B€¢VçF—G•÷G—SÒ'7Ffb"À¢VçF—G•ö–C×7Ffeö–BÀ¢7F–öãÒ'WFFVB"À¢æWu÷fÇVW3Öb$æÖS¢¶f—'7EöæÖWÒ¶Æ7EöæÖWÒÂ÷6—F–öã¢·÷6—F–öçÒÂ&öÆS¢·&öÆWÒÂ7FGW3¢·7FGW7ÒÂ7F÷&R”C¢·7F÷&Uö–GÒ ¢ ¢fÆ6‚†b%7FfbÖVÖ&W"Â'¶f—'7EöæÖWÒ¶Æ7EöæÖWÕÂ"WFFVB7V66W76gVÆÇ’"Â'7V66W72"¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"WFF–ær7Ffc¢¶WÒ"¢fÆ6‚†b$W'&÷"WFF–ær7Ffc¢¶WÒ"Â&FævW""¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢ ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’ ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2óÆ–çC§7F÷&Uö–Câ÷7FfbóÆ–çC§7Ffeö–CâöFVÆWFR"ÂÖWF†öG3Õ²%õ5B%Ò¢&öÆU÷&WV—&VB‚wW6W"rÂvFÖ–ârÂw7WW&FÖ–âr¢FVbFVÆWFU÷7Ffb‡7F÷&Uö–C¢–çBÂ7Ffeö–C¢–çB“ ¢–bæ÷B6åöÖævU÷7F÷&U÷7Ffb‡6W76–öå²wW6W%ö–BuÒÂ7F÷&Uö–B“ ¢fÆ6‚‚%–÷R6âöæÇ’FVÆWFR7Ffb–â–÷W"76–væVB7F÷&Râ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢ ¢2vWB7FfbÖVÖ&W"æÖRf÷"fÆ6‚ÖW76vP¢7W'6÷"æW†V7WFR‚%4TÄT5Bf—'7EöæÖRÂÆ7EöæÖRe$ôÒ7Ffbt„U$R–BÒW2äB7F÷&Uö–BÒW2"Â‡7Ffeö–BÂ7F÷&Uö–B’¢7FfbÒ7W'6÷"æfWF6†öæR‚¢ ¢–bæ÷B7Ffc ¢fÆ6‚‚%7FfbÖVÖ&W"æ÷Bf÷VæB"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’¢ ¢2FVÆWFR7FfbÖVÖ&W ¢7W'6÷"æW†V7WFR‚$DTÄUDRe$ôÒ7Ffbt„U$R–BÒW2äB7F÷&Uö–BÒW2"Â‡7Ffeö–BÂ7F÷&Uö–B’¢6öæâæ6öÖÖ—B‚¢ ¢2ÆörF†R7FfbFVÆWF–öà¢ÆöuöVF—B€¢VçF—G•÷G—SÒ'7Ffb"À¢VçF—G•ö–C×7Ffeö–BÀ¢7F–öãÒ&FVÆWFVB"À¢öÆE÷fÇVW3Öb$æÖS¢·7Ffe³×Ò·7Ffe³×ÒÂ7F÷&R”C¢·7F÷&Uö–GÒ ¢¢ ¢fÆ6‚†b%7FfbÖVÖ&W"Â'·7Ffe³×Ò·7Ffe³×ÕÂ"FVÆWFVB7V66W76gVÆÇ’"Â'7V66W72"¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"FVÆWF–ær7Ffc¢¶WÒ"¢fÆ6‚†b$W'&÷"FVÆWF–ær7Ffc¢¶WÒ"Â&FævW""¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢ ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–BÂF#Òw7Ffbr’ ¢ç&÷WFR‚"öFÖ–â÷&W7öç6W2óÆ–çC§&W7öç6Uö–CâöFVÆWFR"ÂÖWF†öG3Õ²%õ5B%Ò¢FVbFVÆWFU÷&W7öç6U÷&÷WFR‡&W7öç6Uö–C¢–çB“ ¢7F÷&Uö–BÒ&WVW7Bæ&w2ævWB‚'7F÷&Uö–B"¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢2FVÆWFRç7vW'2f—'7@¢7W'6÷"æW†V7WFR‚$DTÄUDRe$ôÒç7vW'2t„U$R&W7öç6Uö–BÒW2"Â‡&W7öç6Uö–BÂ’¢2FVÆWFR&W7öç6P¢7W'6÷"æW†V7WFR‚$DTÄUDRe$ôÒ&W7öç6W2t„U$R–BÒW2"Â‡&W7öç6Uö–BÂ’¢6öæâæ6öÖÖ—B‚¢fÆ6‚‚$fVVF&6²FVÆWFVB"Â'7V66W72"¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"FVÆWF–ær&W7öç6S¢¶WÒ"¢fÆ6‚†b$W'&÷"FVÆWF–ær&W7öç6S¢¶WÒ"Â&FævW""¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢ ¢–b7F÷&Uö–C ¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&UöfVVF&6²"Â7F÷&Uö–C×7F÷&Uö–B’¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&FÖ–åöF6†&ö&B"’ ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢2TU5D”ôâõ$DU"ÔätTÔTå@¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢ç&÷WFR‚"öFÖ–â÷VW7F–öç2óÆ–çC§VW7F–öåö–Câö÷&FW""ÂÖWF†öG3Õ²%õ5B%Ò¢FVbWFFU÷VW7F–öåö÷&FW"‡VW7F–öåö–C¢–çB“ ¢–b&WVW7BæÖWF†öBÓÒ%õ5B# ¢G'“ ¢FFÒ&WVW7BævWEö§6öâ‚¢æWuö÷&FW"Ò–çB†FFævWB‚'VW7F–öåö÷&FW""Â’¢FV×ÆFRÒVç7W&U÷FV×ÆFU÷VW7F–öææ—&R‚¢ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢7W'6÷"æW†V7WFR€¢"" ¢UDDRVW7F–öç2 ¢4UBVW7F–öåö÷&FW"ÒW2 ¢t„U$R–BÒW2äBVW7F–öææ—&Uö–BÒW2äB—5÷FV×ÆFRÒE%TP¢"""À¢†æWuö÷&FW"ÂVW7F–öåö–BÂ–çB‡FV×ÆFU²v–BuÒ’’À¢¢6öæâæ6öÖÖ—B‚¢–b7W'6÷"ç&÷v6÷VçBÓÒ ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢%VW7F–öâFöW2æ÷B&VÆöærFòF†—2Æ–6Vç6R'ÒÂC0¢&WGW&â²'7V66W72#¢G'VRÂ&ÖW76vR#¢%VW7F–öâ÷&FW"WFFVB'Ð¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢ ¢W†6WBW†6WF–öâ2S ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢7G"†R—ÒÂC ¢ ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢$ÖWF†öBæ÷BÆÆ÷vVB'ÒÂCP ¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢2dTTD$4²d”UtU"„DÔ”â¢2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ¢FVbfWF6…÷&W7öç6W5öf÷%÷7F÷&R‡7F÷&Uö–C¢–çBÂÆ–Ö—C¢–çBÒSÂ7FGW3¢7G"ÒæöæR’ÓâÆ—7E´F–7E·7G"Âç•ÕÓ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢ ¢–b7FGW2ÓÒ'Vç&W6öÇfVB# ¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B–BÂVW7F–öææ—&Uö–BÂ7F÷&Uö–BÂW6W%öVÖ–ÂÂ&V6V—EöçVÖ&W"Â7V&Ö—GFVEöBÂ7FGW0¢e$ôÒ&W7öç6W0¢t„U$R7F÷&Uö–BÒW2äB7FGW2ÒwVç&W6öÇfVBp¢õ$DU"%’7V&Ö—GFVEöBDU42Â–BDU40¢Ä”Ô•BW0¢"""À¢‡7F÷&Uö–BÂÆ–Ö—B’À¢¢VÆ–b7FGW2ÓÒ'&W6öÇfVB# ¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B–BÂVW7F–öææ—&Uö–BÂ7F÷&Uö–BÂW6W%öVÖ–ÂÂ&V6V—EöçVÖ&W"Â7V&Ö—GFVEöBÂ7FGW0¢e$ôÒ&W7öç6W0¢t„U$R7F÷&Uö–BÒW2äB7FGW2Òw&W6öÇfVBp¢õ$DU"%’7V&Ö—GFVEöBDU42Â–BDU40¢Ä”Ô•BW0¢"""À¢‡7F÷&Uö–BÂÆ–Ö—B’À¢¢VÇ6S ¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B–BÂVW7F–öææ—&Uö–BÂ7F÷&Uö–BÂW6W%öVÖ–ÂÂ&V6V—EöçVÖ&W"Â7V&Ö—GFVEöBÂ7FGW0¢e$ôÒ&W7öç6W0¢t„U$R7F÷&Uö–BÒW0¢õ$DU"%’7V&Ö—GFVEöBDU42Â–BDU40¢Ä”Ô•BW0¢"""À¢‡7F÷&Uö–BÂÆ–Ö—B’À¢¢&÷w2Ò7W'6÷"æfWF6†ÆÂ‚¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢&WGW&â&÷w0 ¢FVbfWF6…öç7vW'5öf÷%÷&W7öç6W2‡&W7öç6Uö–G3¢Æ—7E¶–çEÒ’ÓâF–7E¶–çBÂÆ—7E´F–7E·7G"Âç•ÕÕÓ ¢–bæ÷B&W7öç6Uö–G3 ¢&WGW&â·Ð¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢Æ6V†öÆFW'2Ò"Â"æ¦ö–â…²"W2%Ò¢ÆVâ‡&W7öç6Uö–G2’¢7W'6÷"æW†V7WFR€¢b"" ¢4TÄT5Bç&W7öç6Uö–BÂçVW7F–öåö–BÂæç7vW%÷FW‡BÂç&F–æu÷fÇVRÂçVW7F–öå÷FW‡BÂçVW7F–öå÷G—P¢e$ôÒç7vW'2¢¤ô”âVW7F–öç2ôâæ–BÒçVW7F–öåö–@¢t„U$Rç&W7öç6Uö–B”â‡·Æ6V†öÆFW'7Ò¢õ$DU"%’ç&W7öç6Uö–B42ÂçVW7F–öåö÷&FW"42Âæ–B40¢"""À¢GWÆR‡&W7öç6Uö–G2’À¢¢&÷w2Ò7W'6÷"æfWF6†ÆÂ‚¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢'•÷&W7öç6S¢F–7E¶–çBÂÆ—7E´F–7E·7G"Âç•ÕÕÒÒ·Ð¢f÷""–â&÷w3 ¢&–BÒ–çB‡%²'&W7öç6Uö–B%Ò¢'•÷&W7öç6Rç6WFFVfVÇB‡&–BÂµÒ’æVæB‡"¢&WGW&â'•÷&W7öç6P ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2óÆ–çC§7F÷&Uö–CâöFWF–Ç2"ÂÖWF†öG3Õ²$tUB%Ò¢FVb7F÷&UöFWF–Ç2‡7F÷&Uö–C¢–çB“ ¢7F÷&RÒfWF6…÷7F÷&Uö'•ö–B‡7F÷&Uö–C×7F÷&Uö–B¢–bæ÷B7F÷&S ¢fÆ6‚‚%7F÷&Ræ÷Bf÷VæBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&FÖ–åöF6†&ö&B"’ ¢2fWF6‚&V6VçBfVVF&6°¢&V6VçEöfVVF&6²ÒfWF6…÷&W7öç6W5öf÷%÷7F÷&R‡7F÷&Uö–C×7F÷&Uö–BÂÆ–Ö—CÓR¢ ¢26Æ7VÆFRæÇ—F–72FF¢ÆÅöfVVF&6²ÒfWF6…÷&W7öç6W5öf÷%÷7F÷&R‡7F÷&Uö–C×7F÷&Uö–BÂÆ–Ö—CÓ¢F÷FÅöfVVF&6²ÒÆVâ†ÆÅöfVVF&6²¢ ¢26Æ7VÆFRfW&vR&F–æp¢fu÷&F–ærÒ ¢ç7vW'5ö'•÷&W7öç6Uö–BÒ·Ð¢–bÆÅöfVVF&6³ ¢ÆÅ÷&W7öç6Uö–G2Ò¶–çB‡%²&–B%Ò’f÷""–âÆÅöfVVF&6µÐ¢ç7vW'5ö'•÷&W7öç6Uö–BÒfWF6…öç7vW'5öf÷%÷&W7öç6W2†ÆÅ÷&W7öç6Uö–G2¢ÆÅ÷&F–æw2ÒµÐ¢f÷"&W7öç6Uö–BÂç7vW'2–âç7vW'5ö'•÷&W7öç6Uö–Bæ—FV×2‚“ ¢f÷"ç7vW"–âç7vW'3 ¢–bç7vW"ævWB‚'&F–æu÷fÇVR"“ ¢ÆÅ÷&F–æw2æVæB†fÆöB†ç7vW%²'&F–æu÷fÇVR%Ò’¢–bÆÅ÷&F–æw3 ¢fu÷&F–ærÒ7VÒ†ÆÅ÷&F–æw2’òÆVâ†ÆÅ÷&F–æw2¢ ¢2Væ†æ6VBR×7F"&F–æræÇ—F–70¢&F–æuöF—7G&–'WF–öâÒ³ÂÂÂÂÒ2ÓR7F'0¢F÷FÅ÷&F–æw2Ò ¢f÷"&W7öç6Uö–BÂç7vW'2–âç7vW'5ö'•÷&W7öç6Uö–Bæ—FV×2‚“ ¢f÷"ç7vW"–âç7vW'3 ¢–bç7vW"ævWB‚'&F–æu÷fÇVR"“ ¢&F–ærÒ–çB†fÆöB†ç7vW%²'&F–æu÷fÇVR%Ò’¢–bÃÒ&F–ærÃÒS ¢&F–æuöF—7G&–'WF–öå·&F–ærÒÒ³Ò¢F÷FÅ÷&F–æw2³Ò¢ ¢26Æ7VÆFRR×7F"7V6–f–2ÖWG&–70¢f—fU÷7F%ö6÷VçBÒ&F–æuöF—7G&–'WF–öå³EÒ2R7F'0¢f÷W%÷7F%ö6÷VçBÒ&F–æuöF—7G&–'WF–öå³5Ò2B7F'0¢F‡&VU÷7F%ö6÷VçBÒ&F–æuöF—7G&–'WF–öå³%Ò227F'0¢Gvõ÷7F%ö6÷VçBÒ&F–æuöF—7G&–'WF–öå³Ò2"7F'0¢öæU÷7F%ö6÷VçBÒ&F–æuöF—7G&–'WF–öå³Ò27F ¢ ¢26Æ7VÆFRW&6VçFvW0¢f—fU÷7F%÷W&6VçFvRÒ†f—fU÷7F%ö6÷VçBòF÷FÅ÷&F–æw2¢’–bF÷FÅ÷&F–æw2âVÇ6R ¢f÷W%÷ÇW5÷7F%÷W&6VçFvRÒ‚†f÷W%÷7F%ö6÷VçB²f—fU÷7F%ö6÷VçB’òF÷FÅ÷&F–æw2¢’–bF÷FÅ÷&F–æw2âVÇ6R ¢F‡&VU÷ÇW5÷7F%÷W&6VçFvRÒ‚‡F‡&VU÷7F%ö6÷VçB²f÷W%÷7F%ö6÷VçB²f—fU÷7F%ö6÷VçB’òF÷FÅ÷&F–æw2¢’–bF÷FÅ÷&F–æw2âVÇ6R ¢ ¢2&F–ærVÆ—G’66÷&R‡vV–v‡FVBfW&vR¢&F–æu÷VÆ—G•÷66÷&RÒ€¢†öæU÷7F%ö6÷VçB¢’°¢‡Gvõ÷7F%ö6÷VçB¢"’°¢‡F‡&VU÷7F%ö6÷VçB¢2’°¢†f÷W%÷7F%ö6÷VçB¢B’°¢†f—fU÷7F%ö6÷VçB¢R¢’òF÷FÅ÷&F–æw2–bF÷FÅ÷&F–æw2âVÇ6R ¢ ¢2fWF6‚7FfbÖVÖ&W'0¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢7W'6÷"æW†V7WFR‚"" ¢4TÄT5B–BÂf—'7EöæÖRÂÆ7EöæÖRÂVÖ–ÂÂ†öæRÂ÷6—F–öâÂ&öÆRÂ7FGW0¢e$ôÒ7Ffb ¢t„U$R7F÷&Uö–BÒW0¢õ$DU"%’&öÆRDU42ÂÆ7EöæÖRÂf—'7EöæÖP¢"""Â‡7F÷&Uö–BÂ’¢7FfeöÖVÖ&W'2Ò7W'6÷"æfWF6†ÆÂ‚¢7W'6÷"æ6Æ÷6R‚¢6öæâæ6Æ÷6R‚¢ ¢F÷FÅ÷7FfbÒÆVâ‡7FfeöÖVÖ&W'2¢ ¢2fWF6‚6öÖÖVæFF–öç0¢6öÖÖVæFF–öç5ö'•÷&W7öç6Uö–BÒ·Ð¢6öÖÖVæFF–öç2ÒµÐ¢–bÆÅöfVVF&6³ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢&W7öç6Uö–G2Ò¶–çB‡%²&–B%Ò’f÷""–âÆÅöfVVF&6µÐ¢Æ6V†öÆFW'2ÒrÂræ¦ö–â…²rW2uÒ¢ÆVâ‡&W7öç6Uö–G2’¢7W'6÷"æW†V7WFR†b"" ¢4TÄT5B62â¢Â2æf—'7EöæÖRÂ2æÆ7EöæÖRÂ2ç÷6—F–öâÂ2ç&öÆP¢e$ôÒ7Ffeö6öÖÖVæFF–öç260¢¤ô”â7Ffb2ôâ62ç7Ffeö–BÒ2æ–@¢t„U$R62ç&W7öç6Uö–B”â‡·Æ6V†öÆFW'7Ò¢õ$DU"%’62æ7&VFVEöBDU40¢"""Â&W7öç6Uö–G2¢6öÖÖVæFF–öç2Ò7W'6÷"æfWF6†ÆÂ‚¢7W'6÷"æ6Æ÷6R‚¢6öæâæ6Æ÷6R‚¢ ¢f÷"6öÖÖVæFF–öâ–â6öÖÖVæFF–öç3 ¢&W7öç6Uö–BÒ6öÖÖVæFF–öå²w&W7öç6Uö–BuÐ¢–b&W7öç6Uö–Bæ÷B–â6öÖÖVæFF–öç5ö'•÷&W7öç6Uö–C ¢6öÖÖVæFF–öç5ö'•÷&W7öç6Uö–E·&W7öç6Uö–EÒÒµÐ¢6öÖÖVæFF–öç5ö'•÷&W7öç6Uö–E·&W7öç6Uö–EÒæVæB†6öÖÖVæFF–öâ¢ ¢F÷FÅö6öÖÖVæFF–öç2Ò7VÒ†ÆVâ†6öÖ×2’f÷"6öÖ×2–â6öÖÖVæFF–öç5ö'•÷&W7öç6Uö–BçfÇVW2‚’¢ ¢27FfbæÇ—F–72Ò6öÖÖVæFF–öç2W"7Ff`¢7Ffeö6öÖÖVæFF–öç2Ò·Ð¢–b6öÖÖVæFF–öç3 ¢f÷"6öÖÖVæFF–öâ–â6öÖÖVæFF–öç3 ¢7Ffeö–BÒ6öÖÖVæFF–öå²w7Ffeö–BuÐ¢–b7Ffeö–Bæ÷B–â7Ffeö6öÖÖVæFF–öç3 ¢7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÒÒ°¢w7FfeöæÖRs¢b'¶6öÖÖVæFF–öå²vf—'7EöæÖRu×Ò¶6öÖÖVæFF–öå²vÆ7EöæÖRu×Ò"À¢w7Ffe÷÷6—F–öâs¢6öÖÖVæFF–öå²w÷6—F–öâuÒ÷"6öÖÖVæFF–öå²w&öÆRuÒçF—FÆR‚’À¢wF÷FÅö6öÖÖVæFF–öç2s¢À¢w&F–æu÷7VÒs¢À¢v6öÖÖVæFF–öå÷G—W2s¢·ÒÀ¢v6öÖÖVçG2s¢µÐ¢Ð¢ ¢7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²wF÷FÅö6öÖÖVæFF–öç2uÒ³Ò¢7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²w&F–æu÷7VÒuÒ³Ò†6öÖÖVæFF–öå²w&F–æruÒ÷"R¢ ¢26÷VçB'’G—P¢5÷G—RÒ6öÖÖVæFF–öå²v6öÖÖVæFF–öå÷G—RuÐ¢–b5÷G—Ræ÷B–â7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²v6öÖÖVæFF–öå÷G—W2uÓ ¢7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²v6öÖÖVæFF–öå÷G—W2uÕ¶5÷G—UÒÒ ¢7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²v6öÖÖVæFF–öå÷G—W2uÕ¶5÷G—UÒ³Ò¢ ¢26öÆÆV7B6öÖÖVçG0¢–b6öÖÖVæFF–öå²v6öÖÖVçBuÓ ¢7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²v6öÖÖVçG2uÒæVæB†6öÖÖVæFF–öå²v6öÖÖVçBuÒ¢ ¢26Æ7VÆFRfu÷&F–æræBvV–v‡FVE÷66÷&Rf÷"V6‚7FfbÂ6÷'B'’vV–v‡FVE÷66÷&P¢f÷"7Ffeö–B–â7Ffeö6öÖÖVæFF–öç3 ¢–b7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²wF÷FÅö6öÖÖVæFF–öç2uÒâ ¢7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²vfu÷&F–æruÒÒ7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²w&F–æu÷7VÒuÒò7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²wF÷FÅö6öÖÖVæFF–öç2uÐ¢7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²wvV–v‡FVE÷66÷&RuÒÒ7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²vfu÷&F–æruÒ¢‡7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²wF÷FÅö6öÖÖVæFF–öç2uÒ¢¢ãR¢VÇ6S ¢7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²vfu÷&F–æruÒÒ ¢7Ffeö6öÖÖVæFF–öç5·7Ffeö–EÕ²wvV–v‡FVE÷66÷&RuÒÒ ¢F÷÷7FfbÒ6÷'FVB‡7Ffeö6öÖÖVæFF–öç2çfÇVW2‚’Â¶W“ÖÆÖ&Fƒ¢…²wvV–v‡FVE÷66÷&RuÒÂ&WfW'6SÕG'VR¢ ¢2–FVçF–g’7Ffbv—F‚÷FVçF–Â—77VW2†Æ÷r÷"æò6öÖÖVæFF–öç2¢7Ffe÷W&f÷&Öæ6RÒµÐ¢f÷"7FfeöÖVÖ&W"–â7FfeöÖVÖ&W'3 ¢7Ffeö–BÒ7FfeöÖVÖ&W%²v–BuÐ¢7FfeöæÖRÒb'·7FfeöÖVÖ&W%²vf—'7EöæÖRu×Ò·7FfeöÖVÖ&W%²vÆ7EöæÖRu×Ò ¢7Ffe÷÷6—F–öâÒ7FfeöÖVÖ&W%²w÷6—F–öâuÒ÷"7FfeöÖVÖ&W%²w&öÆRuÒçF—FÆR‚¢ ¢6öÖÖVæFF–öåö6÷VçBÒ7Ffeö6öÖÖVæFF–öç2ævWB‡7Ffeö–BÂ·Ò’ævWB‚wF÷FÅö6öÖÖVæFF–öç2rÂ¢ ¢26Æ7VÆFRW&f÷&Öæ6R66÷&R&6VBöâ6öÖÖVæFF–öç0¢W&f÷&Öæ6U÷66÷&RÒvW†6VÆÆVçBp¢–b6öÖÖVæFF–öåö6÷VçBÓÒ ¢W&f÷&Öæ6U÷66÷&RÒvæVVG5öGFVçF–öâp¢VÆ–b6öÖÖVæFF–öåö6÷VçBÂ3 ¢W&f÷&Öæ6U÷66÷&RÒvfW&vRp¢ ¢7Ffe÷W&f÷&Öæ6RæVæB‡°¢w7Ffeö–Bs¢7Ffeö–BÀ¢w7FfeöæÖRs¢7FfeöæÖRÀ¢w7Ffe÷÷6—F–öâs¢7Ffe÷÷6—F–öâÀ¢v6öÖÖVæFF–öåö6÷VçBs¢6öÖÖVæFF–öåö6÷VçBÀ¢wW&f÷&Öæ6U÷66÷&Rs¢W&f÷&Öæ6U÷66÷&RÀ¢w&öÆRs¢7FfeöÖVÖ&W%²w&öÆRuÐ¢Ò¢ ¢26÷'B'’W&f÷&Öæ6R‡F†÷6RæVVF–ærGFVçF–öâf—'7B¢7Ffe÷W&f÷&Öæ6Rç6÷'B†¶W“ÖÆÖ&Fƒ¢‡…²wW&f÷&Öæ6U÷66÷&RuÒÒvæVVG5öGFVçF–öârÂ…²v6öÖÖVæFF–öåö6÷VçBuÒ’¢ ¢26Æ7VÆFRÖWG&–72†Öö6²FFf÷"æ÷r¢&W6öÇWF–öå÷&FRÒƒR–bF÷FÅöfVVF&6²âVÇ6R ¢&W7öç6U÷F–ÖRÒ"ãP¢6öÖÖVæFF–öå÷&FRÒ&÷VæB‚‡F÷FÅö6öÖÖVæFF–öç2òF÷FÅöfVVF&6²¢’–bF÷FÅöfVVF&6²âVÇ6R¢&WVE÷&FRÒC ¢ ¢2fVVF&6²G&VæBFF†Öö6²FFf÷"æ÷r¢fVVF&6µ÷G&VæEöÆ&VÇ2Ò²t¦ârÂtfV"rÂtÖ"rÂt"rÂtÖ’rÂt§VâuÐ¢fVVF&6µ÷G&VæEöFFÒ³"Â’ÂRÂ#RÂ#"Â3Ð¢ ¢2vVæW&FR"6öFRf÷"F†R7F÷&P¢V&Æ–5÷W&ÂÒvWE÷7F÷&U÷V&Æ–5÷W&Â‡7F÷&Uö–C×7F÷&U²v–BuÒ¢%öFF÷W&’ÒvVæW&FU÷%öFF÷W&’‡V&Æ–5÷W&Â¢ ¢&WGW&â&VæFW%÷FV×ÆFR€¢&ÖævU÷7F÷&W2÷7F÷&UöFWF–Ç2æ‡FÖÂ"À¢7F÷&S×7F÷&RÀ¢&V6VçEöfVVF&6³×&V6VçEöfVVF&6²À¢F÷FÅöfVVF&6³×F÷FÅöfVVF&6²À¢fu÷&F–æsÖfu÷&F–ærÀ¢&F–æuöF—7G&–'WF–öã×&F–æuöF—7G&–'WF–öâÀ¢7FfeöÖVÖ&W'3×7FfeöÖVÖ&W'2À¢F÷FÅ÷7Ffc×F÷FÅ÷7FfbÀ¢F÷FÅö6öÖÖVæFF–öç3×F÷FÅö6öÖÖVæFF–öç2À¢&W6öÇWF–öå÷&FS×&W6öÇWF–öå÷&FRÀ¢&W7öç6U÷F–ÖS×&W7öç6U÷F–ÖRÀ¢6öÖÖVæFF–öå÷&FSÖ6öÖÖVæFF–öå÷&FRÀ¢&WVE÷&FS×&WVE÷&FRÀ¢fVVF&6µ÷G&VæEöÆ&VÇ3ÖfVVF&6µ÷G&VæEöÆ&VÇ2À¢fVVF&6µ÷G&VæEöFFÖfVVF&6µ÷G&VæEöFFÀ¢V&Æ–5÷W&Ã×V&Æ–5÷W&ÂÀ¢%öFF÷W&“×%öFF÷W&’À¢F÷÷7Ffc×F÷÷7FfbÀ¢7Ffe÷W&f÷&Öæ6S×7Ffe÷W&f÷&Öæ6RÀ¢7Ffeö6öÖÖVæFF–öç3×7Ffeö6öÖÖVæFF–öç2À¢2Væ†æ6VBR×7F"&F–æræÇ—F–70¢F÷FÅ÷&F–æw3×F÷FÅ÷&F–æw2À¢f—fU÷7F%ö6÷VçCÖf—fU÷7F%ö6÷VçBÀ¢f—fU÷7F%÷W&6VçFvSÖf—fU÷7F%÷W&6VçFvRÀ¢f÷W%÷ÇW5÷7F%÷W&6VçFvSÖf÷W%÷ÇW5÷7F%÷W&6VçFvRÀ¢F‡&VU÷ÇW5÷7F%÷W&6VçFvS×F‡&VU÷ÇW5÷7F%÷W&6VçFvRÀ¢&F–æu÷VÆ—G•÷66÷&S×&F–æu÷VÆ—G•÷66÷&RÀ¢ ¢ç&÷WFR‚"öFÖ–â÷7F÷&W2óÆ–çC§7F÷&Uö–CâöfVVF&6²"ÂÖWF†öG3Õ²$tUB%Ò¢Æöv–å÷&WV—&V@¢FVb7F÷&UöfVVF&6²‡7F÷&Uö–C¢–çB“ ¢–bæ÷B6åöÖævU÷7F÷&U÷7Ffb‡6W76–öå²wW6W%ö–BuÒÂ7F÷&Uö–B“ ¢fÆ6‚‚%–÷R6âöæÇ’66W72–÷W"76–væVB7F÷&Râ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚'7F÷&W5öÖævVÖVçB"’¢2†æFÆRÖ&¶–ær7V6–f–2æ÷F–f–6F–öâ2&VB–b&WVW7FV@¢Ö&µ÷&VEö–BÒ&WVW7Bæ&w2ævWB‚vÖ&µ÷&VBr¢–bÖ&µ÷&VEö–C ¢G'“ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢7W'6÷"Ò6öæâæ7W'6÷"‚¢7W'6÷"æW†V7WFR‚%UDDR&W7öç6W24UB—5÷&VBÒE%TRt„U$R–BÒW2"Â†–çB†Ö&µ÷&VEö–B’Â’¢6öæâæ6öÖÖ—B‚¢6öæâæ6Æ÷6R‚¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"Ö&¶–ær7V6–f–2æ÷F–f–6F–öâ2&VC¢¶WÒ" ¢7F÷&RÒfWF6…÷7F÷&Uö'•ö–B‡7F÷&Uö–C×7F÷&Uö–B¢–bæ÷B7F÷&S ¢fÆ6‚‚%7F÷&Ræ÷Bf÷VæBâ"Â&FævW""¢&WGW&â&VF—&V7B‡W&Åöf÷"‚&FÖ–åöF6†&ö&B"’ ¢7FGW2Ò&WVW7Bæ&w2ævWB‚w7FGW2rÂvÆÂr¢&W7öç6W2ÒfWF6…÷&W7öç6W5öf÷%÷7F÷&R‡7F÷&Uö–C×7F÷&Uö–BÂÆ–Ö—CÓSÂ7FGW3×7FGW2¢ç7vW'5ö'•÷&W7öç6Uö–BÒfWF6…öç7vW'5öf÷%÷&W7öç6W2…¶–çB‡%²&–B%Ò’f÷""–â&W7öç6W5Ò¢ ¢2fWF6‚7Ffb6öÖÖVæFF–öç2f÷"F†W6R&W7öç6W0¢6öÖÖVæFF–öç5ö'•÷&W7öç6Uö–BÒ·Ð¢–b&W7öç6W3 ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢&W7öç6Uö–G2Ò¶–çB‡%²&–B%Ò’f÷""–â&W7öç6W5Ð¢Æ6V†öÆFW'2ÒrÂræ¦ö–â…²rW2uÒ¢ÆVâ‡&W7öç6Uö–G2’¢7W'6÷"æW†V7WFR†b"" ¢4TÄT5B62â¢Â2æf—'7EöæÖRÂ2æÆ7EöæÖRÂ2ç÷6—F–öâÂ2ç&öÆP¢e$ôÒ7Ffeö6öÖÖVæFF–öç260¢¤ô”â7Ffb2ôâ62ç7Ffeö–BÒ2æ–@¢t„U$R62ç&W7öç6Uö–B”â‡·Æ6V†öÆFW'7Ò¢õ$DU"%’62æ7&VFVEöBDU40¢"""Â&W7öç6Uö–G2¢6öÖÖVæFF–öç2Ò7W'6÷"æfWF6†ÆÂ‚¢7W'6÷"æ6Æ÷6R‚¢6öæâæ6Æ÷6R‚¢ ¢f÷"6öÖÖVæFF–öâ–â6öÖÖVæFF–öç3 ¢&W7öç6Uö–BÒ6öÖÖVæFF–öå²w&W7öç6Uö–BuÐ¢–b&W7öç6Uö–Bæ÷B–â6öÖÖVæFF–öç5ö'•÷&W7öç6Uö–C ¢6öÖÖVæFF–öç5ö'•÷&W7öç6Uö–E·&W7öç6Uö–EÒÒµÐ¢6öÖÖVæFF–öç5ö'•÷&W7öç6Uö–E·&W7öç6Uö–EÒæVæB†6öÖÖVæFF–öâ ¢26Æ7VÆFR7Ffb6÷VçBæBfW&vR&F–æp¢7Ffeö6÷VçBÒvWE÷7Ffeö6÷VçEöf÷%÷7F÷&R‡7F÷&Uö–B¢7Ffe÷W&f÷&Öæ6RÒvWE÷7Ffe÷W&f÷&Öæ6Uöf÷%÷7F÷&R‡7F÷&Uö–B¢ ¢26Æ7VÆFRfW&vR&F–ærg&öÒ&W7öç6W0¢fu÷&F–æw2ÒµÐ¢f÷"&W7öç6R–â&W7öç6W3 ¢&W7öç6Uöç7vW'2Òç7vW'5ö'•÷&W7öç6Uö–BævWB‡&W7öç6U²&–B%ÒÂµÒ¢&F–æuöç7vW'2Ò¶f÷"–â&W7öç6Uöç7vW'2–bævWB‚'VW7F–öå÷G—R"’ÓÒ'&F–ær%Ð¢–b&F–æuöç7vW'3 ¢fu÷&F–ærÒ7VÒ†ævWB‚'&F–æu÷fÇVR"Â’f÷"–â&F–æuöç7vW'2’òÆVâ‡&F–æuöç7vW'2¢fu÷&F–æw2æVæB†fu÷&F–ær¢ ¢fW&vU÷&F–ærÒ&÷VæB‡7VÒ†fu÷&F–æw2’òÆVâ†fu÷&F–æw2’Â’–bfu÷&F–æw2VÇ6Rã  ¢&WGW&â&VæFW%÷FV×ÆFR€¢&ÖævU÷7F÷&W2öfVVF&6²æ‡FÖÂ"À¢7F÷&S×7F÷&RÀ¢&W7öç6W3×&W7öç6W2À¢ç7vW'5ö'•÷&W7öç6Uö–CÖç7vW'5ö'•÷&W7öç6Uö–BÀ¢6öÖÖVæFF–öç5ö'•÷&W7öç6Uö–CÖ6öÖÖVæFF–öç5ö'•÷&W7öç6Uö–BÀ¢7W'&VçE÷7FGW3×7FGW2À¢7Ffeö6÷VçC×7Ffeö6÷VçBÀ¢7Ffe÷W&f÷&Öæ6S×7Ffe÷W&f÷&Öæ6RÀ¢fW&vU÷&F–æsÖfW&vU÷&F–ærÀ¢ ¢ç&÷WFR‚"öFÖ–â÷&W7öç6W2óÆ–çC§&W7öç6Uö–Câ÷7FGW2"ÂÖWF†öG3Õ²%õ5B%Ò¢FVbWFFU÷&W7öç6U÷7FGW2‡&W7öç6Uö–C¢–çB“ ¢G'“ ¢FFÒ&WVW7BævWEö§6öâ‚¢æWu÷7FGW2ÒFFævWB‚w7FGW2r¢ ¢–bæWu÷7FGW2æ÷B–â²w&W6öÇfVBrÂwVç&W6öÇfVBuÓ ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢$–çfÆ–B7FGW2'ÒÂC ¢ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢7W'6÷"æW†V7WFR€¢%UDDR&W7öç6W24UB7FGW2ÒW2t„U$R–BÒW2"À¢†æWu÷7FGW2Â&W7öç6Uö–B¢¢6öæâæ6öÖÖ—B‚¢fÆ6‚†b$fVVF&6²Ö&¶VB2¶æWu÷7FGW7Ò"Â'7V66W72"¢&WGW&â²'7V66W72#¢G'VWÐ¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢ ¢W†6WBW†6WF–öâ2S ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢7G"†R—ÒÂS  ¢ç&÷WFR‚"ö’öæ÷F–f–6F–öç2÷Vç&VB"¢Æöv–å÷&WV—&V@¢FVbvWE÷Vç&VEöæ÷F–f–6F–öç2‚“ ¢""$fWF6‚fVVF&6²æ÷F–f–6F–öç2f÷"F†R&VÆÂ–6öâÂ6öÖ&–æ–ærfVVF&6²æB7—7FVÒæ÷F–f–6F–öç2à ¢VW'’&×3 ¢Ò7FGW3¢wVç6VVâr†FVfVÇB&WGW&ç2&÷F‚f÷"–æ—F–ÂÆöB’Âw6VVârFòfWF6‚vRöb6VVà¢Ò6VVåööfg6WC¢–çBÂöfg6WB–çFòF†R6VVâÆ—7B†FVfVÇB¢Ò6VVåöÆ–Ö—C¢–çBÂvR6—¦Rf÷"6VVâ†FVfVÇB#ÂÖ‚S¢"" ¢G'“ ¢7FGW2Ò&WVW7Bæ&w2ævWB‚w7FGW2rÂvÆÂr¢6VVåööfg6WBÒÖ‚†–çB‡&WVW7Bæ&w2ævWB‚w6VVåööfg6WBrÂ’’Â¢6VVåöÆ–Ö—BÒÖ–â†Ö‚†–çB‡&WVW7Bæ&w2ævWB‚w6VVåöÆ–Ö—BrÂ#’’Â’ÂS¢W†6WBfÇVTW'&÷# ¢7FGW2ÒvÆÂp¢6VVåööfg6WBÒ ¢6VVåöÆ–Ö—BÒ#  ¢FVböf÷&ÖB‡&÷w2“ ¢f÷"â–â&÷w3 ¢–bâævWB‚v7&VFVEöBr“ ¢å²v7&VFVEöBuÒÒå²v7&VFVEöBuÒç7G&gF–ÖR‚rV"VBÂTƒ¢TÒr¢VÇ6S ¢å²v7&VFVEöBuÒÒtâôp¢–bâævWB‚væ÷F–f–6F–öå÷G—Rr’ÓÒw7—7FVÒs ¢å²w7—7FVÕö–BuÒÒå²v–BuÐ¢å²v–BuÒÒæöæP¢&WGW&â&÷w0 ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR ¢Vç6VVâÒµÐ¢6VVâÒµÐ¢6VVå÷F÷FÂÒ  ¢2vWBW6W"w276–væVB7F÷&W2†Æ–W2FòÆÂW6W'2W†6WB7WW&FÖ–â¢W6W%ö–BÒ6W76–öâævWB‚wW6W%ö–Br¢W6W%÷&öÆRÒ6W76–öâævWB‚w&öÆRr¢76–væVE÷7F÷&Uö–G2ÒµÐ¢–bW6W%ö–BæBW6W%÷&öÆRÒw7WW&FÖ–âs ¢2vWB7F÷&W276–væVBf–W6W%÷7F÷&W2F&ÆP¢7W'6÷"æW†V7WFR€¢%4TÄT5B7F÷&Uö–Be$ôÒW6W%÷7F÷&W2t„U$RW6W%ö–BÒW2"À¢‡W6W%ö–BÂ¢¢76–væVE÷7F÷&Uö–G2Ò·&÷u²w7F÷&Uö–BuÒf÷"&÷r–â7W'6÷"æfWF6†ÆÂ‚•Ð ¢2Ç6ò–æ6ÇVFR7F÷&W2v†W&RF†RW6W"—2F†R÷væW"‡7F÷&W2çW6W%ö–B¢7W'6÷"æW†V7WFR€¢%4TÄT5B–Be$ôÒ7F÷&W2t„U$RW6W%ö–BÒW2"À¢‡W6W%ö–BÂ¢¢÷væVE÷7F÷&Uö–G2Ò·&÷u²v–BuÒf÷"&÷r–â7W'6÷"æfWF6†ÆÂ‚•Ð¢26öÖ&–æRæBFVGWÆ–6FP¢76–væVE÷7F÷&Uö–G2ÒÆ—7B‡6WB†76–væVE÷7F÷&Uö–G2²÷væVE÷7F÷&Uö–G2’ ¢2'V–ÆBt„U$R6ÆW6Rf÷"7F÷&Rf–ÇFW&–æp¢7F÷&Uöf–ÇFW"Ò" ¢–b76–væVE÷7F÷&Uö–G3 ¢Æ6V†öÆFW'2ÒrÂræ¦ö–â…²rW2uÒ¢ÆVâ†76–væVE÷7F÷&Uö–G2’¢7F÷&Uöf–ÇFW"Òb$äB"ç7F÷&Uö–B”â‡·Æ6V†öÆFW'7Ò’ ¢VÆ–bW6W%÷&öÆRÒw7WW&FÖ–âs ¢2æöâ×7WW&FÖ–âv—F‚æò76–væVB7F÷&W2Ò6†÷ræòfVVF&6²æ÷F–f–6F–öç0¢7F÷&Uöf–ÇFW"Ò$äBÓ  ¢–b7FGW2–â‚vÆÂrÂwVç6VVâr“ ¢2fWF6‚ÄÂVç6VVâfVVF&6²&W7öç6W2†æò66òW6W"Çv—26VW2F†VÒ¢VW'’Òb"" ¢4TÄT5B"æ–BÂ"çW6W%öVÖ–ÂÂ"ç7V&Ö—GFVEöB27&VFVEöBÂ2ç7F÷&UöæÖRÂ2æ–B27F÷&Uö–BÂ"æ—5÷&VBÂvfVVF&6²r2æ÷F–f–6F–öå÷G—RÂåTÄÂ2ÖW76vRÂåTÄÂ2G—RÀ¢…4TÄT5Bdr†ç&F–æu÷fÇVR’e$ôÒç7vW'2t„U$Rç&W7öç6Uö–BÒ"æ–BäBç&F–æu÷fÇVR•2äõBåTÄÂ’2fu÷&F–æp¢e$ôÒ&W7öç6W2 ¢¤ô”â7F÷&W22ôâ"ç7F÷&Uö–BÒ2æ–@¢t„U$R2ç7F÷&UöæÖR•2äõBåTÄÂäB"æ—5÷&VBÒdÅ4R·7F÷&Uöf–ÇFW'Ð¢õ$DU"%’"ç7V&Ö—GFVEöBDU40¢"" ¢–b76–væVE÷7F÷&Uö–G3 ¢7W'6÷"æW†V7WFR‡VW'’Â76–væVE÷7F÷&Uö–G2¢VÇ6S ¢7W'6÷"æW†V7WFR‡VW'’¢Vç6VVåöfVVF&6²Ò7W'6÷"æfWF6†ÆÂ‚ ¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B–BÂÖW76vRÂG—RÂ7&VFVEöBÂ—5÷&VBÂw7—7FVÒr2æ÷F–f–6F–öå÷G—RÂåTÄÂ2W6W%öVÖ–ÂÂåTÄÂ27F÷&UöæÖRÂåTÄÂ27F÷&Uö–@¢e$ôÒ7—7FVÕöæ÷F–f–6F–öç0¢t„U$R—5÷&VBÒdÅ4P¢õ$DU"%’7&VFVEöBDU40¢"" ¢¢Vç6VVå÷7—7FVÒÒ7W'6÷"æfWF6†ÆÂ‚ ¢Vç6VVâÒ6÷'FVB€¢Vç6VVåöfVVF&6²²Vç6VVå÷7—7FVÒÀ¢¶W“ÖÆÖ&Fƒ¢…²v7&VFVEöBuÒ÷"FFWF–ÖRæÖ–âÀ¢&WfW'6SÕG'VRÀ¢¢öf÷&ÖB‡Vç6VVâ ¢–b7FGW2–â‚vÆÂrÂw6VVâr“ ¢2÷F–öæÂ7WFöfc¢†–FR6VVâæ÷F–f–6F–öç27V&Ö—GFVBB÷"&Vf÷&RF†—2F–ÖP¢6ÆV&VEöBÒ6W76–öâævWB‚væ÷F–f–6F–öç5ö6ÆV&VEöBr¢6ÆV&VEöGBÒæöæP¢–b6ÆV&VEöC ¢G'“ ¢6ÆV&VEöGBÒFFWF–ÖRæg&öÖ—6öf÷&ÖB†6ÆV&VEöB¢W†6WB…fÇVTW'&÷"ÂG—TW'&÷"“ ¢6ÆV&VEöGBÒæöæP ¢2F÷FÂ6VVâ6÷VçB†f÷"&ÆöBÖ÷&R"T’’Â&W7V7F–ær6ÆV&VB7WFöf`¢–b6ÆV&VEöGC ¢–b76–væVE÷7F÷&Uö–G3 ¢Æ6V†öÆFW'2ÒrÂræ¦ö–â…²rW2uÒ¢ÆVâ†76–væVE÷7F÷&Uö–G2’¢7W'6÷"æW†V7WFR€¢b%4TÄT5B4õTåB‚¢’26÷VçBe$ôÒ&W7öç6W2"¤ô”â7F÷&W22ôâ"ç7F÷&Uö–BÒ2æ–Bt„U$R2ç7F÷&UöæÖR•2äõBåTÄÂäB"æ—5÷&VBÒE%TRäB"ç7V&Ö—GFVEöBâW2äB"ç7F÷&Uö–B”â‡·Æ6V†öÆFW'7Ò’"À¢¶6ÆV&VEöGEÒ²76–væVE÷7F÷&Uö–G0¢¢VÇ6S ¢7W'6÷"æW†V7WFR€¢%4TÄT5B4õTåB‚¢’26÷VçBe$ôÒ&W7öç6W2"¤ô”â7F÷&W22ôâ"ç7F÷&Uö–BÒ2æ–Bt„U$R2ç7F÷&UöæÖR•2äõBåTÄÂäB"æ—5÷&VBÒE%TRäB"ç7V&Ö—GFVEöBâW2"²‚"äBÓ"–bW6W%÷&öÆRÒw7WW&FÖ–ârVÇ6R""’À¢†6ÆV&VEöGBÂ¢¢VÇ6S ¢–b76–væVE÷7F÷&Uö–G3 ¢Æ6V†öÆFW'2ÒrÂræ¦ö–â…²rW2uÒ¢ÆVâ†76–væVE÷7F÷&Uö–G2’¢7W'6÷"æW†V7WFR€¢b%4TÄT5B4õTåB‚¢’26÷VçBe$ôÒ&W7öç6W2"¤ô”â7F÷&W22ôâ"ç7F÷&Uö–BÒ2æ–Bt„U$R2ç7F÷&UöæÖR•2äõBåTÄÂäB"æ—5÷&VBÒE%TRäB"ç7F÷&Uö–B”â‡·Æ6V†öÆFW'7Ò’"À¢76–væVE÷7F÷&Uö–G0¢¢VÇ6S ¢7W'6÷"æW†V7WFR€¢%4TÄT5B4õTåB‚¢’26÷VçBe$ôÒ&W7öç6W2"¤ô”â7F÷&W22ôâ"ç7F÷&Uö–BÒ2æ–Bt„U$R2ç7F÷&UöæÖR•2äõBåTÄÂäB"æ—5÷&VBÒE%TR"²‚"äBÓ"–bW6W%÷&öÆRÒw7WW&FÖ–ârVÇ6R""¢¢6VVåöfVVF&6µ÷F÷FÂÒ7W'6÷"æfWF6†öæR‚•²v6÷VçBuÐ ¢–b6ÆV&VEöGC ¢7W'6÷"æW†V7WFR€¢%4TÄT5B4õTåB‚¢’26÷VçBe$ôÒ7—7FVÕöæ÷F–f–6F–öç2t„U$R—5÷&VBÒE%TRäB7&VFVEöBâW2"À¢†6ÆV&VEöGBÂ¢¢VÇ6S ¢7W'6÷"æW†V7WFR‚%4TÄT5B4õTåB‚¢’26÷VçBe$ôÒ7—7FVÕöæ÷F–f–6F–öç2t„U$R—5÷&VBÒE%TR"¢6VVå÷7—7FVÕ÷F÷FÂÒ7W'6÷"æfWF6†öæR‚•²v6÷VçBuÐ¢6VVå÷F÷FÂÒ6VVåöfVVF&6µ÷F÷FÂ²6VVå÷7—7FVÕ÷F÷FÀ ¢2fWF6‚v–æF÷röb6VVâæ÷F–f–6F–öç2â÷fW"ÖfWF6‚g&öÒV6‚F&ÆRF†VâÖW&vRÀ¢26òF†RÖW&vVBvR&VfÆV7G2G'VR6‡&öæöÆöv–6Â÷&FW"7&÷72&÷F‚6÷W&6W2à¢v–æF÷rÒ6VVåöÆ–Ö—B²2fWF6‚öæRW‡G&FòFWFV7B–bF†W&Rw2Ö÷&P ¢2fWF6‚6VVâfVVF&6²&W7öç6W2v—F‚7F÷&Rf–ÇFW ¢–b6ÆV&VEöGC ¢G'“ ¢6ÆV&VEöGE÷'6VBÒFFWF–ÖRæg&öÖ—6öf÷&ÖB†6ÆV&VEöB¢VW'’Òb"" ¢4TÄT5B"æ–BÂ"çW6W%öVÖ–ÂÂ"ç7V&Ö—GFVEöB27&VFVEöBÂ2ç7F÷&UöæÖRÂ2æ–B27F÷&Uö–BÂ"æ—5÷&VBÂvfVVF&6²r2æ÷F–f–6F–öå÷G—RÂåTÄÂ2ÖW76vRÂåTÄÂ2G—RÀ¢…4TÄT5Bdr†ç&F–æu÷fÇVR’e$ôÒç7vW'2t„U$Rç&W7öç6Uö–BÒ"æ–BäBç&F–æu÷fÇVR•2äõBåTÄÂ’2fu÷&F–æp¢e$ôÒ&W7öç6W2 ¢¤ô”â7F÷&W22ôâ"ç7F÷&Uö–BÒ2æ–@¢t„U$R2ç7F÷&UöæÖR•2äõBåTÄÂäB"æ—5÷&VBÒE%TRäB"ç7V&Ö—GFVEöBâW2·7F÷&Uöf–ÇFW'Ð¢õ$DU"%’"ç7V&Ö—GFVEöBDU40¢Ä”Ô•BW0¢"" ¢–b76–væVE÷7F÷&Uö–G3 ¢7W'6÷"æW†V7WFR‡VW'’Â¶6ÆV&VEöGE÷'6VEÒ²76–væVE÷7F÷&Uö–G2²·v–æF÷uÒ¢VÇ6S ¢7W'6÷"æW†V7WFR‡VW'’Â¶6ÆV&VEöGE÷'6VBÂv–æF÷uÒ¢W†6WBfÇVTW'&÷# ¢6ÆV&VEöGBÒæöæP¢VW'’Òb"" ¢4TÄT5B"æ–BÂ"çW6W%öVÖ–ÂÂ"ç7V&Ö—GFVEöB27&VFVEöBÂ2ç7F÷&UöæÖRÂ2æ–B27F÷&Uö–BÂ"æ—5÷&VBÂvfVVF&6²r2æ÷F–f–6F–öå÷G—RÂåTÄÂ2ÖW76vRÂåTÄÂ2G—RÀ¢…4TÄT5Bdr†ç&F–æu÷fÇVR’e$ôÒç7vW'2t„U$Rç&W7öç6Uö–BÒ"æ–BäBç&F–æu÷fÇVR•2äõBåTÄÂ’2fu÷&F–æp¢e$ôÒ&W7öç6W2 ¢¤ô”â7F÷&W22ôâ"ç7F÷&Uö–BÒ2æ–@¢t„U$R2ç7F÷&UöæÖR•2äõBåTÄÂäB"æ—5÷&VBÒE%TR·7F÷&Uöf–ÇFW'Ð¢õ$DU"%’"ç7V&Ö—GFVEöBDU40¢Ä”Ô•BW0¢"" ¢–b76–væVE÷7F÷&Uö–G3 ¢7W'6÷"æW†V7WFR‡VW'’Â76–væVE÷7F÷&Uö–G2²·v–æF÷uÒ¢VÇ6S ¢7W'6÷"æW†V7WFR‡VW'’Â·v–æF÷uÒ¢VÇ6S ¢VW'’Òb"" ¢4TÄT5B"æ–BÂ"çW6W%öVÖ–ÂÂ"ç7V&Ö—GFVEöB27&VFVEöBÂ2ç7F÷&UöæÖRÂ2æ–B27F÷&Uö–BÂ"æ—5÷&VBÂvfVVF&6²r2æ÷F–f–6F–öå÷G—RÂåTÄÂ2ÖW76vRÂåTÄÂ2G—RÀ¢…4TÄT5Bdr†ç&F–æu÷fÇVR’e$ôÒç7vW'2t„U$Rç&W7öç6Uö–BÒ"æ–BäBç&F–æu÷fÇVR•2äõBåTÄÂ’2fu÷&F–æp¢e$ôÒ&W7öç6W2 ¢¤ô”â7F÷&W22ôâ"ç7F÷&Uö–BÒ2æ–@¢t„U$R2ç7F÷&UöæÖR•2äõBåTÄÂäB"æ—5÷&VBÒE%TR·7F÷&Uöf–ÇFW'Ð¢õ$DU"%’"ç7V&Ö—GFVEöBDU40¢Ä”Ô•BW0¢"" ¢–b76–væVE÷7F÷&Uö–G3 ¢7W'6÷"æW†V7WFR‡VW'’Â76–væVE÷7F÷&Uö–G2²·v–æF÷uÒ¢VÇ6S ¢7W'6÷"æW†V7WFR‡VW'’Â·v–æF÷uÒ¢6VVåöfVVF&6²Ò7W'6÷"æfWF6†ÆÂ‚ ¢7W'6÷"æW†V7WFR€¢"" ¢4TÄT5B–BÂÖW76vRÂG—RÂ7&VFVEöBÂ—5÷&VBÂw7—7FVÒr2æ÷F–f–6F–öå÷G—RÂåTÄÂ2W6W%öVÖ–ÂÂåTÄÂ27F÷&UöæÖRÂåTÄÂ27F÷&Uö–@¢e$ôÒ7—7FVÕöæ÷F–f–6F–öç0¢t„U$R—5÷&VBÒE%TP¢õ$DU"%’7&VFVEöBDU40¢Ä”Ô•BW0¢"""À¢‡v–æF÷rÂ¢¢6VVå÷7—7FVÒÒ7W'6÷"æfWF6†ÆÂ‚ ¢ÖW&vVE÷6VVâÒ6÷'FVB€¢6VVåöfVVF&6²²6VVå÷7—7FVÒÀ¢¶W“ÖÆÖ&Fƒ¢…²v7&VFVEöBuÒ÷"FFWF–ÖRæÖ–âÀ¢&WfW'6SÕG'VRÀ¢¢6VVâÒÖW&vVE÷6VVå·6VVåööfg6WC§6VVåööfg6WB²6VVåöÆ–Ö—EÐ¢öf÷&ÖB‡6VVâ ¢2F÷FÂVç&VB6÷VçB†Çv—2&WGW&æVB’Òf–ÇFW"'’76–væVB7F÷&W2f÷"f–WrÖöæÇ’W6W'0¢–b76–væVE÷7F÷&Uö–G3 ¢Æ6V†öÆFW'2ÒrÂræ¦ö–â…²rW2uÒ¢ÆVâ†76–væVE÷7F÷&Uö–G2’¢7W'6÷"æW†V7WFR€¢b%4TÄT5B4õTåB‚¢’26÷VçBe$ôÒ&W7öç6W2"¤ô”â7F÷&W22ôâ"ç7F÷&Uö–BÒ2æ–Bt„U$R2ç7F÷&UöæÖR•2äõBåTÄÂäB"æ—5÷&VBÒdÅ4RäB"ç7F÷&Uö–B”â‡·Æ6V†öÆFW'7Ò’"À¢76–væVE÷7F÷&Uö–G0¢¢VÆ–bW6W%÷&öÆRÒw7WW&FÖ–âs ¢7W'6÷"æW†V7WFR€¢%4TÄT5B4õTåB‚¢’26÷VçBe$ôÒ&W7öç6W2"¤ô”â7F÷&W22ôâ"ç7F÷&Uö–BÒ2æ–Bt„U$R2ç7F÷&UöæÖR•2äõBåTÄÂäB"æ—5÷&VBÒdÅ4RäBÓ ¢¢VÇ6S ¢7W'6÷"æW†V7WFR€¢%4TÄT5B4õTåB‚¢’26÷VçBe$ôÒ&W7öç6W2"¤ô”â7F÷&W22ôâ"ç7F÷&Uö–BÒ2æ–Bt„U$R2ç7F÷&UöæÖR•2äõBåTÄÂäB"æ—5÷&VBÒdÅ4R ¢¢Vç&VEöfVVF&6µö6÷VçBÒ7W'6÷"æfWF6†öæR‚•²v6÷VçBuÐ¢7W'6÷"æW†V7WFR‚%4TÄT5B4õTåB‚¢’26÷VçBe$ôÒ7—7FVÕöæ÷F–f–6F–öç2t„U$R—5÷&VBÒdÅ4R"¢Vç&VE÷7—7FVÕö6÷VçBÒ7W'6÷"æfWF6†öæR‚•²v6÷VçBuÐ¢F÷FÅ÷Vç&VBÒVç&VEöfVVF&6µö6÷VçB²Vç&VE÷7—7FVÕö6÷Vç@ ¢6VVåö†5öÖ÷&RÒ‡6VVåööfg6WB²ÆVâ‡6VVâ’’Â6VVå÷F÷FÀ ¢&WGW&â§6öæ–g’‡°¢'7V66W72#¢G'VRÀ¢'Vç6VVâ#¢Vç6VVâÀ¢'6VVâ#¢6VVâÀ¢'6VVå÷F÷FÂ#¢6VVå÷F÷FÂÀ¢'6VVåö†5öÖ÷&R#¢6VVåö†5öÖ÷&RÀ¢'F÷FÅ÷Vç&VB#¢F÷FÅ÷Vç&VBÀ¢2&6·v&G2Ö6ö×C¢6öÖ&–æVBÆ—7B‡Vç6VVâf—'7BÂF†Vâ6VVâvR¢&æ÷F–f–6F–öç2#¢Vç6VVâ²6VVâÀ¢Ò¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"fWF6†–æræ÷F–f–6F–öç3¢¶WÒ"¢&WGW&â§6öæ–g’‡²'7V66W72#¢fÇ6RÂ&W'&÷"#¢7G"†R—Ò’ÂS ¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚ ¢ç&÷WFR‚"ö’öæ÷F–f–6F–öç2ö6ÆV"×6VVâ"ÂÖWF†öG3Õ²%õ5B%Ò¢FVb6ÆV%÷6VVåöæ÷F–f–6F–öç2‚“ ¢""$6ÆV"††–FR’ÆÂ7W'&VçFÇ’6VVâæ÷F–f–6F–öç2f÷"F†—26W76–öâà¢7F÷&W27WFöfbF–ÖW7F×²ç’6VVâæ÷F–f–6F–öç2v—F‚7&VFVEöBÃÒ7WFöf`¢&RW†6ÇVFVBg&öÒF†R6VVâÆ—7B&WGW&æVB'’ö’öæ÷F–f–6F–öç2÷Vç&VBâ"" ¢G'“ ¢6W76–öå²væ÷F–f–6F–öç5ö6ÆV&VEöBuÒÒFFWF–ÖRææ÷r‚’æ—6öf÷&ÖB‚¢&WGW&â§6öæ–g’‡²'7V66W72#¢G'VWÒ¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"6ÆV&–ær6VVâæ÷F–f–6F–öç3¢¶WÒ"¢&WGW&â§6öæ–g’‡²'7V66W72#¢fÇ6RÂ&W'&÷"#¢7G"†R—Ò’ÂS  ¢ç&÷WFR‚"öFÖ–â÷&W7öç6W2óÆ–çC§&W7öç6Uö–Câ÷&WÇ’"ÂÖWF†öG3Õ²%õ5B%Ò¢FVb&WÇ•÷FõöfVVF&6²‡&W7öç6Uö–C¢–çB“ ¢G'“ ¢FFÒ&WVW7BævWEö§6öâ‚¢&WÇ•öÖW76vRÒFFævWB‚vÖW76vRrÂrr’ç7G&—‚¢FV×ÆFU÷G—RÒFFævWB‚wFV×ÆFU÷G—RrÂw7FæF&Br¢65öVÖ–Ç2ÒFFævWB‚v65öVÖ–Ç2rÂµÒ¢&65öVÖ–Ç2ÒFFævWB‚v&65öVÖ–Ç2rÂµÒ¢ ¢–bæ÷B&WÇ•öÖW76vS ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢%&WÇ’ÖW76vR6ææ÷B&RV×G’'ÒÂC ¢ ¢–bFV×ÆFU÷G—Ræ÷B–â²w7FæF&BrÂvöÆöw’rÂv&V6–F–öârÂvföÆÆ÷u÷WuÓ ¢FV×ÆFU÷G—RÒw7FæF&Bp¢ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢ ¢2vWB&W7öç6RFWF–Ç2–æ6ÇVF–ær7W7FöÖW"VÖ–ÂæB7F÷&R–æfð¢7W'6÷"æW†V7WFR‚"" ¢4TÄT5B"çW6W%öVÖ–ÂÂ"ç7V&Ö—GFVEöBÂ2ç7F÷&UöæÖRÀ¢…4TÄT5Bu$õUô4ôä4B†æç7vW%÷FW‡B4U$Dõ"rr’ ¢e$ôÒç7vW'2 ¢t„U$Rç&W7öç6Uö–BÒ"æ–B ¢äBæç7vW%÷FW‡B•2äõBåTÄÂ ¢Ä”Ô•B2’2fVVF&6µ÷7VÖÖ'’À¢…4TÄT5Bdr†ç&F–æu÷fÇVR’ ¢e$ôÒç7vW'2 ¢t„U$Rç&W7öç6Uö–BÒ"æ–B ¢äBç&F–æu÷fÇVR•2äõBåTÄÂ’2fu÷&F–æp¢e$ôÒ&W7öç6W2 ¢¤ô”â7F÷&W22ôâ"ç7F÷&Uö–BÒ2æ–@¢t„U$R"æ–BÒW0¢"""Â‡&W7öç6Uö–BÂ’¢ ¢&W7öç6RÒ7W'6÷"æfWF6†öæR‚¢ ¢–bæ÷B&W7öç6S ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢%&W7öç6Ræ÷Bf÷VæB'ÒÂC@¢ ¢–bæ÷B&W7öç6U²wW6W%öVÖ–ÂuÓ ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢$æòVÖ–ÂFG&W72f÷VæBf÷"F†—2fVVF&6²'ÒÂC ¢ ¢2W‡G&7B7W7FöÖW"æÖRg&öÒVÖ–À¢7W7FöÖW%öæÖRÒ&W7öç6U²wW6W%öVÖ–ÂuÒç7Æ—B‚tr•³Òç&WÆ6R‚rârÂrr’çF—FÆR‚¢ ¢2WFò×6VÆV7BFV×ÆFR&6VBöâ&F–ær–bæ÷B7V6–f–V@¢–bFV×ÆFU÷G—RÓÒw7FæF&BræB&W7öç6U²vfu÷&F–æruÒ—2æ÷BæöæS ¢G'“ ¢fu÷&F–ærÒfÆöB‡&W7öç6U²vfu÷&F–æruÒ¢–bfu÷&F–ærÃÒ# ¢FV×ÆFU÷G—RÒvöÆöw’p¢VÆ–bfu÷&F–ærãÒC ¢FV×ÆFU÷G—RÒv&V6–F–öâp¢VÇ6S ¢FV×ÆFU÷G—RÒvföÆÆ÷u÷Wp¢W†6WB…fÇVTW'&÷"ÂG—TW'&÷"“ ¢FV×ÆFU÷G—RÒw7FæF&Bp¢ ¢26VæBVÖ–ÂW6–ær’÷"4ÕE ¢G'“ ¢7V66W72ÂÖW76vRÒVÖ–Åö6öæf–rç6VæEöfVVF&6µ÷&WÇ’€¢FõöVÖ–Ã×&W7öç6U²wW6W%öVÖ–ÂuÒÀ¢7W7FöÖW%öæÖSÖ7W7FöÖW%öæÖRÀ¢&WÇ•öÖW76vS×&WÇ•öÖW76vRÀ¢7F÷&UöæÖS×&W7öç6U²w7F÷&UöæÖRuÒÀ¢fVVF&6µ÷7VÖÖ'“×&W7öç6U²vfVVF&6µ÷7VÖÖ'’uÒÀ¢FV×ÆFU÷G—S×FV×ÆFU÷G—P¢¢–b7V66W73 ¢&WGW&â²'7V66W72#¢G'VRÂ&ÖW76vR#¢%&WÇ’6VçB7V66W76gVÆÇ’"Â'FV×ÆFU÷W6VB#¢FV×ÆFU÷G—WÐ¢VÇ6S ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢ÖW76vWÒÂS ¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$VÖ–Â6VæF–ærf–ÆVC¢·7G"†R—Ò"¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢7G"†R—ÒÂS ¢ ¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢ ¢W†6WBW†6WF–öâ2S ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢7G"†R—ÒÂS ¢ ¢ç&÷WFR‚"öFÖ–âöVÖ–Â÷7FF—7F–72"ÂÖWF†öG3Õ²$tUB%Ò¢FVbVÖ–Å÷7FF—7F–72‚“ ¢""$vWBVÖ–Â6VæF–ær7FF—7F–72"" ¢G'“ ¢7FG2ÒVÖ–Åö6öæf–rævWEöVÖ–Å÷7FF—7F–72‚¢&WGW&â§6öæ–g’‡7FG2¢W†6WBW†6WF–öâ2S ¢&WGW&â§6öæ–g’‡²&W'&÷"#¢7G"†R—Ò’ÂS  ¢ç&÷WFR‚"ö’÷7—7FVÕöæ÷F–f–6F–öç2óÆ–çC¦æ÷F–f–6F–öåö–Câ÷&VB"ÂÖWF†öG3Õ²%õ5B%Ò¢FVbÖ&µ÷7—7FVÕöæ÷F–f–6F–öå÷&VB†æ÷F–f–6F–öåö–C¢–çB“ ¢""$Ö&²6–ævÆR7—7FVÒæ÷F–f–6F–öâ2&VBâ"" ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"‚¢7W'6÷"æW†V7WFR‚%UDDR7—7FVÕöæ÷F–f–6F–öç24UB—5÷&VBÒE%TRt„U$R–BÒW2"Â†æ÷F–f–6F–öåö–BÂ’¢6öæâæ6öÖÖ—B‚¢&WGW&â§6öæ–g’‡²'7V66W72#¢G'VWÒ¢W†6WBW†6WF–öâ2S ¢ÆövvW"æW'&÷"†b$W'&÷"Ö&¶–ær7—7FVÒæ÷F–f–6F–öâ2&VC¢¶WÒ"¢&WGW&â§6öæ–g’‡²'7V66W72#¢fÇ6RÂ&W'&÷"#¢7G"†R—Ò’ÂS ¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢ ¢ç&÷WFR‚"öFÖ–âöVÖ–Âö'VÆ²×&WÇ’"ÂÖWF†öG3Õ²%õ5B%Ò¢FVb'VÆµ÷&WÇ•÷FõöfVVF&6²‚“ ¢""%6VæB'VÆ²VÖ–Â&WÆ–W2Fò×VÇF—ÆRfVVF&6²&W7öç6W2"" ¢G'“ ¢FFÒ&WVW7BævWEö§6öâ‚¢&W7öç6Uö–G2ÒFFævWB‚w&W7öç6Uö–G2rÂµÒ¢&WÇ•öÖW76vRÒFFævWB‚vÖW76vRrÂrr’ç7G&—‚¢FV×ÆFU÷G—RÒFFævWB‚wFV×ÆFU÷G—RrÂw7FæF&Br¢ ¢–bæ÷B&W7öç6Uö–G3 ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢$æò&W7öç6R”G2&÷f–FVB'ÒÂC ¢ ¢–bæ÷B&WÇ•öÖW76vS ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢%&WÇ’ÖW76vR6ææ÷B&RV×G’'ÒÂC ¢ ¢–bFV×ÆFU÷G—Ræ÷B–â²w7FæF&BrÂvöÆöw’rÂv&V6–F–öârÂvföÆÆ÷u÷WuÓ ¢FV×ÆFU÷G—RÒw7FæF&Bp¢ ¢6öæâÒvWEöF%ö6öææV7F–öâ‚¢G'“ ¢7W'6÷"Ò6öæâæ7W'6÷"†F–7F–öæ'“ÕG'VR¢ ¢2vWBÆÂ&W7öç6RFWF–Ç0¢Æ6V†öÆFW'2Ò"Â"æ¦ö–â…²"W2%Ò¢ÆVâ‡&W7öç6Uö–G2’¢7W'6÷"æW†V7WFR†b"" ¢4TÄT5B"æ–BÂ"çW6W%öVÖ–ÂÂ2ç7F÷&UöæÖRÀ¢…4TÄT5Bu$õUô4ôä4B†æç7vW%÷FW‡B4U$Dõ"rr’ ¢e$ôÒç7vW'2 ¢t„U$Rç&W7öç6Uö–BÒ"æ–B ¢äBæç7vW%÷FW‡B•2äõBåTÄÂ ¢Ä”Ô•B2’2fVVF&6µ÷7VÖÖ'¢e$ôÒ&W7öç6W2 ¢¤ô”â7F÷&W22ôâ"ç7F÷&Uö–BÒ2æ–@¢t„U$R"æ–B”â‡·Æ6V†öÆFW'7Ò’äB"çW6W%öVÖ–Â•2äõBåTÄÀ¢"""ÂGWÆR‡&W7öç6Uö–G2’¢ ¢&W7öç6W2Ò7W'6÷"æfWF6†ÆÂ‚¢ ¢–bæ÷B&W7öç6W3 ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢$æòfÆ–B&W7öç6W2f÷VæB'ÒÂC@¢ ¢2&W&RFFf÷"'VÆ²VÖ–À¢VÖ–ÅöÆ—7BÒ·%²wW6W%öVÖ–ÂuÒf÷""–â&W7öç6W5Ð¢7W7FöÖW%öæÖW2Ò·%²wW6W%öVÖ–ÂuÒç7Æ—B‚tr•³Òç&WÆ6R‚rârÂrr’çF—FÆR‚’f÷""–â&W7öç6W5Ð¢fVVF&6µ÷7VÖÖ&–W2Ò·%²vfVVF&6µ÷7VÖÖ'’uÒ÷"$æòFW‡BfVVF&6²&÷f–FVB"f÷""–â&W7öç6W5Ð¢7F÷&UöæÖRÒ&W7öç6W5³Õ²w7F÷&UöæÖRuÒ2W6Rf—'7B7F÷&RæÖR†77VÖ–ær6ÖR7F÷&R¢ ¢26VæB'VÆ²VÖ–Ç0¢&W7VÇG2ÒVÖ–Åö6öæf–rç6VæEö'VÆµöfVVF&6µ÷&WÇ’€¢VÖ–ÅöÆ—7CÖVÖ–ÅöÆ—7BÀ¢7W7FöÖW%öæÖW3Ö7W7FöÖW%öæÖW2À¢&WÇ•öÖW76vS×&WÇ•öÖW76vRÀ¢7F÷&UöæÖS×7F÷&UöæÖRÀ¢fVVF&6µ÷7VÖÖ&–W3ÖfVVF&6µ÷7VÖÖ&–W2À¢FV×ÆFU÷G—S×FV×ÆFU÷G—P¢¢ ¢2Ö&²&W7öç6W22&W6öÇfV@¢7V66W76gVÅöVÖ–Ç2Ò·%²vVÖ–ÂuÒf÷""–â&W7VÇG2–b%²w7V66W72uÕÐ¢–b7V66W76gVÅöVÖ–Ç3 ¢Æ6V†öÆFW'2Ò"Â"æ¦ö–â…²"W2%Ò¢ÆVâ‡7V66W76gVÅöVÖ–Ç2’¢7W'6÷"æW†V7WFR†b"" ¢UDDR&W7öç6W2 ¢4UB7FGW2Òw&W6öÇfVBr ¢t„U$RW6W%öVÖ–Â”â‡·Æ6V†öÆFW'7Ò¢"""ÂGWÆR‡7V66W76gVÅöVÖ–Ç2’¢6öæâæ6öÖÖ—B‚¢ ¢&WGW&â°¢'7V66W72#¢G'VRÀ¢&ÖW76vR#¢b$'VÆ²&WÇ’6ö×ÆWFVBâ¶ÆVâ‡7V66W76gVÅöVÖ–Ç2—Òöb¶ÆVâ‡&W7VÇG2—ÒVÖ–Ç26VçB7V66W76gVÆÇ’â"À¢'&W7VÇG2#¢&W7VÇG0¢Ð¢ ¢f–æÆÇ“ ¢6öæâæ6Æ÷6R‚¢ ¢W†6WBW†6WF–öâ2S ¢&WGW&â²'7V66W72#¢fÇ6RÂ&W'&÷"#¢7G"†R—ÒÂS  ¢&WGW&â   ¦–bõöæÖUõòÓÒ%õöÖ–åõò# ¢Ò7&VFUö‚¢2&–Çv’&÷f–FW2F†R÷'Bf–F†Rõ%BVçf—&öæÖVçBf&–&ÆP¢÷'BÒ–çB†÷2æVçf—&öâævWB‚%õ%B"Âƒ’¢ç'Vâ††÷7CÒ#ããã"Â÷'C×÷'BÂFV'VsÔfÇ6R¦VÇ6S ¢2F†—2—2W6VB'’wVæ–6÷&â‡vV#¢wVæ–6÷&â&¦7&VFUö‚’"¢Ò7&VFUö‚
