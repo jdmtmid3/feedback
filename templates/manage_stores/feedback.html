@@ -731,11 +731,16 @@ PURPOSE: "Feedback Management" page. Displays all customer responses/submissions
   <div class="tab-pane fade" id="staff" role="tabpanel">
     <div class="d-flex justify-content-between align-items-center mb-3 pt-3">
       <h4 class="mb-0">Staff Management</h4>
+      {% if session.get('role') in ('admin', 'superadmin') %}
       <div class="d-flex gap-2">
+        <button class="btn btn-outline-success btn-sm" data-bs-toggle="modal" data-bs-target="#importStaffModal">
+          <i class="bi bi-file-earmark-spreadsheet me-1"></i>Import CSV/Excel
+        </button>
         <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#inlineAddStaffModal">
           <i class="bi bi-plus-lg me-1"></i>Add Staff
         </button>
       </div>
+      {% endif %}
     </div>
     <div id="staffContent">
       <div class="text-center py-3">
@@ -901,6 +906,42 @@ PURPOSE: "Feedback Management" page. Displays all customer responses/submissions
   </div>
 </div>
 
+{% if session.get('role') in ('admin', 'superadmin') %}
+<!-- Bulk Staff Import Modal -->
+<div class="modal fade" id="importStaffModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content border-0 shadow-lg">
+      <div class="modal-header py-3">
+        <div>
+          <h6 class="modal-title fw-bold mb-1"><i class="bi bi-file-earmark-spreadsheet text-success me-2"></i>Import Staff</h6>
+          <div class="small text-muted">Add multiple staff members from CSV or Excel.</div>
+        </div>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="alert alert-light border small">
+          Required columns: <code>first_name</code> and <code>last_name</code>.<br>
+          Optional: email, phone, position, role, hire_date, status. Profile pictures are added manually after import.
+        </div>
+        <form id="inlineImportStaffForm" method="POST" enctype="multipart/form-data" action="{{ url_for('import_staff', store_id=store.id) }}">
+          <label class="form-label small fw-semibold" for="inline_staff_file">CSV or Excel file</label>
+          <input class="form-control" id="inline_staff_file" type="file" name="staff_file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+          <div class="form-text">Maximum 5MB and 1,000 rows. Excel format must be .xlsx.</div>
+        </form>
+        <a class="btn btn-link btn-sm px-0 mt-2" href="{{ url_for('staff_import_template', store_id=store.id) }}">
+          <i class="bi bi-download me-1"></i>Download CSV template
+        </a>
+      </div>
+      <div class="modal-footer py-2">
+        <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" form="inlineImportStaffForm" class="btn btn-sm btn-success"><i class="bi bi-upload me-1"></i>Import Staff</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% if session.get('role') in ('admin', 'superadmin') %}
 <!-- Inline Add Staff Modal -->
 <div class="modal fade" id="inlineAddStaffModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
@@ -1024,6 +1065,7 @@ PURPOSE: "Feedback Management" page. Displays all customer responses/submissions
     </div>
   </div>
 </div>
+{% endif %}
 {% endblock %} {% block scripts %}
 <script>
   let feedbackData = {};
@@ -1781,6 +1823,7 @@ PURPOSE: "Feedback Management" page. Displays all customer responses/submissions
                   </div>
                 </td>
                 <td class="text-center">
+                  {% if session.get('role') in ('admin', 'superadmin') %}
                   <div class="d-flex gap-1 justify-content-center">
                     <button class="btn btn-sm btn-outline-primary py-0 px-1" onclick="openEditStaffModal(${staff.id})" title="Edit">
                       <i class="bi bi-pencil"></i>
@@ -1789,6 +1832,9 @@ PURPOSE: "Feedback Management" page. Displays all customer responses/submissions
                       <i class="bi bi-trash"></i>
                     </button>
                   </div>
+                  {% else %}
+                  <span class="text-muted">—</span>
+                  {% endif %}
                 </td>
               </tr>
       `;

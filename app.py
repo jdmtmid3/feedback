@@ -21,7 +21,7 @@ from collections import defaultdict
 from typing import List, Dict, Any, Optional
 from fpdf import FPDF
 from dotenv import load_dotenv
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import bcrypt
 from functools import wraps
 
@@ -6561,6 +6561,7 @@ def create_app() -> Flask:
         return f"data:{mime};base64,{base64.b64encode(photo.read()).decode('utf-8')}"
 
     @app.route("/admin/stores/<int:store_id>/staff")
+    @role_required('admin', 'superadmin')
     def staff_management(store_id: int):
         conn = get_db_connection()
         try:
@@ -6595,6 +6596,7 @@ def create_app() -> Flask:
             conn.close()
 
     @app.route("/admin/stores/<int:store_id>/staff/add", methods=["POST"])
+    @role_required('admin', 'superadmin')
     def add_staff(store_id: int):
         if not can_manage_store(session['user_id'], store_id):
             flash("You don't have permission to manage staff for this store.", "danger")
@@ -6648,7 +6650,186 @@ def create_app() -> Flask:
             
         return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
 
+    @app.route("/admin/stores/<int:store_id>/staff/import-template", methods=["GET"])
+    @role_required('admin', 'superadmin')
+    def staff_import_template(store_id: int):
+        if not can_manage_store(session['user_id'], store_id):
+            flash("You don't have permission to manage staff for this store.", "danger")
+            return redirect(url_for("stores_management"))
+
+        output = io.StringIO(newline='')
+        writer = csv.writer(output)
+        writer.writerow(["first_name", "last_name", "email", "phone", "position", "role", "hire_date", "status"])
+        writer.writerow(["Juan", "Dela Cruz", "juan@example.com", "09171234567", "Sales Associate", "staff", "2026-09-01", "active"])
+        payload = io.BytesIO(output.getvalue().encode("utf-8-sig"))
+        payload.seek(0)
+        return send_file(
+            payload,
+            mimetype="text/csv; charset=utf-8",
+            as_attachment=True,
+            download_name=f"staff_import_template_store_{store_id}.csv",
+        )
+
+    @app.route("/admin/stores/<int:store_id>/staff/import", methods=["POST"])
+    @role_required('admin', 'superadmin')
+    def import_staff(store_id: int):
+        """Bulk-import staff from CSV or XLSX. Photos remain manual per staff profile."""
+        if not can_manage_store(session['user_id'], store_id):
+            flash("You don't have permission to manage staff for this store.", "danger")
+            return redirect(url_for("stores_management"))
+
+        upload = request.files.get("staff_file")
+        if not upload or not upload.filename:
+            flash("Please choose a CSV or Excel (.xlsx) file.", "danger")
+            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
+
+        filename = upload.filename.lower()
+        if not filename.endswith((".csv", ".xlsx")):
+            flash("Unsupported file type. Please upload a .csv or .xlsx file.", "danger")
+            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
+
+        raw = upload.read(5 * 1024 * 1024 + 1)
+        if len(raw) > 5 * 1024 * 1024:
+            flash("Staff import file must be 5MB or smaller.", "danger")
+            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
+
+        def normalize_header(value: Any) -> str:
+            return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+        aliases = {
+            "firstname": "first_name", "first": "first_name",
+            "lastname": "last_name", "last": "last_name", "surname": "last_name",
+            "mobile": "phone", "phone_number": "phone", "contact_number": "phone",
+            "job_title": "position", "designation": "position",
+            "date_hired": "hire_date", "hired_date": "hire_date",
+        }
+
+        try:
+            if filename.endswith(".csv"):
+                text_stream = io.StringIO(raw.decode("utf-8-sig"))
+                csv_rows = list(csv.reader(text_stream))
+                if not csv_rows:
+                    raise ValueError("The uploaded file is empty.")
+                headers = [aliases.get(normalize_header(h), normalize_header(h)) for h in csv_rows[0]]
+                rows = [dict(zip(headers, row)) for row in csv_rows[1:]]
+            else:
+                from openpyxl import load_workbook
+                workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+                worksheet = workbook.active
+                values = worksheet.iter_rows(values_only=True)
+                first_row = next(values, None)
+                if not first_row:
+                    raise ValueError("The uploaded workbook is empty.")
+                headers = [aliases.get(normalize_header(h), normalize_header(h)) for h in first_row]
+                rows = [dict(zip(headers, row)) for row in values]
+                workbook.close()
+        except (UnicodeDecodeError, ValueError) as exc:
+            flash(f"Unable to read staff file: {exc}", "danger")
+            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
+        except Exception as exc:
+            logger.error("Staff import parsing failed: %s", exc)
+            flash("Unable to read the file. Check that it is a valid CSV or .xlsx workbook.", "danger")
+            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
+
+        if "first_name" not in headers or "last_name" not in headers:
+            flash("Missing required columns: first_name and last_name.", "danger")
+            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
+        if len(rows) > 1000:
+            flash("A single import can contain up to 1,000 staff rows.", "danger")
+            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
+
+        valid_roles = {"staff", "manager", "supervisor"}
+        valid_statuses = {"active", "inactive"}
+        prepared = []
+        errors = []
+        for row_number, row in enumerate(rows, start=2):
+            cleaned = {key: str(value).strip() if value is not None else "" for key, value in row.items()}
+            if not any(cleaned.values()):
+                continue
+            first_name = cleaned.get("first_name", "")
+            last_name = cleaned.get("last_name", "")
+            email = cleaned.get("email", "")
+            role = cleaned.get("role", "staff").lower() or "staff"
+            status = cleaned.get("status", "active").lower() or "active"
+            hire_date = row.get("hire_date")
+
+            if not first_name or not last_name:
+                errors.append(f"Row {row_number}: first_name and last_name are required")
+                continue
+            if email and ("@" not in email or "." not in email.rsplit("@", 1)[-1]):
+                errors.append(f"Row {row_number}: invalid email")
+                continue
+            if role not in valid_roles:
+                errors.append(f"Row {row_number}: role must be staff, manager, or supervisor")
+                continue
+            if status not in valid_statuses:
+                errors.append(f"Row {row_number}: status must be active or inactive")
+                continue
+            if isinstance(hire_date, datetime):
+                hire_date = hire_date.date().isoformat()
+            elif isinstance(hire_date, date):
+                hire_date = hire_date.isoformat()
+            elif hire_date:
+                hire_date = str(hire_date).strip()
+                try:
+                    datetime.strptime(hire_date, "%Y-%m-%d")
+                except ValueError:
+                    errors.append(f"Row {row_number}: hire_date must use YYYY-MM-DD")
+                    continue
+            else:
+                hire_date = None
+
+            prepared.append((
+                store_id, first_name, last_name, email or None,
+                cleaned.get("phone") or None, cleaned.get("position") or None,
+                role, status, hire_date,
+            ))
+
+        if not prepared:
+            detail = errors[0] if errors else "No staff rows were found."
+            flash(f"No staff imported. {detail}", "danger")
+            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM stores WHERE id = %s", (store_id,))
+            if not cursor.fetchone():
+                flash("Store not found.", "danger")
+                return redirect(url_for("stores_management"))
+            cursor.executemany(
+                """INSERT INTO staff
+                   (store_id, first_name, last_name, email, phone, position, role, status, hire_date)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                prepared,
+            )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            logger.error("Staff bulk import failed: %s", exc)
+            flash("Staff import failed. No new rows were saved.", "danger")
+            return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
+        finally:
+            conn.close()
+
+        try:
+            log_audit(
+                entity_type="staff",
+                entity_id=store_id,
+                action="bulk_imported",
+                new_values=f"Imported {len(prepared)} staff; skipped {len(errors)} invalid rows; Store ID: {store_id}",
+            )
+        except Exception:
+            pass
+
+        message = f"Imported {len(prepared)} staff member(s) successfully. Add profile pictures manually using Edit Staff."
+        if errors:
+            message += f" Skipped {len(errors)} invalid row(s): " + "; ".join(errors[:3])
+        flash(message, "warning" if errors else "success")
+        return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
+
     @app.route("/admin/stores/<int:store_id>/staff/<int:staff_id>/edit", methods=["POST"])
+    @role_required('admin', 'superadmin')
     def edit_staff(store_id: int, staff_id: int):
         if not can_manage_store(session['user_id'], store_id):
             flash("You don't have permission to manage staff for this store.", "danger")
@@ -6702,6 +6883,7 @@ def create_app() -> Flask:
         return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
 
     @app.route("/admin/stores/<int:store_id>/staff/<int:staff_id>/delete", methods=["POST"])
+    @role_required('admin', 'superadmin')
     def delete_staff(store_id: int, staff_id: int):
         if not can_manage_store(session['user_id'], store_id):
             flash("You don't have permission to manage staff for this store.", "danger")
