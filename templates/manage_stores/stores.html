@@ -1,10 +1,10 @@
 {% extends "layout.html" %}
-<!-- 
+<!--
 ================================================================================
 FILE: admin/stores.html
 URL ROUTE: /admin/stores
-PURPOSE: "Store Management" page. Allows adding/editing stores, viewing 
-         QR codes for their survey, and clicking to manage their specific 
+PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
+         QR codes for their survey, and clicking to manage their specific
          questionnaire.
 ================================================================================
 -->
@@ -77,7 +77,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
     </div>
   </div>
 
-  
+
   <!-- Add Store Modal -->
   {% if session.get('role') in ('admin', 'superadmin') %}
   <div class="modal fade" id="addStoreModal" tabindex="-1" aria-labelledby="addStoreModalLabel" aria-hidden="true">
@@ -119,7 +119,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                 <input type="file" id="logo" name="logo" class="form-control" accept="image/png,image/jpeg,image/jpg">
                 <div class="form-text">This logo will appear on this store's questionnaire. PNG or JPG, maximum 5MB.</div>
               </div>
-              
+
               <div class="col-12">
                 <label for="address" class="form-label fw-medium">Address</label>
                 <input
@@ -130,7 +130,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   placeholder="e.g. 123 Main Street"
                 />
               </div>
-              
+
               <div class="col-md-4">
                 <label for="city" class="form-label fw-medium">City</label>
                 <input
@@ -161,7 +161,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   placeholder="e.g. 10001"
                 />
               </div>
-              
+
               <div class="col-md-4">
                 <label for="contact_number" class="form-label fw-medium">Contact Number</label>
                 <input
@@ -190,7 +190,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   <option value="pending">Pending</option>
                 </select>
               </div>
-              
+
               <div class="col-12">
                 <label for="google_review_url" class="form-label fw-medium">Google Review Link</label>
                 <input
@@ -205,7 +205,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   This link appears in the Google Review reward flow for this store.
                 </div>
               </div>
-              
+
               <div class="col-12">
                 <label for="google_review_mode" class="form-label fw-medium">Google Review Option</label>
                 <select id="google_review_mode" name="google_review_mode" class="form-select">
@@ -214,7 +214,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                 </select>
                 <div class="form-text">This setting is used only when a Google Review Link is provided.</div>
               </div>
-              
+
               <div class="col-md-6">
                 <label for="store_manager_name" class="form-label fw-medium">Store Manager Name</label>
                 <input
@@ -283,7 +283,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   <option value="other">Other</option>
                 </select>
               </div>
-              
+
               <div class="col-12">
                 <label for="edit_address" class="form-label fw-medium">Address</label>
                 <input
@@ -294,7 +294,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   placeholder="e.g. 123 Main Street"
                 />
               </div>
-              
+
               <div class="col-md-4">
                 <label for="edit_city" class="form-label fw-medium">City</label>
                 <input
@@ -325,7 +325,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   placeholder="e.g. 10001"
                 />
               </div>
-              
+
               <div class="col-md-4">
                 <label for="edit_contact_number" class="form-label fw-medium">Contact Number</label>
                 <input
@@ -354,7 +354,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   <option value="maintenance">Maintenance</option>
                 </select>
               </div>
-              
+
               <div class="col-12">
                 <label for="edit_google_review_url" class="form-label fw-medium">Google Review Link</label>
                 <input
@@ -369,7 +369,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                   This link appears in the Google Review reward flow for this store.
                 </div>
               </div>
-              
+
               <div class="col-12">
                 <label for="edit_google_review_mode" class="form-label fw-medium">Google Review Option</label>
                 <select id="edit_google_review_mode" name="google_review_mode" class="form-select">
@@ -378,7 +378,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                 </select>
                 <div class="form-text">This setting is used only when a Google Review Link is provided.</div>
               </div>
-              
+
               <div class="col-md-6">
                 <label for="edit_store_manager_name" class="form-label fw-medium">Store Manager Name</label>
                 <input
@@ -405,7 +405,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
                 <input type="file" id="edit_logo" name="logo" class="form-control" accept="image/png,image/jpeg" />
                 <div class="form-text">Optional. Leave blank to keep the current logo. PNG/JPG, maximum 5 MB.</div>
               </div>
-              
+
             </div>
           </form>
         </div>
@@ -417,7 +417,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
     </div>
   </div>
 
-  
+
   <!-- Bulk Actions Modal -->
   <div class="modal fade" id="bulkActionsModal" tabindex="-1" aria-labelledby="bulkActionsModalLabel" aria-hidden="true">
     <div class="modal-dialog">
@@ -687,7 +687,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
   <div class="modal fade" id="viewersModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered modal-lg">
       <div class="modal-content border-0 shadow-lg" style="border-radius:14px;">
-        <div class="modal-header" style="background: linear-gradient(135deg, #FF6B35 0%, #212529 100%); color: white; border-radius:14px 14px 0 0;">
+        <div class="modal-header" style="background: linear-gradient(135deg, #1B1E76 0%, #212529 100%); color: white; border-radius:14px 14px 0 0;">
           <h5 class="modal-title fw-bold">
             <i class="bi bi-eye me-2"></i>Manage Store Viewers
           </h5>
@@ -790,7 +790,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
 .store-card-accent {
     height: 4px;
     border-radius: 0.75rem 0.75rem 0 0;
-    background: linear-gradient(90deg, #FF6B35, #E85A2A);
+    background: linear-gradient(90deg, #1B1E76, #171A67);
 }
 
 .store-card-actions {
@@ -817,7 +817,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
 
 .store-action-icon:hover {
     background: #f1f3f5;
-    color: #FF6B35;
+    color: #1B1E76;
     transform: translateY(-1px);
 }
 
@@ -1001,36 +1001,36 @@ document.addEventListener('DOMContentLoaded', function() {
             filterStores();
         });
     }
-    
+
     // Bulk actions functionality
     const bulkActionType = document.getElementById('bulkActionType');
     const executeBulkAction = document.getElementById('executeBulkAction');
     const bulkActionInfo = document.getElementById('bulkActionInfo');
     const bulkActionWarning = document.getElementById('bulkActionWarning');
-    
+
     if (bulkActionType) {
         bulkActionType.addEventListener('change', function() {
             const action = this.value;
             const selectedCount = selectedStores.size;
-            
+
             // Hide all alerts
             if (bulkActionInfo) bulkActionInfo.classList.add('d-none');
             if (bulkActionWarning) bulkActionWarning.classList.add('d-none');
-            
+
             if (action && selectedCount > 0 && executeBulkAction) {
                 executeBulkAction.disabled = false;
-                
+
                 // Show appropriate message based on action
                 if (action === 'delete') {
                     if (bulkActionWarning) {
                         bulkActionWarning.classList.remove('d-none');
-                        document.getElementById('bulkActionWarningMessage').textContent = 
+                        document.getElementById('bulkActionWarningMessage').textContent =
                             `Warning: This will permanently delete ${selectedCount} store(s) and all associated data. This action cannot be undone.`;
                     }
                 } else {
                     if (bulkActionInfo) {
                         bulkActionInfo.classList.remove('d-none');
-                        document.getElementById('bulkActionMessage').textContent = 
+                        document.getElementById('bulkActionMessage').textContent =
                             `This action will be applied to ${selectedCount} selected store(s).`;
                     }
                 }
@@ -1039,7 +1039,7 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         });
     }
-    
+
     if (executeBulkAction) {
         executeBulkAction.addEventListener('click', function() {
             const action = bulkActionType ? bulkActionType.value : '';
@@ -1048,13 +1048,13 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         });
     }
-    
+
     // Checkbox functionality
     document.addEventListener('change', function(e) {
         if (e.target.classList.contains('form-check-input') && e.target.type === 'checkbox') {
             const storeId = parseInt(e.target.value);
             const card = e.target.closest('.store-card');
-            
+
             if (e.target.checked) {
                 selectedStores.add(storeId);
                 if (card) card.classList.add('selected');
@@ -1062,7 +1062,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 selectedStores.delete(storeId);
                 if (card) card.classList.remove('selected');
             }
-            
+
             updateBulkActionButton();
         }
     });
@@ -1106,13 +1106,13 @@ function filterStores() {
 function sortStores(sortBy) {
     const container = document.querySelector('.row.g-3.mb-3');
     const cards = Array.from(container.querySelectorAll('.col-md-6')).filter(col => col.style.display !== 'none');
-    
+
     cards.sort((a, b) => {
         const cardA = a.querySelector('.store-card');
         const cardB = b.querySelector('.store-card');
         const storeA = storesData.find(s => s.id === parseInt(cardA ? cardA.dataset.storeId : 0));
         const storeB = storesData.find(s => s.id === parseInt(cardB ? cardB.dataset.storeId : 0));
-        
+
         switch(sortBy) {
             case 'name':
                 return storeA.store_name.localeCompare(storeB.store_name);
@@ -1126,7 +1126,7 @@ function sortStores(sortBy) {
                 return 0;
         }
     });
-    
+
     // Re-append sorted cards
     cards.forEach(card => container.appendChild(card));
 }
@@ -1134,7 +1134,7 @@ function sortStores(sortBy) {
 function updateBulkActionButton() {
     const count = selectedStores.size;
     const bulkButton = document.querySelector('[data-bs-target="#bulkActionsModal"]');
-    
+
     if (bulkButton) {
         if (count > 0) {
             bulkButton.innerHTML = `<i class="bi bi-check2-square me-2"></i>Bulk Actions (${count})`;
@@ -1151,13 +1151,13 @@ function updateBulkActionButton() {
 function executeBulkActionFunc(action) {
     const storeIds = Array.from(selectedStores);
     const executeBulkAction = document.getElementById('executeBulkAction');
-    
+
     // Show loading state
     if (executeBulkAction) {
         executeBulkAction.disabled = true;
         executeBulkAction.innerHTML = '<i class="bi bi-hourglass-split me-2"></i>Processing...';
     }
-    
+
     // Simulate API call
     setTimeout(() => {
         let message = '';
@@ -1185,13 +1185,13 @@ function executeBulkActionFunc(action) {
                 message = `Successfully exported data for ${storeIds.length} store(s)`;
                 break;
         }
-        
+
         // Close modal and show notification
         const modal = bootstrap.Modal.getInstance(document.getElementById('bulkActionsModal'));
         if (modal) modal.hide();
-        
+
         showNotification(message, 'success');
-        
+
         // Reset form
         const bulkActionType = document.getElementById('bulkActionType');
         if (bulkActionType) bulkActionType.value = '';
@@ -1199,12 +1199,12 @@ function executeBulkActionFunc(action) {
             executeBulkAction.disabled = true;
             executeBulkAction.innerHTML = 'Execute Action';
         }
-        
+
         const bulkActionInfo = document.getElementById('bulkActionInfo');
         const bulkActionWarning = document.getElementById('bulkActionWarning');
         if (bulkActionInfo) bulkActionInfo.classList.add('d-none');
         if (bulkActionWarning) bulkActionWarning.classList.add('d-none');
-        
+
         // Clear selections
         selectedStores.clear();
         document.querySelectorAll('.store-card').forEach(card => {
@@ -1224,9 +1224,9 @@ function showNotification(message, type = 'info') {
         ${message}
         <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
     `;
-    
+
     document.body.appendChild(alertDiv);
-    
+
     // Auto-remove after 5 seconds
     setTimeout(() => {
         if (alertDiv.parentNode) {
@@ -1237,13 +1237,13 @@ function showNotification(message, type = 'info') {
 
 function editStore(storeId) {
     console.log('Editing store:', storeId);
-    
+
     const store = storesData.find(s => s.id == storeId);
     if (!store) {
         console.error('Store not found:', storeId);
         return;
     }
-    
+
     // Populate the edit form with store data
     document.getElementById('edit_store_name').value = store.store_name || '';
     document.getElementById('edit_store_type').value = store.store_type || '';
@@ -1258,10 +1258,10 @@ function editStore(storeId) {
     document.getElementById('edit_manager_contact').value = store.manager_contact || '';
     document.getElementById('edit_google_review_url').value = store.google_review_url || '';
     document.getElementById('edit_google_review_mode').value = store.google_review_mode || 'reward';
-    
+
     // Set form action
     document.getElementById('editStoreForm').action = `/admin/stores/${storeId}/edit`;
-    
+
     // Show the modal
     const modal = new bootstrap.Modal(document.getElementById('editStoreModal'));
     modal.show();
@@ -1355,18 +1355,18 @@ function copyFeedbackLink(storeId) {
 
 function loadStoreDetails(storeId) {
     console.log('Loading store details for:', storeId);
-    
+
     const store = storesData.find(s => s.id == storeId);
     if (!store) {
         console.error('Store not found:', storeId);
         return;
     }
-    
+
     console.log('Found store:', store);
-    
+
     // Generate QR code and public URL dynamically
     const publicUrl = window.location.origin + '/s/' + storeId;
-    
+
     const detailsHtml = `
         <div class="row g-4">
             <div class="col-md-8">
@@ -1375,7 +1375,7 @@ function loadStoreDetails(storeId) {
                     <span class="badge bg-${store.status === 'active' ? 'success' : store.status === 'inactive' ? 'secondary' : 'warning'} text-dark ms-3">${store.status.charAt(0).toUpperCase() + store.status.slice(1)}</span>
                     ${store.store_type ? '<span class="badge bg-light text-dark ms-2">' + store.store_type.charAt(0).toUpperCase() + store.store_type.slice(1) + '</span>' : ''}
                 </div>
-                
+
                 ${store.address ? `
                     <p class="text-muted mb-2">
                         <i class="bi bi-geo-alt me-2"></i>
@@ -1385,14 +1385,14 @@ function loadStoreDetails(storeId) {
                         ${store.postal_code ? ' ' + store.postal_code : ''}
                     </p>
                 ` : ''}
-                
+
                 ${store.contact_number || store.email ? `
                     <div class="mb-3">
                         ${store.contact_number ? '<p class="text-muted mb-2"><i class="bi bi-telephone me-2"></i>' + store.contact_number + '</p>' : ''}
                         ${store.email ? '<p class="text-muted mb-2"><i class="bi bi-envelope me-2"></i>' + store.email + '</p>' : ''}
                     </div>
                 ` : ''}
-                
+
                 ${store.store_manager_name ? `
                     <div class="mb-3">
                         <p class="text-muted mb-1">
@@ -1401,18 +1401,18 @@ function loadStoreDetails(storeId) {
                         ${store.manager_contact ? '<p class="text-muted mb-1"><i class="bi bi-telephone me-2"></i>Manager: ' + store.manager_contact + '</p>' : ''}
                     </div>
                 ` : ''}
-                
+
                 <p class="small text-muted mb-3">
                     <i class="bi bi-calendar me-2"></i>
-                    Created: ${store.created_at ? new Date(store.created_at).toLocaleString('en-US', { 
-                        year: 'numeric', 
-                        month: 'long', 
-                        day: 'numeric', 
-                        hour: '2-digit', 
-                        minute: '2-digit' 
+                    Created: ${store.created_at ? new Date(store.created_at).toLocaleString('en-US', {
+                        year: 'numeric',
+                        month: 'long',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit'
                     }) : 'N/A'}
                 </p>
-                
+
                 <div class="d-flex gap-2">
                     <a href="/admin/stores/${storeId}/feedback" class="btn btn-outline-primary d-flex align-items-center">
                         <i class="bi bi-chat-left-text me-2"></i>
@@ -1424,7 +1424,7 @@ function loadStoreDetails(storeId) {
                     </button>
                 </div>
             </div>
-            
+
             <div class="col-md-4">
                 <div class="bg-light rounded-3 p-3">
                     <div class="d-flex align-items-center mb-2">
@@ -1486,18 +1486,18 @@ function loadStoreDetails(storeId) {
             </div>
         </div>
     `;
-    
+
     document.getElementById('storeDetailsContent').innerHTML = detailsHtml;
-    
+
     // Generate QR code after a small delay to ensure DOM is ready
     setTimeout(() => {
         generateQRCode('qr-code-' + storeId, publicUrl);
     }, 100);
-    
+
     // Show modal
     const modalElement = document.getElementById('storeDetailsModal');
     console.log('Modal element:', modalElement);
-    
+
     if (modalElement) {
         const modal = new bootstrap.Modal(modalElement);
         console.log('Modal instance:', modal);
@@ -1514,11 +1514,11 @@ function generateQRCode(elementId, text) {
         console.error('QR code element not found:', elementId);
         return;
     }
-    
+
     try {
         // Clear any existing content
         element.innerHTML = '';
-        
+
         // Generate QR code
         new QRCode(element, {
             text: text,
@@ -1528,11 +1528,11 @@ function generateQRCode(elementId, text) {
             colorLight: '#ffffff',
             correctLevel: QRCode.CorrectLevel.H
         });
-        
+
         console.log('QR code generated successfully for:', text);
     } catch (error) {
         console.error('Error generating QR code:', error);
-        
+
         // Fallback to placeholder if QR code generation fails
         element.innerHTML = `
             <div class="d-flex align-items-center justify-content-center h-100 text-muted">
@@ -1554,7 +1554,7 @@ function downloadQRCode(storeId, storeName) {
     // Find the canvas or img generated by qrcode.js
     const canvas = qrContainer.querySelector('canvas');
     const img = qrContainer.querySelector('img');
-    
+
     let dataUrl;
     if (canvas) {
         dataUrl = canvas.toDataURL("image/png");
@@ -1568,7 +1568,7 @@ function downloadQRCode(storeId, storeName) {
     // Create a temporary link element to trigger the download
     const link = document.createElement('a');
     const filename = `QR_${storeName.replace(/[^a-z0-9]/gi, '_')}.png`;
-    
+
     link.href = dataUrl;
     link.download = filename;
     document.body.appendChild(link);
@@ -1580,7 +1580,7 @@ function downloadQRCode(storeId, storeName) {
 // Function to update modal with real data
 function updateStoreModal(storeId, feedbackData, analyticsData, staffData) {
     const store = storesData.find(s => s.id === storeId);
-    
+
     // Generate HTML with real data
     const storeDetailsHtml = `
         <div class="container-fluid p-0 h-100">
@@ -1618,9 +1618,9 @@ function updateStoreModal(storeId, feedbackData, analyticsData, staffData) {
                         <!-- QR Code Section -->
                         <div class="mb-4 text-center">
                             <h6 class="text-muted mb-2 small fw-bold">STORE QR CODE</h6>
-                            <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(window.location.origin + '/s/' + store.id)}" 
-                                 alt="Store QR Code" 
-                                 class="img-fluid" 
+                            <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(window.location.origin + '/s/' + store.id)}"
+                                 alt="Store QR Code"
+                                 class="img-fluid"
                                  style="max-width: 120px;">
                             <div class="small text-muted mt-2">Scan to give feedback</div>
                         </div>
@@ -1677,10 +1677,10 @@ function updateStoreModal(storeId, feedbackData, analyticsData, staffData) {
             </div>
         </div>
     `;
-    
+
     // Update modal content
     document.getElementById('storeDetailsContent').innerHTML = storeDetailsHtml;
-    
+
     // Initialize charts with real data
     setTimeout(() => {
         initializeChartsWithData(analyticsData, staffData);
@@ -1697,7 +1697,7 @@ function generateFeedbackHtml(feedbackData) {
             </div>
         `;
     }
-    
+
     const feedbackItems = feedbackData.slice(0, 5).map(feedback => `
         <div class="list-group-item">
             <div class="d-flex align-items-start justify-content-between">
@@ -1716,7 +1716,7 @@ function generateFeedbackHtml(feedbackData) {
             </div>
         </div>
     `).join('');
-    
+
     return `
         <div class="list-group list-group-flush">
             ${feedbackItems}
@@ -1733,7 +1733,7 @@ function generateFeedbackHtml(feedbackData) {
 function generateAnalyticsHtml(analyticsData) {
     const ratingMetrics = analyticsData?.rating_metrics || {};
     const staffMetrics = analyticsData?.staff_metrics || {};
-    
+
     return `
         <div class="row g-4">
             <div class="col-md-6">
@@ -1784,7 +1784,7 @@ function generateStaffHtml(staffData) {
             </div>
         `;
     }
-    
+
     const staffItems = staffData.map((staff, index) => `
         <div class="list-group-item">
             <div class="d-flex align-items-center justify-content-between">
@@ -1802,7 +1802,7 @@ function generateStaffHtml(staffData) {
             </div>
         </div>
     `).join('');
-    
+
     return `
         <div class="list-group list-group-flush">
             ${staffItems}
@@ -1818,11 +1818,11 @@ function generateStaffHtml(staffData) {
 // Generate star rating HTML
 function generateStarRating(rating) {
     if (!rating) return '<span class="text-muted">No rating</span>';
-    
+
     const fullStars = Math.floor(rating);
     const hasHalfStar = rating % 1 >= 0.5;
     const emptyStars = 5 - fullStars - (hasHalfStar ? 1 : 0);
-    
+
     let stars = '';
     for (let i = 0; i < fullStars; i++) {
         stars += '<i class="bi bi-star-fill"></i>';
@@ -1833,7 +1833,7 @@ function generateStarRating(rating) {
     for (let i = 0; i < emptyStars; i++) {
         stars += '<i class="bi bi-star"></i>';
     }
-    
+
     return stars;
 }
 
@@ -1841,7 +1841,7 @@ function generateStarRating(rating) {
 function initializeChartsWithData(analyticsData, staffData) {
     const ratingMetrics = analyticsData?.rating_metrics || {};
     const staffMetrics = analyticsData?.staff_metrics || {};
-    
+
     // Rating Distribution Chart
     const ratingCtx = document.getElementById('ratingChart');
     if (ratingCtx && typeof Chart !== 'undefined') {
@@ -1853,11 +1853,11 @@ function initializeChartsWithData(analyticsData, staffData) {
                     label: 'Rating Distribution',
                     data: ratingMetrics.distribution || [0, 0, 0, 0, 0],
                     backgroundColor: [
-                        '#FF6B35',
-                        '#FF6B35',
-                        '#E85A2A',
-                        '#E85A2A',
-                        '#CC4A1F'
+                        '#1B1E76',
+                        '#1B1E76',
+                        '#171A67',
+                        '#171A67',
+                        '#131657'
                     ],
                     borderWidth: 0
                 }]
@@ -1881,13 +1881,13 @@ function initializeChartsWithData(analyticsData, staffData) {
             }
         });
     }
-    
+
     // Staff Commendations Chart
     const staffCtx = document.getElementById('staffChart');
     if (staffCtx && typeof Chart !== 'undefined') {
         const staffNames = staffData?.map(s => s.name) || [];
         const staffCommendations = staffData?.map(s => s.commendations || 0) || [];
-        
+
         new Chart(staffCtx, {
             type: 'doughnut',
             data: {
@@ -1895,11 +1895,11 @@ function initializeChartsWithData(analyticsData, staffData) {
                 datasets: [{
                     data: staffCommendations,
                     backgroundColor: [
-                        '#FF6B35',
-                        '#FF6B35',
-                        '#E85A2A',
-                        '#E85A2A',
-                        '#CC4A1F'
+                        '#1B1E76',
+                        '#1B1E76',
+                        '#171A67',
+                        '#171A67',
+                        '#131657'
                     ],
                     borderWidth: 0
                 }]
@@ -1925,7 +1925,7 @@ function downloadQRCode(storeId, storeName) {
     // Find the canvas or img generated by qrcode.js
     const canvas = qrContainer.querySelector('canvas');
     const img = qrContainer.querySelector('img');
-    
+
     let dataUrl;
     if (canvas) {
         dataUrl = canvas.toDataURL("image/png");
@@ -1939,7 +1939,7 @@ function downloadQRCode(storeId, storeName) {
     // Create a temporary link element to trigger the download
     const link = document.createElement('a');
     const filename = `QR_${storeName.replace(/[^a-z0-9]/gi, '_')}.png`;
-    
+
     link.href = dataUrl;
     link.download = filename;
     document.body.appendChild(link);
@@ -1954,11 +1954,11 @@ function generateQRCode(elementId, text) {
         console.error('QR code element not found:', elementId);
         return;
     }
-    
+
     try {
         // Clear any existing content
         element.innerHTML = '';
-        
+
         // Generate QR code
         new QRCode(element, {
             text: text,
@@ -1968,11 +1968,11 @@ function generateQRCode(elementId, text) {
             colorLight: '#ffffff',
             correctLevel: QRCode.CorrectLevel.H
         });
-        
+
         console.log('QR code generated successfully for:', text);
     } catch (error) {
         console.error('Error generating QR code:', error);
-        
+
         // Fallback to placeholder if QR code generation fails
         element.innerHTML = `
             <div class="d-flex align-items-center justify-content-center h-100 text-muted">
@@ -1999,11 +1999,11 @@ function initializeCharts() {
                     label: 'Rating Distribution',
                     data: [34, 18, 8, 3, 2],
                     backgroundColor: [
-                        '#FF6B35',
-                        '#FF6B35',
-                        '#E85A2A',
-                        '#E85A2A',
-                        '#CC4A1F'
+                        '#1B1E76',
+                        '#1B1E76',
+                        '#171A67',
+                        '#171A67',
+                        '#131657'
                     ],
                     borderWidth: 0
                 }]
@@ -2027,7 +2027,7 @@ function initializeCharts() {
             }
         });
     }
-    
+
     // Staff Commendations Chart
     const staffCtx = document.getElementById('staffChart');
     if (staffCtx && typeof Chart !== 'undefined') {
@@ -2038,11 +2038,11 @@ function initializeCharts() {
                 datasets: [{
                     data: [15, 12, 10, 8, 2],
                     backgroundColor: [
-                        '#FF6B35',
-                        '#FF6B35',
-                        '#E85A2A',
-                        '#E85A2A',
-                        '#CC4A1F'
+                        '#1B1E76',
+                        '#1B1E76',
+                        '#171A67',
+                        '#171A67',
+                        '#131657'
                     ],
                     borderWidth: 0
                 }]
@@ -2106,7 +2106,7 @@ async function openViewersModal(storeId, storeName) {
         <div class="d-flex align-items-center justify-content-between py-2 px-2 mb-1 rounded" style="background: var(--neutral-100);">
           <div class="d-flex align-items-center gap-2">
             <div class="rounded-circle d-flex align-items-center justify-content-center"
-                 style="width:32px;height:32px;background:linear-gradient(135deg,#FF6B35,#E85A2A);color:white;font-weight:700;font-size:.85rem;">
+                 style="width:32px;height:32px;background:linear-gradient(135deg,#1B1E76,#171A67);color:white;font-weight:700;font-size:.85rem;">
               ${escapeHtml((u.username || '?')[0].toUpperCase())}
             </div>
             <div>

@@ -158,19 +158,19 @@ function filterStaff() {
   const searchTerm = document.getElementById('staffSearch').value.toLowerCase();
   const statusFilter = document.getElementById('statusFilter').value.toLowerCase();
   const storeFilter = document.getElementById('storeFilter').value.toLowerCase();
-  
+
   const rows = document.querySelectorAll('tbody tr');
   let visibleCount = 0;
-  
+
   rows.forEach(row => {
     const name = row.dataset.name || '';
     const status = row.dataset.status || '';
     const store = row.dataset.store || '';
-    
+
     const matchesSearch = name.includes(searchTerm);
     const matchesStatus = !statusFilter || status === statusFilter;
     const matchesStore = !storeFilter || store.toLowerCase() === storeFilter;
-    
+
     if (matchesSearch && matchesStatus && matchesStore) {
       row.style.display = '';
       visibleCount++;
@@ -178,7 +178,7 @@ function filterStaff() {
       row.style.display = 'none';
     }
   });
-  
+
   // Update rank display for visible rows
   updateRanks();
 }

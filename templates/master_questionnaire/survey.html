@@ -134,7 +134,7 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
                 </p>
               </div>
             </div>
-            
+
             <div class="form-group mb-3">
               <label for="staff_commendation" class="form-label fw-medium">
                 Select Staff Member
@@ -372,7 +372,7 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
 {% endblock %} {% block scripts %}
 <style>
   :root {
-    --tenant-primary: {{ branding.primary_color|default('#FF6B35') }};
+    --tenant-primary: {{ branding.primary_color|default('#1B1E76') }};
     --tenant-secondary: {{ branding.secondary_color|default('#F59E0B') }};
     --tenant-accent: {{ branding.accent_color|default('#2563EB') }};
     --tenant-text: {{ branding.text_color|default('#212529') }};
@@ -569,12 +569,12 @@ PURPOSE: The actual "Feedback Form". This is the page the customer sees when
     const stars = document.querySelectorAll('#commendationStars .commendation-star');
     const input = document.getElementById('commendationRatingInput');
     const label = document.getElementById('commendationRatingLabel');
-    
+
     input.value = value;
-    
+
     const labels = ['', 'Poor', 'Fair', 'Good', 'Very Good', 'Excellent'];
     label.textContent = labels[value] || 'Tap a star to rate';
-    
+
     stars.forEach(star => {
       const starValue = parseInt(star.dataset.value);
       if (starValue <= value) {

@@ -1,5 +1,5 @@
 {% extends "layout.html" %}
-<!-- 
+<!--
 ================================================================================
 FILE: manage_stores/store_details.html
 URL ROUTE: /admin/stores/<store_id>/details
@@ -183,13 +183,13 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
                   <option value="unresolved">Unresolved</option>
                   <option value="resolved">Resolved</option>
                 </select>
-                <a href="{{ request.url_root }}s/{{ store.id }}" target="_blank" class="btn btn-sm py-1 px-2" style="font-size: 0.75rem; background: rgba(255, 107, 53, 0.1); color: #FF6B35; border: 1px solid rgba(255, 107, 53, 0.3);">
+                <a href="{{ request.url_root }}s/{{ store.id }}" target="_blank" class="btn btn-sm py-1 px-2" style="font-size: 0.75rem; background: rgba(255, 107, 53, 0.1); color: #1B1E76; border: 1px solid rgba(255, 107, 53, 0.3);">
                   <i class="bi bi-arrow-right me-1"></i>
                   View All Feedback
                 </a>
               </div>
             </div>
-            
+
             {% if recent_feedback|length == 0 %}
               <div class="text-center py-5">
                 <i class="bi bi-inbox text-muted fs-1"></i>
@@ -237,7 +237,7 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
         <div class="tab-pane fade" id="analytics" role="tabpanel">
           <div class="p-4">
             <h4 class="mb-4 fw-bold">Store Analytics</h4>
-            
+
             <div class="row g-4">
               <div class="col-md-6">
                 <div class="card border-0 shadow-sm">
@@ -270,7 +270,7 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
                 </div>
               </div>
             </div>
-            
+
             <div class="row g-4 mt-2">
               <div class="col-md-6">
                 <div class="card border-0 shadow-sm">
@@ -297,7 +297,7 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
                   </div>
                 </div>
               </div>
-              
+
               <div class="col-md-6">
                 <div class="card border-0 shadow-sm">
                   <div class="card-body p-3">
@@ -320,7 +320,7 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
                 </div>
               </div>
             </div>
-            
+
             <!-- Staff Analytics Section -->
             <div class="row g-4 mt-2">
               <div class="col-md-6">
@@ -333,7 +333,7 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
                     {% if top_staff %}
                       <!-- Top Performer -->
                       {% if top_staff[0] %}
-                      <div class="d-flex align-items-center justify-content-center rounded-circle" style="width: 48px; height: 48px; min-width: 48px; background: linear-gradient(135deg, #FF6B35, #E85A2A); color: white; font-size: 1.2rem; font-weight: 700;">
+                      <div class="d-flex align-items-center justify-content-center rounded-circle" style="width: 48px; height: 48px; min-width: 48px; background: linear-gradient(135deg, #1B1E76, #171A67); color: white; font-size: 1.2rem; font-weight: 700;">
                         <div>
                           <div class="fw-bold text-success">
                             <i class="bi bi-award-fill me-2"></i>
@@ -347,7 +347,7 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
                         </div>
                       </div>
                       {% endif %}
-                      
+
                       <!-- Other Top Performers -->
                       {% for staff in top_staff[1:4] %}
                       <div class="d-flex align-items-center justify-content-between mb-2 p-2 bg-light rounded">
@@ -367,7 +367,7 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
                   </div>
                 </div>
               </div>
-              
+
               <div class="col-md-6">
                 <div class="card border-0 shadow-sm">
                   <div class="card-body p-3">
@@ -396,7 +396,7 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
                 </div>
               </div>
             </div>
-            
+
             <!-- Staff Commendations Chart -->
             {% if top_staff %}
             <div class="row g-4 mt-2">
@@ -423,7 +423,7 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
                 Manage Staff
               </a>
             </div>
-            
+
             {% if staff_members|length == 0 %}
               <div class="text-center py-5">
                 <i class="bi bi-people text-muted fs-1"></i>
@@ -492,7 +492,7 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
               <img src="{{ qr_data_uri }}" alt="QR Code" style="width: 200px; height: 200px;" />
             </div>
           </div>
-          
+
           <div class="mb-4">
             <h6 class="fw-semibold mb-2">Survey Link</h6>
             <div class="input-group">
@@ -522,7 +522,7 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
   <div class="modal fade" id="editStoreModal" tabindex="-1" aria-labelledby="editStoreModalLabel" aria-hidden="true">
     <div class="modal-dialog modal-lg">
       <div class="modal-content">
-        <div class="modal-header" style="background: linear-gradient(135deg, #FF6B35 0%, #212529 100%); color: white; border-radius:14px 14px 0 0;">
+        <div class="modal-header" style="background: linear-gradient(135deg, #1B1E76 0%, #212529 100%); color: white; border-radius:14px 14px 0 0;">
           <h5 class="modal-title" id="editStoreModalLabel">Edit Store</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
@@ -549,12 +549,12 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
                   <option value="other" {{ 'selected' if store.store_type == 'other' }}>Other</option>
                 </select>
               </div>
-              
+
               <div class="col-12">
                 <label for="edit_address" class="form-label fw-medium">Address</label>
                 <input type="text" id="edit_address" name="address" class="form-control" value="{{ store.address or '' }}" />
               </div>
-              
+
               <div class="col-md-4">
                 <label for="edit_city" class="form-label fw-medium">City</label>
                 <input type="text" id="edit_city" name="city" class="form-control" value="{{ store.city or '' }}" />
@@ -572,7 +572,7 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
                 <label for="edit_postal_code" class="form-label fw-medium">Postal Code</label>
                 <input type="text" id="edit_postal_code" name="postal_code" class="form-control" value="{{ store.postal_code or '' }}" />
               </div>
-              
+
               <div class="col-md-4">
                 <label for="edit_contact_number" class="form-label fw-medium">Contact Number</label>
                 <input type="tel" id="edit_contact_number" name="contact_number" class="form-control" value="{{ store.contact_number or '' }}" />
@@ -607,20 +607,20 @@ PURPOSE: Comprehensive store details page showing feedback, analytics, and staff
 document.addEventListener('DOMContentLoaded', function() {
     // Set edit form action
     document.getElementById('editStoreForm').action = `/admin/stores/{{ store.id }}/edit`;
-    
+
     // QR Code functions
     window.copySurveyLink = function() {
         const surveyLink = document.getElementById('surveyLink');
         surveyLink.select();
         document.execCommand('copy');
-        
+
         // Show feedback
         const button = event.target;
         const originalText = button.innerHTML;
         button.innerHTML = '<i class="bi bi-check me-2"></i>Copied!';
         button.classList.remove('btn-outline-primary');
         button.classList.add('btn-success');
-        
+
         setTimeout(() => {
             button.innerHTML = originalText;
             button.classList.remove('btn-success');
@@ -638,11 +638,11 @@ document.addEventListener('DOMContentLoaded', function() {
             window.prompt('Copy this feedback link:', feedbackUrl);
         }
     };
-    
+
     window.downloadQRCode = function() {
         const qrImage = document.querySelector('#qrCodeModal img');
         if (!qrImage) return;
-        
+
         // Create download link
         const link = document.createElement('a');
         link.href = qrImage.src;
@@ -651,7 +651,7 @@ document.addEventListener('DOMContentLoaded', function() {
         link.click();
         document.body.removeChild(link);
     };
-    
+
     // Analytics Charts
     const ctx1 = document.getElementById('ratingChart');
     if (ctx1) {
@@ -663,18 +663,18 @@ document.addEventListener('DOMContentLoaded', function() {
                     label: 'Number of Ratings',
                     data: {{ rating_distribution|tojson }},
                     backgroundColor: [
-                        '#FF6B35',  // 1 star - orange
-                        '#FF6B35',  // 2 stars - orange
-                        '#E85A2A',  // 3 stars - darker orange
-                        '#E85A2A',  // 4 stars - darker orange
-                        '#CC4A1F'   // 5 stars - darkest orange
+                        '#1B1E76',  // 1 star - orange
+                        '#1B1E76',  // 2 stars - orange
+                        '#171A67',  // 3 stars - darker orange
+                        '#171A67',  // 4 stars - darker orange
+                        '#131657'   // 5 stars - darkest orange
                     ],
                     borderColor: [
-                        '#FF6B35',
-                        '#FF6B35', 
-                        '#E85A2A',
-                        '#E85A2A',
-                        '#CC4A1F'
+                        '#1B1E76',
+                        '#1B1E76',
+                        '#171A67',
+                        '#171A67',
+                        '#131657'
                     ],
                     borderWidth: 1
                 }]
@@ -708,7 +708,7 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         });
     }
-    
+
     const ctx2 = document.getElementById('trendChart');
     if (ctx2) {
         new Chart(ctx2, {
@@ -718,8 +718,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 datasets: [{
                     label: 'Feedback Count',
                     data: {{ feedback_trend_data|tojson }},
-                    borderColor: '#FF6B35',
-                    backgroundColor: '#FF6B35',
+                    borderColor: '#1B1E76',
+                    backgroundColor: '#1B1E76',
                     tension: 0.4
                 }]
             },
@@ -737,14 +737,14 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         });
     }
-    
+
     // Staff Commendations Chart
     const ctx3 = document.getElementById('staffCommendationsChart');
     if (ctx3) {
         const staffData = {{ top_staff|tojson }};
         const staffNames = staffData.map(s => s.staff_name);
         const commendationCounts = staffData.map(s => s.total_commendations);
-        
+
         new Chart(ctx3, {
             type: 'bar',
             data: {

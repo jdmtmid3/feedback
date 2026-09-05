@@ -1,9 +1,9 @@
 {% extends "layout.html" %}
-<!-- 
+<!--
 ================================================================================
 FILE: manage_staff/staff.html
 URL ROUTE: /admin/stores/<store_id>/staff
-PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/deleting 
+PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/deleting
          staff members for the store.
 ================================================================================
 -->
@@ -186,7 +186,7 @@ PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/del
                   required
                 />
               </div>
-              
+
               <div class="col-md-6">
                 <label for="email" class="form-label fw-medium">Email</label>
                 <input
@@ -207,7 +207,7 @@ PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/del
                   placeholder="e.g. (555) 123-4567"
                 />
               </div>
-              
+
               <div class="col-md-6">
                 <label for="position" class="form-label fw-medium">Position</label>
                 <input
@@ -226,7 +226,7 @@ PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/del
                   <option value="supervisor">Supervisor</option>
                 </select>
               </div>
-              
+
               <div class="col-12">
                 <label for="photo" class="form-label fw-medium">Profile Photo</label>
                 <input type="file" id="photo" name="photo" class="form-control" accept="image/png,image/jpeg" />
@@ -286,7 +286,7 @@ PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/del
                   required
                 />
               </div>
-              
+
               <div class="col-md-6">
                 <label for="edit_email" class="form-label fw-medium">Email</label>
                 <input
@@ -305,7 +305,7 @@ PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/del
                   class="form-control"
                 />
               </div>
-              
+
               <div class="col-md-6">
                 <label for="edit_position" class="form-label fw-medium">Position</label>
                 <input
@@ -323,7 +323,7 @@ PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/del
                   <option value="supervisor">Supervisor</option>
                 </select>
               </div>
-              
+
               <div class="col-md-6">
                 <label for="edit_status" class="form-label fw-medium">Status</label>
                 <select id="edit_status" name="status" class="form-select">
@@ -331,7 +331,7 @@ PURPOSE: "Staff Management" page for a specific store. Allows adding/editing/del
                   <option value="inactive">Inactive</option>
                 </select>
               </div>
-              
+
               <div class="col-md-6">
                 <label for="edit_hire_date" class="form-label fw-medium">Hire Date</label>
                 <input
@@ -594,13 +594,13 @@ const staffData = {{ staff | tojson | safe }};
 
 function editStaff(staffId) {
     console.log('Editing staff:', staffId);
-    
+
     const staff = staffData.find(s => s.id == staffId);
     if (!staff) {
         console.error('Staff not found:', staffId);
         return;
     }
-    
+
     // Populate the edit form with staff data
     document.getElementById('edit_first_name').value = staff.first_name || '';
     document.getElementById('edit_last_name').value = staff.last_name || '';
@@ -610,10 +610,10 @@ function editStaff(staffId) {
     document.getElementById('edit_role').value = staff.role || 'staff';
     document.getElementById('edit_status').value = staff.status || 'active';
     document.getElementById('edit_hire_date').value = staff.hire_date || '';
-    
+
     // Set form action
     document.getElementById('editStaffForm').action = `/admin/stores/{{ store.id }}/staff/${staffId}/edit`;
-    
+
     // Show the modal
     const modal = new bootstrap.Modal(document.getElementById('editStaffModal'));
     modal.show();
@@ -624,14 +624,14 @@ function copyStaffSurveyLink() {
     const surveyLink = document.getElementById('staffSurveyLink');
     surveyLink.select();
     document.execCommand('copy');
-    
+
     // Show feedback
     const button = event.target;
     const originalText = button.innerHTML;
     button.innerHTML = '<i class="bi bi-check"></i> Copied!';
     button.classList.remove('btn-outline-primary');
     button.classList.add('btn-success');
-    
+
     setTimeout(() => {
         button.innerHTML = originalText;
         button.classList.remove('btn-success');
@@ -642,7 +642,7 @@ function copyStaffSurveyLink() {
 function downloadStaffQRCode() {
     const qrImage = document.querySelector('.bg-white img');
     if (!qrImage) return;
-    
+
     // Create download link
     const link = document.createElement('a');
     link.href = qrImage.src;

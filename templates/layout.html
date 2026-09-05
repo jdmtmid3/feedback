@@ -1,8 +1,8 @@
 <!doctype html>
-<!-- 
+<!--
 ================================================================================
 FILE: layout.html (Admin Base Layout)
-PURPOSE: This is the main "shell" for all Admin pages. It contains the 
+PURPOSE: This is the main "shell" for all Admin pages. It contains the
          sidebar, top navigation, and imports Bootstrap & CSS.
          Other admin pages "extend" this file and inject their content.
 ================================================================================
@@ -22,9 +22,9 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
       :root {
-        --tenant-primary: {{ ui_branding.primary_color|default('#FF6B35') }};
-        --tenant-secondary: {{ ui_branding.secondary_color|default('#B03A14') }};
-        --tenant-accent: {{ ui_branding.accent_color|default('#2563EB') }};
+        --tenant-primary: {{ ui_branding.primary_color|default('#1B1E76') }};
+        --tenant-secondary: {{ ui_branding.secondary_color|default('#FC8C12') }};
+        --tenant-accent: {{ ui_branding.accent_color|default('#FC8C12') }};
         --tenant-text: {{ ui_branding.text_color|default('#212529') }};
         /* Primary Colors - Black Theme */
         --primary-50: #f8f9fa;
@@ -38,29 +38,29 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         --primary-800: #212529;
         --primary-900: #000000;
 
-        /* Secondary Accent - Orange Theme */
-        --accent-50: #FFF0E6;
-        --accent-100: #FFE0CC;
-        --accent-200: #FFCC99;
-        --accent-300: #FFB366;
-        --accent-400: #FF9933;
+        /* Primary Indigo scale */
+        --accent-50: #F1F2FF;
+        --accent-100: #E2E4FF;
+        --accent-200: #C5C8FF;
+        --accent-300: #999EFF;
+        --accent-400: #696FE8;
         --accent-500: var(--tenant-primary);
-        --accent-600: #E85A2A;
-        --accent-700: #CC4A1F;
-        --accent-800: #B03A14;
-        --accent-900: #942A09;
+        --accent-600: #171A67;
+        --accent-700: #131657;
+        --accent-800: #11134D;
+        --accent-900: #0C0E3B;
 
         /* Tertiary Accent - Orange Theme for call-to-action */
-        --yellow-50: #FFF0E6;
-        --yellow-100: #FFE0CC;
-        --yellow-200: #FFCC99;
-        --yellow-300: #FFB366;
-        --yellow-400: #FF9933;
-        --yellow-500: #FF6B35;
-        --yellow-600: #E85A2A;
-        --yellow-700: #CC4A1F;
-        --yellow-800: #B03A14;
-        --yellow-900: #942A09;
+        --yellow-50: #FFF7ED;
+        --yellow-100: #FFEDD5;
+        --yellow-200: #FED7AA;
+        --yellow-300: #FDBA74;
+        --yellow-400: #FD9A38;
+        --yellow-500: var(--tenant-secondary);
+        --yellow-600: #E97808;
+        --yellow-700: #C55E07;
+        --yellow-800: #9C480C;
+        --yellow-900: #7D3D0D;
 
         /* Header Color - Orange */
         --header-color: var(--tenant-primary);
@@ -97,7 +97,8 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         overflow: hidden;
       }
 
-      .btn-primary, .badge-primary { background-color: var(--tenant-primary) !important; border-color: var(--tenant-primary) !important; }
+      .btn-primary, .badge-primary { background-color: var(--tenant-primary) !important; border-color: var(--tenant-primary) !important; color: #fff !important; }
+      .btn-secondary { background-color: var(--tenant-secondary) !important; border-color: var(--tenant-secondary) !important; color: #fff !important; }
       .bg-primary { background-color: var(--tenant-primary) !important; }
       .text-primary { color: var(--tenant-primary) !important; }
       /* Bootstrap's opacity helper cannot tint a custom solid background.
@@ -204,7 +205,7 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
       .btn-primary {
         color: white !important;
       }
-      
+
       .btn-primary:hover {
         color: white !important;
       }
@@ -245,7 +246,7 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
       }
 
       .btn-primary {
-        background: linear-gradient(135deg, var(--yellow-500), var(--yellow-600));
+        background: linear-gradient(135deg, var(--tenant-primary), var(--accent-600));
         color: white;
         border: none;
         border-radius: 8px;
@@ -256,20 +257,20 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
 
       .btn-primary:hover {
         transform: translateY(-1px);
-        box-shadow: 0 4px 12px rgba(255, 107, 53, 0.4);
+        box-shadow: 0 4px 12px rgba(27, 30, 118, 0.28);
       }
 
       .btn-outline-primary {
-        color: var(--yellow-600);
-        border-color: var(--yellow-300);
+        color: var(--tenant-primary);
+        border-color: var(--accent-300);
         border-radius: 8px;
         font-weight: 500;
         transition: all 0.2s ease;
       }
 
       .btn-outline-primary:hover {
-        background: var(--yellow-50);
-        color: var(--yellow-700);
+        background: var(--accent-50);
+        color: var(--accent-700);
       }
 
       .form-control,
@@ -284,8 +285,8 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
 
       .form-control:focus,
       .form-select:focus {
-        border-color: var(--yellow-500);
-        box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.2);
+        border-color: var(--tenant-primary);
+        box-shadow: 0 0 0 3px rgba(27, 30, 118, 0.16);
         background-color: white;
       }
 

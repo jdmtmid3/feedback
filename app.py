@@ -991,9 +991,9 @@ def create_app() -> Flask:
                         owner_user_id INT NOT NULL,
                         scope_key VARCHAR(255) NOT NULL UNIQUE,
                         license_key VARCHAR(255) NULL,
-                        primary_color VARCHAR(7) NOT NULL DEFAULT '#FF6B35',
-                        secondary_color VARCHAR(7) NOT NULL DEFAULT '#F59E0B',
-                        accent_color VARCHAR(7) NOT NULL DEFAULT '#2563EB',
+                        primary_color VARCHAR(7) NOT NULL DEFAULT '#1B1E76',
+                        secondary_color VARCHAR(7) NOT NULL DEFAULT '#FC8C12',
+                        accent_color VARCHAR(7) NOT NULL DEFAULT '#FC8C12',
                         text_color VARCHAR(7) NOT NULL DEFAULT '#212529',
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                         FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -1897,8 +1897,8 @@ def create_app() -> Flask:
                 "owner_user_id": owner['id'], "license_key": owner.get('license_key'), "logo_url": default_logo}
 
     def fetch_tenant_branding(owner_user_id: int, license_key: str | None = None) -> Dict[str, Any]:
-        defaults = {"primary_color": "#FF6B35", "secondary_color": "#F59E0B",
-                    "accent_color": "#2563EB", "text_color": "#212529"}
+        defaults = {"primary_color": "#1B1E76", "secondary_color": "#FC8C12",
+                    "accent_color": "#FC8C12", "text_color": "#212529"}
         conn = get_db_connection()
         try:
             cursor = conn.cursor(dictionary=True)
@@ -1906,15 +1906,20 @@ def create_app() -> Flask:
             effective_license = license_key if license_key is not None else owner.get('license_key')
             scope_key = effective_license or f"user:{owner_user_id}"
             cursor.execute("SELECT primary_color, secondary_color, accent_color, text_color FROM tenant_branding WHERE scope_key = %s", (scope_key,))
-            return cursor.fetchone() or defaults
+            branding = cursor.fetchone()
+            # Upgrade the former orange default palette while preserving any
+            # genuinely custom tenant color selection.
+            if branding and branding.get("primary_color", "").upper() == "#FF6B35":
+                return defaults
+            return branding or defaults
         finally:
             conn.close()
 
     @app.context_processor
     def inject_tenant_ui_branding():
         """Apply company colors to every authenticated client/admin page."""
-        defaults = {"primary_color": "#FF6B35", "secondary_color": "#B03A14",
-                    "accent_color": "#2563EB", "text_color": "#212529"}
+        defaults = {"primary_color": "#1B1E76", "secondary_color": "#FC8C12",
+                    "accent_color": "#FC8C12", "text_color": "#212529"}
         user_id = session.get("user_id")
         if not user_id:
             return {"ui_branding": defaults}

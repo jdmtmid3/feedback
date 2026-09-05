@@ -246,18 +246,18 @@ document.getElementById('conversation-filter')?.addEventListener('change', filte
 
 function selectConversation(conversationId, element) {
     currentConversationId = conversationId;
-    
+
     // Update active state in sidebar
     document.querySelectorAll('.conversation-item').forEach(el => el.classList.remove('active'));
     element.classList.add('active');
-    
+
     // Update chat header
     document.getElementById('chat-company-name').textContent = element.dataset.companyName;
     document.getElementById('chat-contact-email').textContent = element.dataset.contactEmail;
-    
+
     // Load messages
     loadMessages(conversationId);
-    
+
     // Mobile: show chat area
     if (window.innerWidth <= 768) {
         document.getElementById('sidebar').classList.add('hidden');
@@ -331,13 +331,13 @@ function sendMessage(event) {
     event.preventDefault();
     const input = document.getElementById('message-input');
     const message = input.value.trim();
-    
+
     if (!message || !currentConversationId) return;
-    
+
     const btn = event.target.querySelector('button');
     btn.disabled = true;
     btn.innerHTML = '<i class="bi bi-hourglass-split"></i> Sending...';
-    
+
     fetch(`/api/admin/conversations/${currentConversationId}/send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
