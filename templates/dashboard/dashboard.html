@@ -28,12 +28,12 @@ PURPOSE: The main "Analytics Dashboard" showing store counts, total responses,
                  onfocus="openStoreDropdown()" oninput="filterStoreList()">
           <i class="bi bi-chevron-down store-filter-chevron" onclick="toggleStoreDropdown()"></i>
           <div class="store-filter-list" id="storeFilterList" style="display:none;">
-            <div class="store-filter-item active" data-store-id="all" onclick="selectStore('all', 'All Stores (Overall)')">
+            {% if session.get('role') != 'user' %}<div class="store-filter-item active" data-store-id="all" onclick="selectStore('all', 'All Stores (Overall)')">
               <i class="bi bi-grid-3x3-gap me-2"></i>All Stores (Overall)
-            </div>
+            </div>{% endif %}
             <div class="store-filter-item" onclick="window.location.href='/dashboard/staff-overall'">
               <i class="bi bi-people me-2"></i>Staff Overall
-              <span class="store-filter-meta">All Staff</span>
+              <span class="store-filter-meta">{{ 'Assigned Staff' if session.get('role') == 'user' else 'All Staff' }}</span>
             </div>
             {% for store in stores_data %}
             <div class="store-filter-item" data-store-id="{{ store.id }}" onclick="selectStore({{ store.id }}, '{{ store.store_name }}')">
@@ -46,7 +46,7 @@ PURPOSE: The main "Analytics Dashboard" showing store counts, total responses,
       </div>
       <div id="filterBadge" class="filter-active-badge">
         <span class="badge rounded-pill bg-primary bg-opacity-10 text-primary" style="font-size:.75rem;">
-          <i class="bi bi-grid-3x3-gap me-1"></i><span id="filterBadgeText">All Stores</span>
+          <i class="bi bi-grid-3x3-gap me-1"></i><span id="filterBadgeText">{{ 'Assigned Stores' if session.get('role') == 'user' else 'All Stores' }}</span>
         </span>
       </div>
     </div>

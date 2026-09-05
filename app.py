@@ -4539,15 +4539,38 @@ def create_app() -> Flask:
         return redirect(url_for("admin_users"))
 
     @app.route("/dashboard/staff-overall")
+    @login_required
     def staff_overall():
         """Staff overall page showing all staff with ratings and performance metrics."""
         try:
             conn = get_db_connection()
             cursor = conn.cursor(dictionary=True)
 
+            current_user = get_user_by_id(session['user_id'])
+            scoped_store_ids: Optional[List[int]] = None
+            if current_user['role'] == 'admin':
+                scoped_store_ids = [s['id'] for s in fetch_stores(user_id=session['user_id'])]
+            elif current_user['role'] == 'user':
+                scoped_store_ids = get_assigned_store_ids(session['user_id'])
+
+            staff_scope_sql = ""
+            staff_scope_params: List[Any] = []
+            if scoped_store_ids is not None:
+                if scoped_store_ids:
+                    placeholders = ",".join(["%s"] * len(scoped_store_ids))
+                    staff_scope_sql = f"WHERE s.store_id IN ({placeholders})"
+                    staff_scope_params = list(scoped_store_ids)
+                else:
+                    staff_scope_sql = "WHERE 1 = 0"
+
             # Global average commendation rating (prior `m`); fall back to 4.0.
             cursor.execute(
-                "SELECT AVG(rating) as global_avg FROM staff_commendations WHERE rating IS NOT NULL"
+                f"""SELECT AVG(sc.rating) as global_avg
+                    FROM staff s
+                    LEFT JOIN staff_commendations sc ON s.id = sc.staff_id
+                    {staff_scope_sql}
+                    {"AND" if staff_scope_sql else "WHERE"} sc.rating IS NOT NULL""",
+                tuple(staff_scope_params),
             )
             row = cursor.fetchone()
             global_avg_rating = float(row['global_avg']) if row and row['global_avg'] is not None else 4.0
@@ -4556,7 +4579,7 @@ def create_app() -> Flask:
             # `weighted_score` is the Bayesian average:
             #   (C * m + sum_of_ratings) / (C + n)
             cursor.execute(
-                """
+                f"""
                 SELECT s.id, s.first_name, s.last_name, s.email, s.phone, s.position, s.role, s.status, st.store_name, s.store_id,
                        AVG(sc.rating) as avg_rating,
                        COUNT(sc.id) as commendation_count,
@@ -4568,10 +4591,11 @@ def create_app() -> Flask:
                 FROM staff s
                 LEFT JOIN staff_commendations sc ON s.id = sc.staff_id
                 LEFT JOIN stores st ON s.store_id = st.id
+                {staff_scope_sql}
                 GROUP BY s.id, s.first_name, s.last_name, s.email, s.phone, s.position, s.role, s.status, st.store_name, s.store_id
                 ORDER BY weighted_score DESC, s.last_name, s.first_name
                 """,
-                (BAYESIAN_C, global_avg_rating, BAYESIAN_C),
+                tuple([BAYESIAN_C, global_avg_rating, BAYESIAN_C] + staff_scope_params),
             )
             staff_data = cursor.fetchall()
             
@@ -4589,6 +4613,7 @@ def create_app() -> Flask:
             return f"Staff Overall Error: {e}<br><pre>{error_details}</pre>", 500
 
     @app.route("/api/dashboard/analytics")
+    @login_required
     def api_dashboard_analytics():
         """JSON endpoint for overall dashboard analytics (used by store filter)."""
         try:
@@ -7435,6 +7460,7 @@ def create_app() -> Flask:
         )
 
     @app.route("/admin/responses/<int:response_id>/status", methods=["POST"])
+    @role_required('user', 'admin', 'superadmin')
     def update_response_status(response_id: int):
         try:
             data = request.get_json()
@@ -7445,7 +7471,19 @@ def create_app() -> Flask:
             
             conn = get_db_connection()
             try:
-                cursor = conn.cursor()
+                cursor = conn.cursor(dictionary=True)
+                cursor.execute(
+                    """SELECT q.store_id
+                       FROM responses r
+                       JOIN questionnaires q ON q.id = r.questionnaire_id
+                       WHERE r.id = %s""",
+                    (response_id,),
+                )
+                response_scope = cursor.fetchone()
+                if not response_scope:
+                    return {"success": False, "error": "Feedback not found"}, 404
+                if not can_manage_store_staff(session['user_id'], int(response_scope['store_id'])):
+                    return {"success": False, "error": "You can only update feedback from your assigned store."}, 403
                 cursor.execute(
                     "UPDATE responses SET status = %s WHERE id = %s",
                     (new_status, response_id)
