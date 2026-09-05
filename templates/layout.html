@@ -98,7 +98,11 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         overflow: hidden;
       }
 
-      .btn-primary, .badge-primary { background-color: var(--ui-highlight) !important; border-color: var(--ui-highlight) !important; color: var(--tenant-primary) !important; }
+      .btn-primary, .badge-primary {
+        background-color: var(--tenant-primary) !important;
+        border-color: var(--tenant-primary) !important;
+        color: #fff !important;
+      }
       .btn-secondary { background-color: var(--tenant-secondary) !important; border-color: var(--tenant-secondary) !important; color: #fff !important; }
       .bg-primary { background-color: var(--tenant-primary) !important; }
       .text-primary { color: var(--tenant-primary) !important; }
@@ -116,7 +120,11 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         -webkit-text-fill-color: currentColor;
       }
       .btn-outline-primary { color: var(--tenant-primary) !important; border-color: var(--tenant-primary) !important; }
-      .btn-outline-primary:hover { color: var(--tenant-primary) !important; background-color: var(--ui-highlight) !important; border-color: var(--ui-highlight) !important; }
+      .btn-outline-primary:hover {
+        color: #fff !important;
+        background-color: var(--tenant-primary) !important;
+        border-color: var(--tenant-primary) !important;
+      }
 
       h1 { font-size: 1.5625rem; font-weight: 700; }
       h2 { font-size: 1.3125rem; font-weight: 700; }
@@ -194,21 +202,23 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         opacity: 0.6;
       }
 
-      /* Primary button icons use indigo for contrast on the yellow surface. */
+      /* Yellow icons remain visible against Indigo primary buttons. */
       .btn-primary .bi-plus-lg,
       button.btn-primary .bi-plus-lg,
       .btn-primary i.bi-plus-lg {
-        color: var(--tenant-primary) !important;
-        fill: var(--tenant-primary) !important;
+        color: var(--ui-highlight) !important;
+        fill: var(--ui-highlight) !important;
       }
 
-      /* Yellow buttons need dark Indigo text for accessible contrast. */
+      /* Primary buttons keep readable white text in every interaction state. */
       .btn-primary {
-        color: var(--tenant-primary) !important;
+        color: #fff !important;
+        -webkit-text-fill-color: #fff;
       }
 
-      .btn-primary:hover {
-        color: var(--tenant-primary) !important;
+      .btn-primary:hover, .btn-primary:focus, .btn-primary:active {
+        color: #fff !important;
+        -webkit-text-fill-color: #fff;
       }
 
       /* Custom dropdown styling */
@@ -247,8 +257,8 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
       }
 
       .btn-primary {
-        background: var(--ui-highlight);
-        color: var(--tenant-primary);
+        background: linear-gradient(135deg, var(--tenant-primary), var(--accent-600));
+        color: #fff;
         border: none;
         border-radius: 8px;
         padding: 8px 16px;
@@ -258,7 +268,7 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
 
       .btn-primary:hover {
         transform: translateY(-1px);
-        box-shadow: 0 4px 12px rgba(255, 193, 9, 0.3);
+        box-shadow: 0 4px 12px rgba(27, 30, 118, 0.28);
       }
 
       .btn-outline-primary {
@@ -270,8 +280,8 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
       }
 
       .btn-outline-primary:hover {
-        background: var(--ui-highlight);
-        color: var(--tenant-primary);
+        background: var(--tenant-primary);
+        color: #fff;
       }
 
       .form-control,
@@ -383,7 +393,7 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         color: var(--ui-highlight) !important;
       }
       .btn-primary .bi, .btn-outline-primary:hover .bi {
-        color: var(--tenant-primary) !important;
+        color: var(--ui-highlight) !important;
       }
 
       .header-primary-nav {
