@@ -20,6 +20,7 @@
   <div class="reward-stat px-4 py-3 text-center shadow-sm"><div class="small text-muted">Matching records</div><div class="fs-4 fw-bold">{{ total_rewards }}</div></div>
 </div>
 
+{% if session.get('role') in ('admin', 'superadmin') %}
 <div class="card border-0 shadow-sm mb-4">
   <div class="card-header bg-white py-3"><h5 class="mb-1">Store Reward Settings</h5><p class="small text-muted mb-0">Google Review links come directly from each store's information.</p></div>
   <div class="card-body"><div class="row g-3">
@@ -49,6 +50,7 @@
     {% else %}<div class="col-12 text-center text-muted py-4">No stores available.</div>{% endfor %}
   </div></div>
 </div>
+{% endif %}
 
 <div class="card border-0 shadow-sm">
   <div class="card-header bg-white py-3">
@@ -130,7 +132,7 @@
     if (!modal || !form || !code) return;
 
     modal.addEventListener('show.bs.modal', function (event) {
-      const buttn = event.relatedTarget;
+      const button = event.relatedTarget;
       if (!button) return;
       form.action = button.dataset.action;
       code.textContent = button.dataset.code;

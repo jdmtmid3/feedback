@@ -422,6 +422,8 @@ def create_app() -> Flask:
         'import_staff',
         'edit_staff',
         'delete_staff',
+        # Assigned branch managers may redeem codes issued by their store.
+        'use_review_reward',
         # Viewers remain read-only for business data, but may participate in
         # their own private support conversation.
         'api_send_client_message',
@@ -2452,6 +2454,16 @@ def create_app() -> Flask:
             questionnaire_quota=questionnaire_quota,
             questionnaire_quota_error=questionnaire_quota_error,
         )
+
+    @app.route("/admin/my-survey", methods=["GET"])
+    @role_required('user')
+    def assigned_store_survey():
+        """Open the public survey for the viewer's assigned branch only."""
+        assigned_store_ids = get_assigned_store_ids(session['user_id'])
+        if not assigned_store_ids:
+            flash("No store is assigned to your account yet.", "warning")
+            return redirect(url_for("stores_management"))
+        return redirect(url_for("public_survey", store_id=assigned_store_ids[0]))
 
     @app.route("/admin/questionnaire/questions/add", methods=["POST"])
     def master_add_question():
@@ -5649,7 +5661,7 @@ def create_app() -> Flask:
         return redirect(url_for("survey_thank_you", store_id=store_id, claim=claim_token, issued=1))
 
     @app.route("/admin/rewards", methods=["GET"])
-    @role_required('admin', 'superadmin')
+    @role_required('user', 'admin', 'superadmin')
     def admin_rewards():
         user = get_user_by_id(session["user_id"])
         search = request.args.get("search", "").strip()[:100]
@@ -5674,6 +5686,21 @@ def create_app() -> Flask:
                 stores = cursor.fetchall()
                 scope_sql = "1 = 1"
                 scope_params = []
+            elif user["role"] == "user":
+                assigned_store_ids = get_assigned_store_ids(user["id"])
+                if assigned_store_ids:
+                    placeholders = ",".join(["%s"] * len(assigned_store_ids))
+                    cursor.execute(
+                        f"SELECT * FROM stores WHERE id IN ({placeholders}) ORDER BY store_name",
+                        tuple(assigned_store_ids),
+                    )
+                    stores = cursor.fetchall()
+                    scope_sql = f"rr.store_id IN ({placeholders})"
+                    scope_params = list(assigned_store_ids)
+                else:
+                    stores = []
+                    scope_sql = "1 = 0"
+                    scope_params = []
             else:
                 cursor.execute("SELECT * FROM stores WHERE user_id = %s ORDER BY store_name", (user["id"],))
                 stores = cursor.fetchall()
@@ -5742,7 +5769,7 @@ def create_app() -> Flask:
         return redirect(url_for("admin_rewards"))
 
     @app.route("/admin/rewards/<int:reward_id>/use", methods=["POST"])
-    @role_required('admin', 'superadmin')
+    @role_required('user', 'admin', 'superadmin')
     def use_review_reward(reward_id: int):
         user = get_user_by_id(session["user_id"])
         conn = get_db_connection()
@@ -5750,6 +5777,17 @@ def create_app() -> Flask:
             cursor = conn.cursor()
             if user["role"] == "superadmin":
                 cursor.execute("UPDATE review_rewards SET status='used', used_at=NOW() WHERE id=%s AND status='issued'", (reward_id,))
+            elif user["role"] == "user":
+                cursor.execute(
+                    """UPDATE review_rewards rr
+                       SET rr.status='used', rr.used_at=NOW()
+                       WHERE rr.id=%s AND rr.status='issued'
+                         AND EXISTS (
+                           SELECT 1 FROM user_stores us
+                           WHERE us.user_id=%s AND us.store_id=rr.store_id
+                         )""",
+                    (reward_id, user["id"]),
+                )
             else:
                 cursor.execute("""UPDATE review_rewards SET status='used', used_at=NOW()
                                   WHERE id=%s AND owner_user_id=%s AND license_key <=> %s AND status='issued'""",
@@ -6888,6 +6926,16 @@ def create_app() -> Flask:
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
+
+            # MySQL reports rowcount=0 when submitted values are unchanged, so
+            # verify the staff row explicitly instead of treating rowcount as existence.
+            cursor.execute(
+                "SELECT 1 FROM staff WHERE id = %s AND store_id = %s LIMIT 1",
+                (staff_id, store_id),
+            )
+            if not cursor.fetchone():
+                flash("Staff member not found", "danger")
+                return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
             
             # Update staff member
             cursor.execute("""
@@ -6897,20 +6945,17 @@ def create_app() -> Flask:
                 WHERE id = %s AND store_id = %s
             """, (first_name, last_name, email, phone, position, photo_url, role, status, hire_date, staff_id, store_id))
             
-            if cursor.rowcount == 0:
-                flash("Staff member not found", "danger")
-            else:
-                conn.commit()
-                
-                # Log the staff edit
-                log_audit(
-                    entity_type="staff",
-                    entity_id=staff_id,
-                    action="updated",
-                    new_values=f"Name: {first_name} {last_name}, Position: {position}, Role: {role}, Status: {status}, Store ID: {store_id}"
-                )
-                
-                flash(f"Staff member \"{first_name} {last_name}\" updated successfully", "success")
+            conn.commit()
+
+            # Log the staff edit
+            log_audit(
+                entity_type="staff",
+                entity_id=staff_id,
+                action="updated",
+                new_values=f"Name: {first_name} {last_name}, Position: {position}, Role: {role}, Status: {status}, Store ID: {store_id}"
+            )
+
+            flash(f"Staff member \"{first_name} {last_name}\" updated successfully", "success")
         except Exception as e:
             logger.error(f"Error updating staff: {e}")
             flash(f"Error updating staff: {e}", "danger")
