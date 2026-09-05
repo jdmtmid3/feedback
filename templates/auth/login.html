@@ -38,31 +38,6 @@
             overflow: hidden;
         }
 
-        /* Decorative background blobs */
-        body::before,
-        body::after {
-            content: '';
-            position: absolute;
-            border-radius: 50%;
-            filter: blur(80px);
-            opacity: 0.35;
-            pointer-events: none;
-        }
-        body::before {
-            width: 480px;
-            height: 480px;
-            background: var(--yellow-400);
-            top: -120px;
-            right: -120px;
-        }
-        body::after {
-            width: 520px;
-            height: 520px;
-            background: var(--header-color);
-            bottom: -160px;
-            left: -160px;
-        }
-
         .login-wrapper {
             position: relative;
             z-index: 1;
@@ -141,21 +116,21 @@
             border-color: var(--header-color);
         }
 
-        /* Login CTA uses the high-visibility brand yellow. */
+        /* Clean login CTA without the yellow/orange treatment. */
         .btn-primary {
-            background: #FFC109;
+            background: #1B1E76;
             border: none;
-            color: #1B1E76 !important;
+            color: #fff !important;
             font-weight: 600;
             border-radius: 8px;
             transition: all 0.2s ease;
         }
         .btn-primary:hover,
         .btn-primary:focus {
-            background: #e6ad00;
-            color: #11134D !important;
+            background: #11134D;
+            color: #fff !important;
             transform: translateY(-1px);
-            box-shadow: 0 6px 16px rgba(255, 107, 53, 0.35);
+            box-shadow: 0 6px 16px rgba(27, 30, 118, 0.28);
         }
 
         .login-footer {
