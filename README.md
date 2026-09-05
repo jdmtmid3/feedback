@@ -10,12 +10,14 @@ A comprehensive web-based platform for businesses to collect, manage, and analyz
 - **Dynamic Charting**: interactive bar and line charts for data-driven insights.
 - **Automated QA Suite**: Built-in test suite to ensure system stability.
 - **Responsive Design**: Modern, orange-themed UI built with Bootstrap 5.
+- **Resend Email Delivery**: Sends customer feedback replies through the Resend HTTPS API.
 
 ## 🛠️ Tech Stack
 
 - **Backend**: Python / Flask
 - **Frontend**: HTML5, CSS3, JavaScript (Chart.js, Sortable.js)
 - **Database**: MySQL
+- **Email**: Resend API
 - **Environment**: python-dotenv for configuration management
 
 ## 📦 Installation
@@ -23,8 +25,8 @@ A comprehensive web-based platform for businesses to collect, manage, and analyz
 1. **Clone the repository**:
 
    ```bash
-   git clone https://github.com/YOUR_USERNAME/feedback_system.git
-   cd feedback_system
+   git clone https://github.com/jdmtmid3/feedback.git
+   cd feedback
    ```
 
 2. **Set up a virtual environment**:
@@ -41,7 +43,8 @@ A comprehensive web-based platform for businesses to collect, manage, and analyz
    ```
 
 4. **Configure the environment**:
-   Create a `.env` file in the root directory with your database credentials:
+
+   Copy `.env.example` to `.env`, then enter your database and application credentials.
 
    ```env
    DB_HOST=localhost
@@ -61,11 +64,24 @@ A comprehensive web-based platform for businesses to collect, manage, and analyz
    For the licensing portal, set these additional variables:
 
    ```env
-   MAIN_APP_URL=http://localhost:8000  # URL of the main feedback system
+   MAIN_APP_URL=http://localhost:8000
    LICENSING_API_KEY=<same-shared-key-as-main-app>
    ```
 
-5. **Initialize the database**:
+5. **Configure Resend**:
+
+   Verify `mail.jdmt-itservices.com` in the Resend dashboard before enabling email. Add the following variables to the deployed main application, such as its Railway Variables settings:
+
+   ```env
+   RESEND_API_KEY=<your-resend-api-key>
+   MAIL_DEFAULT_SENDER=Feedback System <feedback@mail.jdmt-itservices.com>
+   EMAIL_SENDING_ENABLED=true
+   ```
+
+   Keep `EMAIL_SENDING_ENABLED=false` until the domain status is verified. Never commit the real API key to GitHub.
+
+6. **Initialize the database**:
+
    Ensure your MySQL server is running and the database specified in `.env` exists.
 
    On Railway, set the exact same non-default `LICENSING_API_KEY` on both the
@@ -73,7 +89,8 @@ A comprehensive web-based platform for businesses to collect, manage, and analyz
    main app to the public licensing URL, and `MAIN_APP_URL` on the licensing
    portal to the public main-app URL.
 
-6. **Run the application**:
+7. **Run the application**:
+
    ```bash
    python3 app.py
    ```
