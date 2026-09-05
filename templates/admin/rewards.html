@@ -13,7 +13,8 @@
   .reward-mobile-card { border-bottom: 1px solid #edf0f2; }
   .reward-settings-table th, .reward-settings-table td { vertical-align: middle; }
   .review-link-button { width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center; }
-  #rewardCodesPanel.is-hidden { display: none; }
+  .reward-codes-modal .modal-dialog { max-width: min(1320px, 96vw); }
+  .reward-codes-modal .modal-body { max-height: 72vh; overflow: auto; }
   .pagination .page-link { border-radius: 9px; margin: 0 2px; color: #343a40; }
   .pagination .active .page-link { background: var(--bs-primary); border-color: var(--bs-primary); color: #fff; }
 </style>
@@ -63,9 +64,15 @@
 </div>
 {% endif %}
 
-<div class="card border-0 shadow-sm {{ '' if search or status_filter or store_filter else 'is-hidden' }}" id="rewardCodesPanel">
-  <div class="card-header bg-white py-3">
-    <div class="mb-3 d-flex justify-content-between align-items-start gap-2"><div><h5 class="mb-0" id="rewardCodesTitle">Reward Codes</h5><small class="text-muted">Showing {{ rewards|length }} of {{ total_rewards }} matching records</small></div><button type="button" class="btn-close" id="closeRewardCodes" aria-label="Close reward codes"></button></div>
+<div class="modal fade reward-codes-modal" id="rewardCodesModal" tabindex="-1" aria-labelledby="rewardCodesTitle" aria-hidden="true">
+  <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
+   <div class="modal-content border-0 shadow">
+    <div class="modal-header">
+      <div><h5 class="modal-title" id="rewardCodesTitle">Reward Codes</h5><small class="text-muted">Showing {{ rewards|length }} of {{ total_rewards }} matching records</small></div>
+      <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close reward codes"></button>
+    </div>
+    <div class="modal-body p-0">
+  <div class="bg-white p-3 border-bottom">
     <form method="GET" action="{{ url_for('admin_rewards') }}" class="row g-2 align-items-end">
       <div class="col-xl-5 col-md-12"><label class="form-label small fw-semibold" for="rewardSearch">Search</label><div class="input-group"><span class="input-group-text bg-white"><i class="bi bi-search"></i></span><input class="form-control" id="rewardSearch" name="search" value="{{ search }}" placeholder="Code, email, store, or reward"></div></div>
       <div class="col-xl-2 col-md-4 col-6"><label class="form-label small fw-semibold" for="rewardStatus">Status</label><select class="form-select" id="rewardStatus" name="status"><option value="">All statuses</option>{% for value in ['pending', 'issued', 'used'] %}<option value="{{ value }}" {{ 'selected' if status_filter == value else '' }}>{{ value|title }}</option>{% endfor %}</select></div>
@@ -75,7 +82,7 @@
     </form>
   </div>
 
-  <div class="d-none d-lg-block">
+  <div class="d-none d-lg-block table-responsive">
     <table class="table table-hover rewards-table mb-0">
       <thead class="table-light"><tr><th>Code</th><th>Email</th><th>Store</th><th>Reward</th><th>Created</th><th>Used</th><th>Status</th><th>Action</th></tr></thead>
       <tbody>{% for reward in rewards %}
@@ -85,7 +92,9 @@
           <td><span class="badge bg-{{ 'success' if reward.status == 'issued' else 'secondary' if reward.status == 'used' else 'warning' }}">{{ reward.status|title }}</span>{% if reward.status == 'issued' and not reward.email_sent %}<div class="small text-danger mt-1">Email pending</div>{% endif %}</td>
           <td>{% if reward.status == 'issued' %}<button type="button" class="btn btn-sm btn-outline-success mark-used-btn" data-bs-toggle="modal" data-bs-target="#markUsedConfirmModal" data-action="{{ url_for('use_review_reward', reward_id=reward.id) }}" data-code="{{ reward.reward_code or 'this reward' }}">Mark Used</button>{% else %}<span class="text-muted">—</span>{% endif %}</td>
         </tr>
-      {% else %}<tr><td colspan="8" class="text-center text-muted py-5">No rewards match your filters.</td></tr>{% endfor %}</tbody>
+      {% else %}<tr><td colspan="8" class="text-center text-muted py-5">No rewards match your filters.</td></tr>{% endfor %}
+        <tr class="d-none filtered-codes-empty"><td colspan="8" class="text-center text-muted py-5">No reward codes found for this store.</td></tr>
+      </tbody>
     </table>
   </div>
 
@@ -96,7 +105,7 @@
       <div class="small mb-1"><span class="text-muted">Reward:</span> {{ reward.reward_type }}</div><div class="small mb-3"><span class="text-muted">Created:</span> {{ reward.issued_at or reward.created_at }}</div>
       {% if reward.status == 'issued' %}<button type="button" class="btn btn-sm btn-outline-success w-100 mark-used-btn" data-bs-toggle="modal" data-bs-target="#markUsedConfirmModal" data-action="{{ url_for('use_review_reward', reward_id=reward.id) }}" data-code="{{ reward.reward_code or 'this reward' }}">Mark Used</button>{% endif %}
     </div>
-  {% else %}<div class="text-center text-muted py-5">No rewards match your filters.</div>{% endfor %}</div>
+  {% else %}<div class="text-center text-muted py-5">No rewards match your filters.</div>{% endfor %}<div class="d-none filtered-codes-empty text-center text-muted py-5">No reward codes found for this store.</div></div>
 
   {% if total_pages > 1 %}
   <div class="card-footer bg-white d-flex flex-wrap justify-content-between align-items-center gap-2 py-3">
@@ -108,6 +117,9 @@
     </ul></nav>
   </div>
   {% endif %}
+    </div>
+   </div>
+  </div>
 </div>
 
 <div class="modal fade" id="reviewLinkModal" tabindex="-1" aria-labelledby="reviewLinkModalLabel" aria-hidden="true">
@@ -169,21 +181,24 @@
       openLink.setAttribute('aria-disabled', url ? 'false' : 'true');
     });
 
-    const codesPanel = document.getElementById('rewardCodesPanel');
+    const codesModalElement = document.getElementById('rewardCodesModal');
+    const codesModal = codesModalElement ? bootstrap.Modal.getOrCreateInstance(codesModalElement) : null;
     document.querySelectorAll('.view-codes-btn').forEach(button => {
       button.addEventListener('click', function () {
         const storeId = this.dataset.storeId;
         const storeName = this.dataset.storeName;
-        codesPanel?.classList.remove('is-hidden');
         document.getElementById('rewardCodesTitle').textContent = `Reward Codes · ${storeName}`;
-        document.querySelectorAll('#rewardCodesPanel [data-store-id]').forEach(row => {
-          row.classList.toggle('d-none', row.dataset.storeId !== storeId);
+        let matchingCodes = 0;
+        document.querySelectorAll('#rewardCodesModal [data-store-id]').forEach(row => {
+          const matches = row.dataset.storeId === storeId;
+          row.classList.toggle('d-none', !matches);
+          if (matches) matchingCodes += 1;
         });
-        codesPanel?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        document.querySelectorAll('#rewardCodesModal .filtered-codes-empty').forEach(emptyState => emptyState.classList.toggle('d-none', matchingCodes > 0));
+        const storeFilter = document.getElementById('rewardStore');
+        if (storeFilter) storeFilter.value = storeId;
+        codesModal?.show();
       });
-    });
-    document.getElementById('closeRewardCodes')?.addEventListener('click', function () {
-      codesPanel?.classList.add('is-hidden');
     });
 
     const modal = document.getElementById('markUsedConfirmModal');
