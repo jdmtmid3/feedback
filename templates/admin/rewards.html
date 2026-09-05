@@ -70,7 +70,7 @@
           <td class="fw-bold">{{ reward.reward_code or 'Pending review' }}</td><td>{{ reward.customer_email }}</td><td>{{ reward.store_name }}</td><td>{{ reward.reward_type }}</td>
           <td>{{ reward.issued_at or reward.created_at }}</td><td>{{ reward.used_at or '—' }}</td>
           <td><span class="badge bg-{{ 'success' if reward.status == 'issued' else 'secondary' if reward.status == 'used' else 'warning' }}">{{ reward.status|title }}</span>{% if reward.status == 'issued' and not reward.email_sent %}<div class="small text-danger mt-1">Email pending</div>{% endif %}</td>
-          <td>{% if reward.status == 'issued' %}<form method="POST" action="{{ url_for('use_review_reward', reward_id=reward.id) }}" onsubmit="return confirm('Mark this code as used?');"><button class="btn btn-sm btn-outline-success">Mark Used</button></form>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td>{% if reward.status == 'issued' %}<button type="button" class="btn btn-sm btn-outline-success mark-used-btn" data-bs-toggle="modal" data-bs-target="#markUsedConfirmModal" data-action="{{ url_for('use_review_reward', reward_id=reward.id) }}" data-code="{{ reward.reward_code or 'this reward' }}">Mark Used</button>{% else %}<span class="text-muted">—</span>{% endif %}</td>
         </tr>
       {% else %}<tr><td colspan="8" class="text-center text-muted py-5">No rewards match your filters.</td></tr>{% endfor %}</tbody>
     </table>
@@ -81,7 +81,7 @@
       <div class="d-flex justify-content-between gap-2 mb-2"><strong>{{ reward.reward_code or 'Pending review' }}</strong><span class="badge bg-{{ 'success' if reward.status == 'issued' else 'secondary' if reward.status == 'used' else 'warning' }}">{{ reward.status|title }}</span></div>
       <div class="small mb-1"><span class="text-muted">Email:</span> {{ reward.customer_email }}</div><div class="small mb-1"><span class="text-muted">Store:</span> {{ reward.store_name }}</div>
       <div class="small mb-1"><span class="text-muted">Reward:</span> {{ reward.reward_type }}</div><div class="small mb-3"><span class="text-muted">Created:</span> {{ reward.issued_at or reward.created_at }}</div>
-      {% if reward.status == 'issued' %}<form method="POST" action="{{ url_for('use_review_reward', reward_id=reward.id) }}" onsubmit="return confirm('Mark this code as used?');"><button class="btn btn-sm btn-outline-success w-100">Mark Used</button></form>{% endif %}
+      {% if reward.status == 'issued' %}<button type="button" class="btn btn-sm btn-outline-success w-100 mark-used-btn" data-bs-toggle="modal" data-bs-target="#markUsedConfirmModal" data-action="{{ url_for('use_review_reward', reward_id=reward.id) }}" data-code="{{ reward.reward_code or 'this reward' }}">Mark Used</button>{% endif %}
     </div>
   {% else %}<div class="text-center text-muted py-5">No rewards match your filters.</div>{% endfor %}</div>
 
@@ -96,4 +96,50 @@
   </div>
   {% endif %}
 </div>
+
+<div class="modal fade" id="markUsedConfirmModal" tabindex="-1" aria-labelledby="markUsedConfirmModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content border-0 shadow">
+      <div class="modal-header border-0 pb-0">
+        <div class="d-flex align-items-center gap-3">
+          <span class="d-inline-flex align-items-center justify-content-center rounded-circle bg-warning-subtle text-warning" style="width: 44px; height: 44px;"><i class="bi bi-exclamation-triangle-fill fs-5"></i></span>
+          <div><h5 class="modal-title" id="markUsedConfirmModalLabel">Mark reward as used?</h5><div class="small text-muted">Please confirm this reward redemption.</div></div>
+        </div>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body py-4">
+        <p class="mb-2">You are about to mark this reward code as used:</p>
+        <div class="rounded-3 bg-light border px-3 py-3 fw-bold text-center font-monospace" id="markUsedRewardCode">—</div>
+        <p class="small text-muted mb-0 mt-3">Once confirmed, the code can no longer be redeemed again.</p>
+      </div>
+      <div class="modal-footer border-0 pt-0">
+        <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button>
+        <form method="POST" id="markUsedConfirmForm">
+          <button type="submit" class="btn btn-success"><i class="bi bi-check-circle me-1"></i>Yes, Mark Used</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    const modal = document.getElementById('markUsedConfirmModal');
+    const form = document.getElementById('markUsedConfirmForm');
+    const code = document.getElementById('markUsedRewardCode');
+    if (!modal || !form || !code) return;
+
+    modal.addEventListener('show.bs.modal', function (event) {
+      const buttn = event.relatedTarget;
+      if (!button) return;
+      form.action = button.dataset.action;
+      code.textContent = button.dataset.code;
+    });
+
+    modal.addEventListener('hidden.bs.modal', function () {
+      form.removeAttribute('action');
+      code.textContent = '—';
+    });
+  });
+</script>
 {% endblock %}
