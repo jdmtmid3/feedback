@@ -25,6 +25,7 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         --tenant-primary: {{ ui_branding.primary_color|default('#1B1E76') }};
         --tenant-secondary: {{ ui_branding.secondary_color|default('#FC8C12') }};
         --tenant-accent: {{ ui_branding.accent_color|default('#FC8C12') }};
+        --ui-highlight: #FFC109;
         --tenant-text: {{ ui_branding.text_color|default('#212529') }};
         /* Primary Colors - Black Theme */
         --primary-50: #f8f9fa;
@@ -97,7 +98,7 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         overflow: hidden;
       }
 
-      .btn-primary, .badge-primary { background-color: var(--tenant-primary) !important; border-color: var(--tenant-primary) !important; color: #fff !important; }
+      .btn-primary, .badge-primary { background-color: var(--ui-highlight) !important; border-color: var(--ui-highlight) !important; color: var(--tenant-primary) !important; }
       .btn-secondary { background-color: var(--tenant-secondary) !important; border-color: var(--tenant-secondary) !important; color: #fff !important; }
       .bg-primary { background-color: var(--tenant-primary) !important; }
       .text-primary { color: var(--tenant-primary) !important; }
@@ -115,7 +116,7 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         -webkit-text-fill-color: currentColor;
       }
       .btn-outline-primary { color: var(--tenant-primary) !important; border-color: var(--tenant-primary) !important; }
-      .btn-outline-primary:hover { color: #fff !important; background-color: var(--tenant-primary) !important; }
+      .btn-outline-primary:hover { color: var(--tenant-primary) !important; background-color: var(--ui-highlight) !important; border-color: var(--ui-highlight) !important; }
 
       h1 { font-size: 1.5625rem; font-weight: 700; }
       h2 { font-size: 1.3125rem; font-weight: 700; }
@@ -193,21 +194,21 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
         opacity: 0.6;
       }
 
-      /* Add store button + sign white */
+      /* Primary button icons use indigo for contrast on the yellow surface. */
       .btn-primary .bi-plus-lg,
       button.btn-primary .bi-plus-lg,
       .btn-primary i.bi-plus-lg {
-        color: white !important;
-        fill: white !important;
+        color: var(--tenant-primary) !important;
+        fill: var(--tenant-primary) !important;
       }
 
-      /* Active button text white */
+      /* Yellow buttons need dark Indigo text for accessible contrast. */
       .btn-primary {
-        color: white !important;
+        color: var(--tenant-primary) !important;
       }
 
       .btn-primary:hover {
-        color: white !important;
+        color: var(--tenant-primary) !important;
       }
 
       /* Custom dropdown styling */
@@ -246,8 +247,8 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
       }
 
       .btn-primary {
-        background: linear-gradient(135deg, var(--tenant-primary), var(--accent-600));
-        color: white;
+        background: var(--ui-highlight);
+        color: var(--tenant-primary);
         border: none;
         border-radius: 8px;
         padding: 8px 16px;
@@ -257,20 +258,20 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
 
       .btn-primary:hover {
         transform: translateY(-1px);
-        box-shadow: 0 4px 12px rgba(27, 30, 118, 0.28);
+        box-shadow: 0 4px 12px rgba(255, 193, 9, 0.3);
       }
 
       .btn-outline-primary {
         color: var(--tenant-primary);
-        border-color: var(--accent-300);
+        border-color: var(--ui-highlight);
         border-radius: 8px;
         font-weight: 500;
         transition: all 0.2s ease;
       }
 
       .btn-outline-primary:hover {
-        background: var(--accent-50);
-        color: var(--accent-700);
+        background: var(--ui-highlight);
+        color: var(--tenant-primary);
       }
 
       .form-control,
@@ -327,11 +328,11 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
       }
 
       .topnav-link i {
-        color: white;
+        color: var(--ui-highlight) !important;
       }
 
       .topnav-link:hover i {
-        color: white !important;
+        color: var(--ui-highlight) !important;
       }
 
       .topnav-link.active {
@@ -343,7 +344,46 @@ PURPOSE: This is the main "shell" for all Admin pages. It contains the
       }
 
       .topnav-link.active i {
-        color: white !important;
+        color: var(--ui-highlight) !important;
+      }
+
+      .mobile-menu-toggle {
+        color: var(--ui-highlight) !important;
+        border: 1px solid rgba(255, 193, 9, 0.5);
+        background: rgba(255, 255, 255, 0.08);
+        line-height: 1;
+        padding: 0.25rem 0.55rem;
+      }
+      .mobile-main-navigation { width: min(86vw, 340px); }
+      .mobile-nav-link {
+        display: grid;
+        grid-template-columns: 34px 1fr auto;
+        align-items: center;
+        gap: 0.55rem;
+        padding: 0.85rem 1rem;
+        border-radius: 10px;
+        color: var(--tenant-primary);
+        text-decoration: none;
+        font-weight: 600;
+      }
+      .mobile-nav-link:hover, .mobile-nav-link.active {
+        color: var(--tenant-primary);
+        background: rgba(255, 193, 9, 0.18);
+      }
+      .mobile-nav-link .bi { color: var(--ui-highlight) !important; font-size: 1.15rem; }
+      .mobile-message-badge {
+        min-width: 24px; height: 24px; padding: 0 6px; border-radius: 999px;
+        display: inline-flex; align-items: center; justify-content: center;
+        background: #e5e7eb; color: var(--tenant-primary); font-size: .72rem; font-weight: 800;
+      }
+      .mobile-message-badge.has-unread { background: #dc2626; color: #fff; }
+
+      main .bi:not(.text-success):not(.text-danger):not(.text-warning):not(.text-muted),
+      .modal .bi:not(.text-success):not(.text-danger):not(.text-warning):not(.text-muted) {
+        color: var(--ui-highlight) !important;
+      }
+      .btn-primary .bi, .btn-outline-primary:hover .bi {
+        color: var(--tenant-primary) !important;
       }
 
       .header-primary-nav {

@@ -1,6 +1,6 @@
 <!-- Top Navigation Header -->
 <header class="border-bottom shadow-sm" style="position: sticky; top: 0; z-index: 1030; background: linear-gradient(135deg, var(--tenant-primary) 0%, var(--accent-600) 100%);">
-  <div class="container-fluid px-4">
+  <div class="container-fluid px-2 px-sm-4">
     <div class="d-flex justify-content-between align-items-center py-3 position-relative">
       <div class="d-flex align-items-center flex-grow-1 min-width-0">
         <div class="me-4 flex-shrink-0">
@@ -14,34 +14,37 @@
         </div>
         <nav class="header-primary-nav d-none d-lg-flex flex-nowrap overflow-hidden">
           <a href="{{ url_for('admin_dashboard') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'admin_dashboard' %}active{% endif %}">
-            <i class="bi bi-speedometer2 me-2" style="color: white !important;"></i>Dashboard
+            <i class="bi bi-speedometer2 me-2" style="color: #FFC109 !important;"></i>Dashboard
           </a>
           <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
           <a href="{{ url_for('stores_management') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'stores_management' or 'store' in request.endpoint %}active{% endif %}">
-            <i class="bi bi-shop me-2" style="color: white !important;"></i>Stores
+            <i class="bi bi-shop me-2" style="color: #FFC109 !important;"></i>Stores
           </a>
           <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
           <a href="{{ url_for('assigned_store_survey') if session.get('role') == 'user' else url_for('master_questionnaire') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint in ('master_questionnaire', 'assigned_store_survey') %}active{% endif %}" {% if session.get('role') == 'user' %}target="_blank" rel="noopener"{% endif %}>
-            <i class="bi bi-question-square me-2" style="color: white !important;"></i>Survey
+            <i class="bi bi-question-square me-2" style="color: #FFC109 !important;"></i>Survey
           </a>
           <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
           <a href="{{ url_for('admin_rewards') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'admin_rewards' %}active{% endif %}">
-            <i class="bi bi-gift me-2" style="color: white !important;"></i>Rewards
+            <i class="bi bi-gift me-2" style="color: #FFC109 !important;"></i>Rewards
           </a>
           {% if session.get('role') == 'superadmin' %}
           <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
           <a href="{{ url_for('admin_users') }}" class="text-decoration-none topnav-link px-3 py-2 rounded-2 text-nowrap {% if request.endpoint == 'admin_users' %}active{% endif %}">
-            <i class="bi bi-people me-2" style="color: white !important;"></i>Users
+            <i class="bi bi-people me-2" style="color: #FFC109 !important;"></i>Users
           </a>
           {% endif %}
           <div class="border-start border-2 mx-2 flex-shrink-0" style="border-color: rgba(255, 255, 255, 0.3); height: 20px; align-self: center;"></div>
           <a href="{{ url_for('admin_messages') if session.get('role') == 'superadmin' else url_for('client_support') }}" class="text-decoration-none topnav-link message-nav-link px-3 py-2 rounded-2 text-nowrap position-relative {% if request.endpoint in ('admin_messages', 'client_support') %}active{% endif %}">
-            <i class="bi bi-chat-dots me-2" style="color: white !important;"></i>Messages
+            <i class="bi bi-chat-dots me-2" style="color: #FFC109 !important;"></i>Messages
             <span id="message-count-badge" class="message-nav-badge" aria-label="0 unread messages">0</span>
           </a>
         </nav>
       </div>
       <div class="d-flex align-items-center flex-shrink-0 ms-3">
+        <button class="mobile-menu-toggle btn d-lg-none me-3" type="button" data-bs-toggle="offcanvas" data-bs-target="#mobileMainNavigation" aria-controls="mobileMainNavigation" aria-label="Open navigation menu">
+          <i class="bi bi-list fs-3"></i>
+        </button>
         <!-- Notification Bell -->
         <div class="dropdown me-3">
           <button class="btn btn-link text-white p-0 position-relative border-0" type="button" id="notificationDropdown" data-bs-toggle="dropdown" aria-expanded="false" style="box-shadow: none;">
@@ -84,7 +87,7 @@
         <div class="dropdown">
           <button class="btn rounded-3 px-3 py-2 d-flex align-items-center" type="button" id="userDropdown" data-bs-toggle="dropdown" aria-expanded="false" style="background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); border: 1px solid rgba(255, 255, 255, 0.2);">
             <i class="bi bi-person-circle text-white me-2"></i>
-            <span class="text-white fw-bold small">
+            <span class="text-white fw-bold small d-none d-md-inline">
               {% if session.get('username') %}
                 {{ session.get('role', '').title() }}: {{ session.get('username') }}
               {% else %}
@@ -118,20 +121,44 @@
       </div>
     </div>
   </header>
+
+<div class="offcanvas offcanvas-start mobile-main-navigation" tabindex="-1" id="mobileMainNavigation" aria-labelledby="mobileMainNavigationLabel">
+  <div class="offcanvas-header border-bottom">
+    <div class="d-flex align-items-center gap-2">
+      <img src="{{ url_for('static', filename='logo.png') }}" alt="tugon. Logo" style="height: 38px; width: auto;">
+      <div><h5 class="offcanvas-title fw-bold mb-0" id="mobileMainNavigationLabel">tugon.</h5><small class="text-muted">Navigation</small></div>
+    </div>
+    <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+  </div>
+  <div class="offcanvas-body p-3">
+    <nav class="mobile-nav-list d-grid gap-2">
+      <a href="{{ url_for('admin_dashboard') }}" class="mobile-nav-link {% if request.endpoint == 'admin_dashboard' %}active{% endif %}"><i class="bi bi-speedometer2"></i><span>Dashboard</span></a>
+      <a href="{{ url_for('stores_management') }}" class="mobile-nav-link {% if request.endpoint == 'stores_management' or 'store' in request.endpoint %}active{% endif %}"><i class="bi bi-shop"></i><span>Stores</span></a>
+      <a href="{{ url_for('assigned_store_survey') if session.get('role') == 'user' else url_for('master_questionnaire') }}" class="mobile-nav-link {% if request.endpoint in ('master_questionnaire', 'assigned_store_survey') %}active{% endif %}" {% if session.get('role') == 'user' %}target="_blank" rel="noopener"{% endif %}><i class="bi bi-question-square"></i><span>Survey</span></a>
+      <a href="{{ url_for('admin_rewards') }}" class="mobile-nav-link {% if request.endpoint == 'admin_rewards' %}active{% endif %}"><i class="bi bi-gift"></i><span>Rewards</span></a>
+      {% if session.get('role') == 'superadmin' %}<a href="{{ url_for('admin_users') }}" class="mobile-nav-link {% if request.endpoint == 'admin_users' %}active{% endif %}"><i class="bi bi-people"></i><span>Users</span></a>{% endif %}
+      <a href="{{ url_for('admin_messages') if session.get('role') == 'superadmin' else url_for('client_support') }}" class="mobile-nav-link position-relative {% if request.endpoint in ('admin_messages', 'client_support') %}active{% endif %}">
+        <i class="bi bi-chat-dots"></i><span>Messages</span><span id="message-count-badge-mobile" class="mobile-message-badge" aria-label="0 unread messages">0</span>
+      </a>
+    </nav>
+  </div>
+</div>
 <script>
 document.addEventListener('DOMContentLoaded', () => {
-  const badge = document.getElementById('message-count-badge');
+  const badges = [document.getElementById('message-count-badge'), document.getElementById('message-count-badge-mobile')].filter(Boolean);
   const refreshMessageCount = async () => {
     try {
       const response = await fetch('/api/messages/unread-count', {headers:{Accept:'application/json'}});
       const data = await response.json();
       const count = Number(data.count || 0);
       const label = count > 99 ? '99+' : String(count);
-      badge.textContent = label;
-      badge.setAttribute('aria-label', `${count} unread message${count === 1 ? '' : 's'}`);
-      badge.classList.toggle('has-unread', count > 0);
+      badges.forEach((badge) => {
+        badge.textContent = label;
+        badge.setAttribute('aria-label', `${count} unread message${count === 1 ? '' : 's'}`);
+        badge.classList.toggle('has-unread', count > 0);
+      });
     } catch (_) {
-      badge.setAttribute('aria-label', 'Unable to refresh unread messages');
+      badges.forEach((badge) => badge.setAttribute('aria-label', 'Unable to refresh unread messages'));
     }
   };
   refreshMessageCount();

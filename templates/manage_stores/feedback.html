@@ -327,20 +327,20 @@ PURPOSE: "Feedback Management" page. Displays all customer responses/submissions
   }
 
   .btn-primary {
-    background: #374151;
-    color: white;
-    border: 1px solid #374151;
+    background: #FFC109;
+    color: #1B1E76;
+    border: 1px solid #FFC109;
   }
 
   .btn-outline-primary {
-    border: 1px solid #6b7280;
-    color: #6b7280;
+    border: 1px solid #FFC109;
+    color: #1B1E76;
   }
 
   .btn-outline-primary:hover {
-    background: #374151;
-    border-color: #374151;
-    color: white;
+    background: #FFC109;
+    border-color: #FFC109;
+    color: #1B1E76;
     transform: translateY(-1px);
   }
 
@@ -1674,7 +1674,7 @@ PURPOSE: "Feedback Management" page. Displays all customer responses/submissions
           labels: ['5 Star', '4 Star', '3 Star', '2 Star', '1 Star'],
           datasets: [{
             data: [...(data.rating_metrics?.distribution || [0,0,0,0,0])].reverse(),
-            backgroundColor: ['#1B1E76', '#1B1E76', '#171A67', '#171A67', '#131657'],
+            backgroundColor: '#FFC109',
             borderRadius: 4,
             barThickness: 14
           }]
@@ -1699,12 +1699,12 @@ PURPOSE: "Feedback Management" page. Displays all customer responses/submissions
           labels: data.trend?.labels || [],
           datasets: [{
             data: data.trend?.values || [],
-            borderColor: '#1B1E76',
-            backgroundColor: 'rgba(255, 107, 53, 0.1)',
+            borderColor: '#FFC109',
+            backgroundColor: 'rgba(255, 193, 9, 0.16)',
             fill: true,
             tension: 0.4,
             pointRadius: 3,
-            pointBackgroundColor: '#1B1E76',
+            pointBackgroundColor: '#FFC109',
             borderWidth: 2
           }]
         },
@@ -1728,7 +1728,7 @@ PURPOSE: "Feedback Management" page. Displays all customer responses/submissions
           labels: ['Resolved', 'Unresolved'],
           datasets: [{
             data: [overview.resolved || 0, overview.unresolved || 0],
-            backgroundColor: ['#1B1E76', '#171A67'],
+            backgroundColor: '#FFC109',
             borderWidth: 0
           }]
         },

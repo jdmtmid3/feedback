@@ -625,7 +625,7 @@ function initStoreCharts(dist, trend, ov) {
         labels: ['5 Star', '4 Star', '3 Star', '2 Star', '1 Star'],
         datasets: [{
           data: [...dist].reverse(),
-          backgroundColor: ['#1B1E76', '#1B1E76', '#171A67', '#171A67', '#131657'],
+          backgroundColor: '#FFC109',
           borderRadius: 4, barThickness: 14
         }]
       },
@@ -650,10 +650,10 @@ function initStoreCharts(dist, trend, ov) {
         labels: trend.labels || [],
         datasets: [{
           data: trend.values || [],
-          borderColor: '#1B1E76',
-          backgroundColor: 'rgba(255, 107, 53, 0.1)',
+          borderColor: '#FFC109',
+          backgroundColor: 'rgba(255, 193, 9, 0.16)',
           fill: true, tension: 0.4, pointRadius: 3,
-          pointBackgroundColor: '#1B1E76', borderWidth: 2
+          pointBackgroundColor: '#FFC109', borderWidth: 2
         }]
       },
       options: {
@@ -676,7 +676,7 @@ function initStoreCharts(dist, trend, ov) {
         labels: ['Resolved', 'Unresolved'],
         datasets: [{
           data: [ov.resolved || 0, ov.unresolved || 0],
-          backgroundColor: ['#1B1E76', '#171A67'], borderWidth: 0
+          backgroundColor: '#FFC109', borderWidth: 0
         }]
       },
       options: {
@@ -704,16 +704,13 @@ function initOverallCharts() {
           labels: storeLabels,
           datasets: [{
             label: 'Responses', data: responseData,
-            backgroundColor: [
-              '#1B1E76', '#1B1E76', '#171A67', '#171A67', '#171A67', '#171A67',
-              '#FF9933', '#1B1E76', '#171A67', '#131657', '#11134D'
-            ],
+            backgroundColor: '#FFC109',
             borderWidth: 0, borderRadius: 5, barThickness: 26
           }, {
             label: 'Avg Rating', data: ratingData,
-            backgroundColor: 'rgba(255, 107, 53, 0.15)', borderColor: '#1B1E76',
+            backgroundColor: 'rgba(255, 193, 9, 0.16)', borderColor: '#FFC109',
             borderWidth: 2, type: 'line', yAxisID: 'y1', tension: 0.4,
-            pointBackgroundColor: '#1B1E76', pointBorderColor: '#fff',
+            pointBackgroundColor: '#FFC109', pointBorderColor: '#fff',
             pointBorderWidth: 2, pointRadius: 4
           }]
         },
@@ -743,9 +740,9 @@ function initOverallCharts() {
           labels: actLabels,
           datasets: [{
             label: 'Daily Responses', data: actData,
-            borderColor: '#1B1E76', backgroundColor: 'rgba(255, 107, 53, 0.1)',
+            borderColor: '#FFC109', backgroundColor: 'rgba(255, 193, 9, 0.16)',
             borderWidth: 2, fill: true, tension: 0.4, pointRadius: 4, pointHoverRadius: 6,
-            pointBackgroundColor: '#1B1E76', pointBorderColor: '#fff', pointBorderWidth: 2
+            pointBackgroundColor: '#FFC109', pointBorderColor: '#fff', pointBorderWidth: 2
           }]
         },
         options: {

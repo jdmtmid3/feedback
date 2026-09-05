@@ -662,20 +662,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 datasets: [{
                     label: 'Number of Ratings',
                     data: {{ rating_distribution|tojson }},
-                    backgroundColor: [
-                        '#1B1E76',  // 1 star - orange
-                        '#1B1E76',  // 2 stars - orange
-                        '#171A67',  // 3 stars - darker orange
-                        '#171A67',  // 4 stars - darker orange
-                        '#131657'   // 5 stars - darkest orange
-                    ],
-                    borderColor: [
-                        '#1B1E76',
-                        '#1B1E76',
-                        '#171A67',
-                        '#171A67',
-                        '#131657'
-                    ],
+                    backgroundColor: '#FFC109',
+                    borderColor: '#FFC109',
                     borderWidth: 1
                 }]
             },
@@ -718,8 +706,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 datasets: [{
                     label: 'Feedback Count',
                     data: {{ feedback_trend_data|tojson }},
-                    borderColor: '#1B1E76',
-                    backgroundColor: '#1B1E76',
+                    borderColor: '#FFC109',
+                    backgroundColor: '#FFC109',
                     tension: 0.4
                 }]
             },
@@ -752,22 +740,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 datasets: [{
                     label: 'Total Commendations',
                     data: commendationCounts,
-                    backgroundColor: [
-                        '#4A90E2',
-                        '#4A90E2',
-                        '#357ABD',
-                        '#357ABD',
-                        '#357ABD',
-                        '#357ABD'
-                    ],
-                    borderColor: [
-                        '#4A90E2',
-                        '#4A90E2',
-                        '#357ABD',
-                        '#357ABD',
-                        '#357ABD',
-                        '#357ABD'
-                    ],
+                    backgroundColor: '#FFC109',
+                    borderColor: '#FFC109',
                     borderWidth: 1
                 }]
             },
