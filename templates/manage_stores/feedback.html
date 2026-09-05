@@ -1828,9 +1828,9 @@ PURPOSE: "Feedback Management" page. Displays all customer responses/submissions
                     <button class="btn btn-sm btn-outline-primary py-0 px-1" onclick="openEditStaffModal(${staff.id})" title="Edit">
                       <i class="bi bi-pencil"></i>
                     </button>
-                    {% if session.get('role') in ('admin', 'superadmin') %}<button class="btn btn-sm btn-outline-danger py-0 px-1" onclick="deleteStaffMember(${staff.id})" title="Delete">
+                    <button class="btn btn-sm btn-outline-danger py-0 px-1" onclick="deleteStaffMember(${staff.id})" title="Delete">
                       <i class="bi bi-trash"></i>
-                    </button>{% endif %}
+                    </button>
                   </div>
                   {% else %}
                   <span class="text-muted">—</span>

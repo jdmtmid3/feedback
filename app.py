@@ -421,6 +421,7 @@ def create_app() -> Flask:
         'add_staff',
         'import_staff',
         'edit_staff',
+        'delete_staff',
         # Viewers remain read-only for business data, but may participate in
         # their own private support conversation.
         'api_send_client_message',
@@ -6919,10 +6920,10 @@ def create_app() -> Flask:
         return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
 
     @app.route("/admin/stores/<int:store_id>/staff/<int:staff_id>/delete", methods=["POST"])
-    @role_required('admin', 'superadmin')
+    @role_required('user', 'admin', 'superadmin')
     def delete_staff(store_id: int, staff_id: int):
-        if not can_manage_store(session['user_id'], store_id):
-            flash("You don't have permission to manage staff for this store.", "danger")
+        if not can_manage_store_staff(session['user_id'], store_id):
+            flash("You can only delete staff in your assigned store.", "danger")
             return redirect(url_for("stores_management"))
         conn = get_db_connection()
         try:
