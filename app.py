@@ -417,6 +417,10 @@ def create_app() -> Flask:
         'logout',
         'login',
         'account_change_password',
+        # Assigned branch viewers act as area managers for staff records only.
+        'add_staff',
+        'import_staff',
+        'edit_staff',
         # Viewers remain read-only for business data, but may participate in
         # their own private support conversation.
         'api_send_client_message',
@@ -1248,6 +1252,26 @@ def create_app() -> Flask:
         try:
             cursor = conn.cursor()
             cursor.execute("SELECT 1 FROM stores WHERE id = %s AND user_id = %s", (store_id, user_id))
+            return cursor.fetchone() is not None
+        finally:
+            conn.close()
+
+    def can_manage_store_staff(user_id: int, store_id: int) -> bool:
+        """Allow owners/superadmins, plus viewers assigned to this exact store."""
+        user = get_user_by_id(user_id)
+        if not user:
+            return False
+        if user.get('role') in ('admin', 'superadmin'):
+            return can_manage_store(user_id, store_id)
+        if user.get('role') != 'user':
+            return False
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM user_stores WHERE user_id = %s AND store_id = %s LIMIT 1",
+                (user_id, store_id),
+            )
             return cursor.fetchone() is not None
         finally:
             conn.close()
@@ -4786,8 +4810,11 @@ def create_app() -> Flask:
 
     # API endpoint for store feedback data
     @app.route("/api/stores/<int:store_id>/feedback", methods=["GET"])
+    @login_required
     def api_store_feedback(store_id: int):
         """API endpoint to get feedback data for a store."""
+        if not can_manage_store_staff(session['user_id'], store_id):
+            return jsonify({"error": "You can only view your assigned store."}), 403
         store = fetch_store_by_id(store_id=store_id)
         if not store:
             return jsonify({"error": "Store not found"}), 404
@@ -4797,8 +4824,11 @@ def create_app() -> Flask:
 
     # API endpoint for store analytics data
     @app.route("/api/stores/<int:store_id>/analytics", methods=["GET"])
+    @login_required
     def api_store_analytics(store_id: int):
         """API endpoint to get analytics data for a store."""
+        if not can_manage_store_staff(session['user_id'], store_id):
+            return jsonify({"error": "You can only view your assigned store."}), 403
         store = fetch_store_by_id(store_id=store_id)
         if not store:
             return jsonify({"error": "Store not found"}), 404
@@ -4946,8 +4976,11 @@ def create_app() -> Flask:
 
     # API endpoint for store staff data
     @app.route("/api/stores/<int:store_id>/staff", methods=["GET"])
+    @login_required
     def api_store_staff(store_id: int):
         """API endpoint to get staff data for a store."""
+        if not can_manage_store_staff(session['user_id'], store_id):
+            return jsonify({"error": "You can only view staff in your assigned store."}), 403
         store = fetch_store_by_id(store_id=store_id)
         if not store:
             return jsonify({"error": "Store not found"}), 404
@@ -6561,8 +6594,11 @@ def create_app() -> Flask:
         return f"data:{mime};base64,{base64.b64encode(photo.read()).decode('utf-8')}"
 
     @app.route("/admin/stores/<int:store_id>/staff")
-    @role_required('admin', 'superadmin')
+    @role_required('user', 'admin', 'superadmin')
     def staff_management(store_id: int):
+        if not can_manage_store_staff(session['user_id'], store_id):
+            flash("You can only manage staff in your assigned store.", "danger")
+            return redirect(url_for("stores_management"))
         conn = get_db_connection()
         try:
             cursor = conn.cursor(dictionary=True)
@@ -6596,10 +6632,10 @@ def create_app() -> Flask:
             conn.close()
 
     @app.route("/admin/stores/<int:store_id>/staff/add", methods=["POST"])
-    @role_required('admin', 'superadmin')
+    @role_required('user', 'admin', 'superadmin')
     def add_staff(store_id: int):
-        if not can_manage_store(session['user_id'], store_id):
-            flash("You don't have permission to manage staff for this store.", "danger")
+        if not can_manage_store_staff(session['user_id'], store_id):
+            flash("You can only add staff to your assigned store.", "danger")
             return redirect(url_for("stores_management"))
         first_name = request.form.get("first_name", "").strip()
         last_name = request.form.get("last_name", "").strip()
@@ -6651,10 +6687,10 @@ def create_app() -> Flask:
         return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
 
     @app.route("/admin/stores/<int:store_id>/staff/import-template", methods=["GET"])
-    @role_required('admin', 'superadmin')
+    @role_required('user', 'admin', 'superadmin')
     def staff_import_template(store_id: int):
-        if not can_manage_store(session['user_id'], store_id):
-            flash("You don't have permission to manage staff for this store.", "danger")
+        if not can_manage_store_staff(session['user_id'], store_id):
+            flash("You can only manage staff in your assigned store.", "danger")
             return redirect(url_for("stores_management"))
 
         output = io.StringIO(newline='')
@@ -6671,11 +6707,11 @@ def create_app() -> Flask:
         )
 
     @app.route("/admin/stores/<int:store_id>/staff/import", methods=["POST"])
-    @role_required('admin', 'superadmin')
+    @role_required('user', 'admin', 'superadmin')
     def import_staff(store_id: int):
         """Bulk-import staff from CSV or XLSX. Photos remain manual per staff profile."""
-        if not can_manage_store(session['user_id'], store_id):
-            flash("You don't have permission to manage staff for this store.", "danger")
+        if not can_manage_store_staff(session['user_id'], store_id):
+            flash("You can only import staff into your assigned store.", "danger")
             return redirect(url_for("stores_management"))
 
         upload = request.files.get("staff_file")
@@ -6829,10 +6865,10 @@ def create_app() -> Flask:
         return redirect(url_for("store_feedback", store_id=store_id, tab='staff'))
 
     @app.route("/admin/stores/<int:store_id>/staff/<int:staff_id>/edit", methods=["POST"])
-    @role_required('admin', 'superadmin')
+    @role_required('user', 'admin', 'superadmin')
     def edit_staff(store_id: int, staff_id: int):
-        if not can_manage_store(session['user_id'], store_id):
-            flash("You don't have permission to manage staff for this store.", "danger")
+        if not can_manage_store_staff(session['user_id'], store_id):
+            flash("You can only edit staff in your assigned store.", "danger")
             return redirect(url_for("stores_management"))
         first_name = request.form.get("first_name", "").strip()
         last_name = request.form.get("last_name", "").strip()
@@ -7263,7 +7299,11 @@ def create_app() -> Flask:
         )
 
     @app.route("/admin/stores/<int:store_id>/feedback", methods=["GET"])
+    @login_required
     def store_feedback(store_id: int):
+        if not can_manage_store_staff(session['user_id'], store_id):
+            flash("You can only access your assigned store.", "danger")
+            return redirect(url_for("stores_management"))
         # Handle marking a specific notification as read if requested
         mark_read_id = request.args.get('mark_read')
         if mark_read_id:
