@@ -3704,24 +3704,61 @@ def create_app() -> Flask:
                 (store_id,)
             )
             assigned = cursor.fetchall()
-            assigned_ids = [a['id'] for a in assigned]
+
+            # A license may have at most one store viewer/manager per store,
+            # and no more assigned viewers than the owning Admin's store limit.
+            cursor.execute(
+                """SELECT s.user_id AS owner_user_id, COALESCE(u.max_stores, 0) AS max_viewers,
+                          u.license_key
+                   FROM stores s
+                   LEFT JOIN users u ON u.id = s.user_id
+                   WHERE s.id = %s""",
+                (store_id,),
+            )
+            ownership = cursor.fetchone() or {}
+            owner_user_id = ownership.get('owner_user_id')
+            max_viewers = int(ownership.get('max_viewers') or 0)
+            if ownership.get('license_key'):
+                license_status = validate_tenant_license(ownership['license_key'])
+                if license_status.get('valid'):
+                    max_viewers = int(license_status.get('max_stores') or 0)
+            assigned_total = 0
+            if owner_user_id:
+                cursor.execute(
+                    """SELECT COUNT(*) AS total
+                       FROM user_stores us
+                       JOIN stores s ON s.id = us.store_id
+                       WHERE s.user_id = %s""",
+                    (owner_user_id,),
+                )
+                assigned_total = int((cursor.fetchone() or {}).get('total') or 0)
+
+            store_has_viewer = bool(assigned)
+            limit_reached = max_viewers > 0 and assigned_total >= max_viewers
 
             # Available view-only users not yet assigned to this store
-            if assigned_ids:
-                ph = ",".join(["%s"] * len(assigned_ids))
+            if not store_has_viewer and not limit_reached:
                 cursor.execute(
-                    f"SELECT id, username, email FROM users "
-                    f"WHERE role='user' AND is_active=TRUE AND id NOT IN ({ph}) "
-                    f"ORDER BY username",
-                    tuple(assigned_ids)
+                    """SELECT u.id, u.username, u.email
+                       FROM users u
+                       WHERE u.role='user' AND u.is_active=TRUE
+                         AND NOT EXISTS (
+                           SELECT 1 FROM user_stores us WHERE us.user_id = u.id
+                         )
+                       ORDER BY u.username"""
                 )
+                available = cursor.fetchall()
             else:
-                cursor.execute(
-                    "SELECT id, username, email FROM users "
-                    "WHERE role='user' AND is_active=TRUE ORDER BY username"
-                )
-            available = cursor.fetchall()
-            return jsonify({"success": True, "assigned": assigned, "available": available})
+                available = []
+            return jsonify({
+                "success": True,
+                "assigned": assigned,
+                "available": available,
+                "assigned_total": assigned_total,
+                "max_viewers": max_viewers,
+                "limit_reached": limit_reached,
+                "store_has_viewer": store_has_viewer,
+            })
         finally:
             conn.close()
 
@@ -3750,6 +3787,43 @@ def create_app() -> Flask:
             if not target or target['role'] != 'user':
                 flash("Selected account must be a view-only user.", "danger")
                 return redirect(url_for("stores_management", store_id=store_id))
+
+            cursor.execute("""SELECT s.user_id, u.license_key, COALESCE(u.max_stores, 0) AS max_viewers
+                              FROM stores s LEFT JOIN users u ON u.id = s.user_id
+                              WHERE s.id = %s""", (store_id,))
+            store_row = cursor.fetchone()
+            owner_user_id = store_row.get('user_id') if store_row else None
+
+            cursor.execute("SELECT COUNT(*) AS total FROM user_stores WHERE store_id = %s", (store_id,))
+            if int((cursor.fetchone() or {}).get('total') or 0) >= 1:
+                flash("This store already has a viewer/manager. Remove the current viewer first.", "warning")
+                return redirect(url_for("stores_management", store_id=store_id))
+
+            cursor.execute("SELECT COUNT(*) AS total FROM user_stores WHERE user_id = %s", (target_user_id,))
+            if int((cursor.fetchone() or {}).get('total') or 0) >= 1:
+                flash("That viewer is already assigned to another store.", "warning")
+                return redirect(url_for("stores_management", store_id=store_id))
+
+            if owner_user_id:
+                max_viewers = int(store_row.get('max_viewers') or 0)
+                if store_row.get('license_key'):
+                    license_status = validate_tenant_license(store_row['license_key'], force=True)
+                    if not license_status.get('valid'):
+                        flash("Unable to verify the store owner's license. Please try again.", "danger")
+                        return redirect(url_for("stores_management", store_id=store_id))
+                    max_viewers = int(license_status.get('max_stores') or 0)
+                if max_viewers > 0:
+                    cursor.execute(
+                        """SELECT COUNT(*) AS total
+                           FROM user_stores us
+                           JOIN stores s ON s.id = us.store_id
+                           WHERE s.user_id = %s""",
+                        (owner_user_id,),
+                    )
+                    assigned_total = int((cursor.fetchone() or {}).get('total') or 0)
+                    if assigned_total >= max_viewers:
+                        flash(f"Viewer limit reached. This license allows up to {max_viewers} store viewers.", "danger")
+                        return redirect(url_for("stores_management", store_id=store_id))
 
             try:
                 cursor.execute(
@@ -4636,6 +4710,7 @@ def create_app() -> Flask:
         return render_template(
             "manage_stores/stores.html",
             stores=enhanced_stores if user['role'] != 'superadmin' else None,
+            all_stores=enhanced_stores,
             stores_by_user=stores_by_user_enhanced if user['role'] == 'superadmin' else None,
             user_info=user_info if user['role'] == 'superadmin' else None,
             selected_store=selected_store,
@@ -5979,7 +6054,7 @@ def create_app() -> Flask:
         return redirect(url_for("stores_management", store_id=store_id))
 
     @app.route("/admin/stores/<int:store_id>/delete", methods=["POST"])
-    @login_required
+    @role_required('admin', 'superadmin')
     def delete_store_route(store_id: int):
         if not can_manage_store(session['user_id'], store_id):
             flash("You don't have permission to delete this store.", "danger")
@@ -5991,6 +6066,15 @@ def create_app() -> Flask:
             cursor.execute("SELECT store_name FROM stores WHERE id = %s", (store_id,))
             store_row = cursor.fetchone()
             store_name = store_row[0] if store_row else "Unknown"
+
+            if not store_row:
+                flash("Store not found.", "warning")
+                return redirect(url_for("stores_management"))
+
+            # These receipt tables intentionally have no foreign keys, so
+            # remove their store-scoped records before deleting the store.
+            cursor.execute("DELETE FROM receipt_usages WHERE store_id = %s", (store_id,))
+            cursor.execute("DELETE FROM global_receipt_usages WHERE store_id = %s", (store_id,))
 
             # Cascading delete: delete staff_commendations first
             cursor.execute("""

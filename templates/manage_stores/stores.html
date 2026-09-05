@@ -19,6 +19,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
         Manage your stores, view feedback, and configure questionnaires.
       </p>
     </div>
+    {% if session.get('role') in ('admin', 'superadmin') %}
     <div class="d-flex gap-2">
       <a href="{{ url_for('admin_dashboard') }}" class="btn btn-outline-primary d-flex align-items-center">
         <i class="bi bi-bar-chart me-2"></i>
@@ -28,8 +29,6 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
         <i class="bi bi-download me-2"></i>
         Backup CSV
       </a>
-      
-      </form>
       <form method="POST" action="{{ url_for('clear_feedback_route') }}" onsubmit="return confirm('WARNING: Make sure to BACKUP your data before proceeding.\n\nAre you sure you want to clear ALL feedback data? This will delete all responses, answers, and staff commendations. Stores and their configurations will be preserved. This action cannot be undone.');" class="d-inline">
         <button type="submit" class="btn btn-outline-danger d-flex align-items-center">
           <i class="bi bi-trash me-2"></i>
@@ -41,6 +40,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
         Add Store
       </button>
     </div>
+    {% endif %}
   </div>
 
 
@@ -79,6 +79,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
 
   
   <!-- Add Store Modal -->
+  {% if session.get('role') in ('admin', 'superadmin') %}
   <div class="modal fade" id="addStoreModal" tabindex="-1" aria-labelledby="addStoreModalLabel" aria-hidden="true">
     <div class="modal-dialog modal-lg">
       <div class="modal-content">
@@ -247,6 +248,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
       </div>
     </div>
   </div>
+  {% endif %}
 
   <!-- Edit Store Modal -->
   <div class="modal fade" id="editStoreModal" tabindex="-1" aria-labelledby="editStoreModalLabel" aria-hidden="true">
@@ -707,11 +709,12 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
           <h6 class="fw-semibold mb-2">
             <i class="bi bi-person-plus me-1 text-primary"></i>Add a viewer
           </h6>
+          <div id="viewerCapacity" class="small text-muted mb-2"></div>
           <form id="viewerAddForm" method="POST" class="d-flex gap-2 align-items-stretch">
             <select id="viewerSelect" name="user_id" class="form-select" required>
               <option value="">— Select an active view-only user —</option>
             </select>
-            <button class="btn btn-primary" type="submit">
+            <button class="btn btn-primary" id="viewerAssignButton" type="submit">
               <i class="bi bi-plus-lg me-1"></i>Assign
             </button>
           </form>
@@ -983,7 +986,7 @@ PURPOSE: "Store Management" page. Allows adding/editing stores, viewing
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 <script>
 // Store details data (pre-loaded from server)
-const storesData = {{ stores | tojson | safe }};
+const storesData = {{ all_stores | tojson | safe }};
 let selectedStores = new Set();
 
 document.addEventListener('DOMContentLoaded', function() {
@@ -2123,11 +2126,20 @@ async function openViewersModal(storeId, storeName) {
 
     // Populate available dropdown
     const select = document.getElementById('viewerSelect');
+    const assignButton = document.getElementById('viewerAssignButton');
+    const capacity = document.getElementById('viewerCapacity');
+    const limitLabel = Number(data.max_viewers) > 0 ? data.max_viewers : 'Unlimited';
+    capacity.textContent = `Assigned viewers: ${data.assigned_total || 0} / ${limitLabel}`;
     if (!data.available || data.available.length === 0) {
-      select.innerHTML = '<option value="">No unassigned view-only users available</option>';
+      const reason = data.store_has_viewer
+        ? 'This store already has its viewer/manager'
+        : (data.limit_reached ? 'License viewer limit reached' : 'No unassigned view-only users available');
+      select.innerHTML = `<option value="">${reason}</option>`;
       select.disabled = true;
+      assignButton.disabled = true;
     } else {
       select.disabled = false;
+      assignButton.disabled = false;
       select.innerHTML = '<option value="">— Select an active view-only user —</option>' +
         data.available.map(u => `<option value="${u.id}">${escapeHtml(u.username)} (${escapeHtml(u.email)})</option>`).join('');
     }
